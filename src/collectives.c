@@ -1293,3 +1293,31 @@ shmem_internal_alltoalls(void *dest, const void *source, ptrdiff_t dst,
     for (i = 0; i < SHMEM_BARRIER_SYNC_SIZE; i++)
         pSync[i] = SHMEM_SYNC_VALUE;
 }
+
+// NBC
+SHMEM_FUNCTION_ATTRIBUTES int shmem_req_wait(const shmem_req_h *request)
+{
+    SHMEM_ERR_CHECK_INITIALIZED();
+    shmem_internal_assert(request != NULL);
+
+    // Fetch our call record slot
+    shmem_broadcastnb_callrecord_t *cr = &(g_shmem_broadcast[*request]);
+
+    // Actually do the call. This does it all, making the split nature rather lopsided.
+    shmem_internal_bcast(cr->dest, cr->source, cr->nelems * cr->type_size,              
+                             cr->PE_root, cr->myteam->start, cr->myteam->stride,    
+                             cr->myteam->size, cr->psync, 1);                 
+
+    shmem_internal_team_release_psyncs(cr->myteam, BCAST);              
+
+    int team_root = cr->myteam->start + cr->PE_root * cr->myteam->stride;     
+    if (shmem_internal_my_pe == team_root && cr->dest != cr->source) {      
+        shmem_internal_copy_self(cr->dest, cr->source, cr->nelems * cr->type_size);            
+    }                                                               
+    return 0;
+}
+
+SHMEM_FUNCTION_ATTRIBUTES int shmem_req_test(const shmem_req_h *request)
+{
+    return shmem_req_wait(request);
+}

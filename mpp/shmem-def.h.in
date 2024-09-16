@@ -116,6 +116,8 @@ typedef struct {
 #define SHMEM_SIGNAL_SET        0
 #define SHMEM_SIGNAL_ADD        1
 
+typedef int shmem_req_h;
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

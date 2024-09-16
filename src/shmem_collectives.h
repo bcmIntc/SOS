@@ -18,6 +18,25 @@
 
 #include "shmem_synchronization.h"
 
+// NBC: TODO: consider exporting this
+#define SHMEM_BROADCASTNB_REQUEST_MAXSIZE 32
+
+typedef struct {
+    long *psync;        // which psync to use
+    shmem_internal_team_t * myteam;
+    int type_size;
+    void *dest;         // ? how to handle these TYPE macros? If I use void*, fixes, but then breaks the call I need to: 
+    //  shmem_internal_bcast(void *target, const void *source, size_t len, int PE_root, int PE_start, int PE_stride, int PE_size, long *pSync, int complete))
+    //  1) instead of that approach which wont work in C, try to just store what is needed in the completion: {nelems * sizeof(TYPE)}
+    const void *source;
+    size_t nelems;
+    int PE_root;
+} shmem_broadcastnb_callrecord_t;
+
+// Index is used as the request handle
+extern shmem_broadcastnb_callrecord_t g_shmem_broadcast[SHMEM_BROADCASTNB_REQUEST_MAXSIZE];
+// Index
+extern unsigned int g_shmem_next_request;
 
 enum coll_type_t {
     AUTO = 0,
@@ -309,4 +328,5 @@ void shmem_internal_alltoall(void *dest, const void *source, size_t len,
 void shmem_internal_alltoalls(void *dest, const void *source, ptrdiff_t dst,
                               ptrdiff_t sst, size_t elem_size, size_t nelems,
                               int PE_start, int PE_stride, int PE_size, long *pSync);
+
 #endif

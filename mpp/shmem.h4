@@ -232,6 +232,13 @@ define(`SHMEM_CXX_BCAST',
 }')dnl
 SHMEM_CXX_DEFINE_FOR_RMA(`SHMEM_CXX_BCAST')
 
+define(`SHMEM_CXX_BCAST_NB',
+`static inline int shmem_broadcast_nb(shmem_team_t team, $2* dest, const $2* source,
+                                   size_t nelems, int PE_root, shmem_req_h *request) {
+    return shmem_$1_broadcast_nb(team, dest, source, nelems, PE_root, request);
+}')dnl
+SHMEM_CXX_DEFINE_FOR_RMA(`SHMEM_CXX_BCAST_NB')
+
 define(`SHMEM_CXX_COLLECT',
 `static inline int shmem_collect(shmem_team_t team, $2* dest, const $2* source,
                                  size_t nelems) {
@@ -935,6 +942,12 @@ define(`SHMEM_C11_GEN_BCAST', `        $2*: shmem_$1_broadcast')dnl
 #define shmem_broadcast(...) \
     _Generic(SHMEM_C11_TYPE_EVAL_PTR(SHMEM_C11_ARG1(__VA_ARGS__)), \
 SHMEM_BIND_C11_RMA(`SHMEM_C11_GEN_BCAST', `, \') \
+    )(__VA_ARGS__)
+
+define(`SHMEM_C11_GEN_BCAST_NB', `        $2*: shmem_$1_broadcast_nb')dnl
+#define shmem_broadcast_nb(...) \
+    _Generic(SHMEM_C11_TYPE_EVAL_PTR(SHMEM_C11_ARG1(__VA_ARGS__)), \
+SHMEM_BIND_C11_RMA(`SHMEM_C11_GEN_BCAST_NB', `, \') \
     )(__VA_ARGS__)
 
 define(`SHMEM_C11_GEN_COLLECT', `        $2*: shmem_$1_collect')dnl
