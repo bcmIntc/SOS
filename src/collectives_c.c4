@@ -95,6 +95,12 @@ SHMEM_BIND_C_RMA(`SHMEM_PROF_DEF_BCAST')
 #pragma weak shmem_broadcast64 = pshmem_broadcast64
 #define shmem_broadcast64 pshmem_broadcast64
 
+define(`SHMEM_PROF_DEF_BCAST_NB',
+`#pragma weak shmem_$1_broadcast_nb = pshmem_$1_broadcast_nb
+#define shmem_$1_broadcast_nb pshmem_$1_broadcast_nb')dnl
+dnl
+SHMEM_BIND_C_RMA(`SHMEM_PROF_DEF_BCAST_NB')
+
 #pragma weak shmem_collect32 = pshmem_collect32
 #define shmem_collect32 pshmem_collect32
 #pragma weak shmem_collect64 = pshmem_collect64
@@ -385,12 +391,13 @@ SHMEM_BIND_C_RMA(`SHMEM_DEF_BCAST')
         shmem_internal_team_t *myteam = (shmem_internal_team_t *)team;  \
         long *psync = shmem_internal_team_choose_psync(myteam, BCAST);  \
                                                                         \
-        /* Track necessary info and map it to a request (index) */    \
-        *request = g_shmem_next_request;                                \
-                                                                        \
         /* Update index. TODO: optimize for power of 2 SHMEM_BROADCASTNB_REQUEST_MAXSIZE */    \
         /* TODO: atomic considerations */                                                      \
+        /* TODO: rollover considerations */                                                    \
         g_shmem_next_request = (g_shmem_next_request + 1) % SHMEM_BROADCASTNB_REQUEST_MAXSIZE; \
+                                                                        \
+        /* Track necessary info and map it to a request (index) */      \
+        *request = g_shmem_next_request;                                \
                                                                         \
         /* Write a record in g_shmem_broadcast[] */                     \
         g_shmem_broadcast[g_shmem_next_request].psync = psync;          \

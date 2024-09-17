@@ -29,6 +29,7 @@ coll_type_t shmem_internal_collect_type = AUTO;
 coll_type_t shmem_internal_fcollect_type = AUTO;
 long *shmem_internal_barrier_all_psync;
 long *shmem_internal_sync_all_psync;
+shmem_req_h g_shmem_next_request = 0;
 
 char *coll_type_str[] = { "AUTO",
                           "LINEAR",
@@ -430,7 +431,7 @@ shmem_internal_bcast_linear(void *target, const void *source, size_t len,
         int i, pe;
 
         /* send data to all peers */
-        for (pe = PE_start,i=0; i < PE_size; pe += PE_stride, i++) {
+        for (pe = PE_start, i=0; i < PE_size; pe += PE_stride, i++) {
             if (pe == shmem_internal_my_pe) continue;
             shmem_internal_put_nb(SHMEM_CTX_DEFAULT, target, source, len, pe, &completion);
         }
@@ -1295,10 +1296,15 @@ shmem_internal_alltoalls(void *dest, const void *source, ptrdiff_t dst,
 }
 
 // NBC
+shmem_broadcastnb_callrecord_t g_shmem_broadcast[SHMEM_BROADCASTNB_REQUEST_MAXSIZE];
+
 SHMEM_FUNCTION_ATTRIBUTES int shmem_req_wait(const shmem_req_h *request)
 {
     SHMEM_ERR_CHECK_INITIALIZED();
     shmem_internal_assert(request != NULL);
+    shmem_internal_assert(g_shmem_broadcast != NULL);
+
+    //printf("==> +shmem_req_wait(%d). \n", *request); fflush(stdout);
 
     // Fetch our call record slot
     shmem_broadcastnb_callrecord_t *cr = &(g_shmem_broadcast[*request]);
@@ -1317,6 +1323,8 @@ SHMEM_FUNCTION_ATTRIBUTES int shmem_req_wait(const shmem_req_h *request)
     return 0;
 }
 
+// This should do a test to determine if we are done. We cannot be done with this split
+//   implementation, since we do not actually issued the bcast until the wait.
 SHMEM_FUNCTION_ATTRIBUTES int shmem_req_test(const shmem_req_h *request)
 {
     return shmem_req_wait(request);

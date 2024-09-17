@@ -24,10 +24,8 @@
 typedef struct {
     long *psync;        // which psync to use
     shmem_internal_team_t * myteam;
-    int type_size;
-    void *dest;         // ? how to handle these TYPE macros? If I use void*, fixes, but then breaks the call I need to: 
-    //  shmem_internal_bcast(void *target, const void *source, size_t len, int PE_root, int PE_start, int PE_stride, int PE_size, long *pSync, int complete))
-    //  1) instead of that approach which wont work in C, try to just store what is needed in the completion: {nelems * sizeof(TYPE)}
+    int type_size;      // captures the type size
+    void *dest;
     const void *source;
     size_t nelems;
     int PE_root;
@@ -35,8 +33,9 @@ typedef struct {
 
 // Index is used as the request handle
 extern shmem_broadcastnb_callrecord_t g_shmem_broadcast[SHMEM_BROADCASTNB_REQUEST_MAXSIZE];
+
 // Index
-extern unsigned int g_shmem_next_request;
+extern shmem_req_h g_shmem_next_request;
 
 enum coll_type_t {
     AUTO = 0,
