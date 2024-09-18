@@ -427,7 +427,8 @@ shmem_internal_bcast_linear(void *target, const void *source, size_t len,
 
     if (PE_size == 1 || len == 0) return;
 
-    if (real_root == shmem_internal_my_pe) {
+    if (real_root == shmem_internal_my_pe) 
+    {
         int i, pe;
 
         /* send data to all peers */
@@ -455,7 +456,9 @@ shmem_internal_bcast_linear(void *target, const void *source, size_t len,
             SHMEM_WAIT_UNTIL(pSync, SHMEM_CMP_EQ, 0);
         }
 
-    } else {
+    } 
+    else 
+    {
         /* wait for data arrival message */
         SHMEM_WAIT(pSync, 0);
 
@@ -470,6 +473,39 @@ shmem_internal_bcast_linear(void *target, const void *source, size_t len,
                                   real_root, SHM_INTERNAL_SUM, SHM_INTERNAL_LONG);
         }
     }
+}
+
+// non-blocking variant
+// TODO: pare it down, merge with above if clean
+//
+void
+shmem_internal_bcast_linear_nb(void *target, const void *source, size_t len,
+                            int PE_root, int PE_start, int PE_stride, int PE_size,
+                            long *pSync, int complete)
+{
+    int real_root = PE_start + PE_root * PE_stride;
+    long completion = 0;
+
+    /* need 1 slot */
+    shmem_internal_assert(SHMEM_BCAST_SYNC_SIZE >= 1);
+
+    if (PE_size == 1 || len == 0) return;
+
+    // We only are concerned with the sender.
+    if (real_root == shmem_internal_my_pe) {
+        int i, pe;
+        
+        printf("+shmem_internal_bcast_linear_nb(): Sending data then exiting... \n");
+
+        /* send data to all peers */
+        for (pe = PE_start, i=0; i < PE_size; pe += PE_stride, i++) 
+        {
+            if (pe == shmem_internal_my_pe) continue;
+            shmem_internal_put_nb(SHMEM_CTX_DEFAULT, target, source, len, pe, &completion);     // TODO: once this level of split is working, drill down into this to see if FI is doing any completions.
+        }
+        printf("shmem_internal_bcast_linear_nb(): ...data sent. \n");
+    } 
+    printf("-shmem_internal_bcast_linear_nb()\n"); fflush(stdout);
 }
 
 
@@ -1298,7 +1334,7 @@ shmem_internal_alltoalls(void *dest, const void *source, ptrdiff_t dst,
 // NBC
 shmem_broadcastnb_callrecord_t g_shmem_broadcast[SHMEM_BROADCASTNB_REQUEST_MAXSIZE];
 
-SHMEM_FUNCTION_ATTRIBUTES int shmem_req_wait(const shmem_req_h *request)
+SHMEM_FUNCTION_ATTRIBUTES int shmem_req_wait__OLD(const shmem_req_h *request)
 {
     SHMEM_ERR_CHECK_INITIALIZED();
     shmem_internal_assert(request != NULL);
@@ -1324,8 +1360,101 @@ SHMEM_FUNCTION_ATTRIBUTES int shmem_req_wait(const shmem_req_h *request)
 }
 
 // This should do a test to determine if we are done. We cannot be done with this split
-//   implementation, since we do not actually issued the bcast until the wait.
+//   implementation, since we do not actually issue the bcast until the wait.
 SHMEM_FUNCTION_ATTRIBUTES int shmem_req_test(const shmem_req_h *request)
 {
     return shmem_req_wait(request);
+}
+
+// newer
+SHMEM_FUNCTION_ATTRIBUTES int shmem_req_wait(const shmem_req_h *request)
+{
+    SHMEM_ERR_CHECK_INITIALIZED();
+    shmem_internal_assert(request != NULL);
+    shmem_internal_assert(g_shmem_broadcast != NULL);
+
+    printf("==> +shmem_req_wait(%d). \n", *request); fflush(stdout);
+
+    // Fetch our call record slot
+    shmem_broadcastnb_callrecord_t *cr = &(g_shmem_broadcast[*request]);
+
+    // Now flesh out all of the sync stuff I removed in the send
+    long zero = 0, one = 1, completion = 0;
+    int complete = 1;                                   // mimics original call chain value. TODO: consider moving this to my call structure
+    int real_root = (cr->myteam->start + cr->PE_root * cr->myteam->stride);
+    printf("==> shmem_req_wait(): cr->myteam->start=%d, cr->PE_root=%d, cr->myteam->stride=%d \n", cr->myteam->start, cr->PE_root, cr->myteam->stride); fflush(stdout);
+
+    if (real_root == shmem_internal_my_pe) 
+    {
+        int pe, i;
+        shmem_internal_put_wait(SHMEM_CTX_DEFAULT, &completion);
+        shmem_internal_fence(SHMEM_CTX_DEFAULT);       
+
+        printf("==> shmem_req_wait(): I am the real_root. Sending ACKS to peers... \n"); fflush(stdout);
+
+        /* send completion ack to all peers */
+        for (pe = cr->myteam->start, i=0; i < cr->myteam->size; pe += cr->myteam->stride, i++) 
+        {
+            if (pe == shmem_internal_my_pe) continue;
+            shmem_internal_put_scalar(SHMEM_CTX_DEFAULT, cr->psync, &one, sizeof(long), pe);
+        }
+        printf("==> shmem_req_wait(): I am the real_root. Done sending ACKS to peers. \n"); fflush(stdout);
+
+        if (1 == complete) 
+        {
+            printf("==> shmem_req_wait(): real_root: Waiting on ACKS... \n"); fflush(stdout);
+
+            /* wait for acks from everyone */
+            SHMEM_WAIT_UNTIL(cr->psync, SHMEM_CMP_EQ, cr->myteam->size - 1);
+
+            printf("==> shmem_req_wait(): real_root: Done waiting on ACKS. Clearing psync... \n"); fflush(stdout);
+
+            /* Clear pSync */
+            shmem_internal_put_scalar(SHMEM_CTX_DEFAULT, cr->psync, &zero, sizeof(zero), shmem_internal_my_pe);
+            printf("==> shmem_req_wait(): real_root: Done clearing psync. Now waiting... \n"); fflush(stdout);
+            SHMEM_WAIT_UNTIL(cr->psync, SHMEM_CMP_EQ, 0);
+            printf("==> shmem_req_wait(): real_root: Done waiting. \n"); fflush(stdout);
+        }
+    }
+    else
+    {
+        printf("==> shmem_req_wait(): I am NOT the real_root (shmem_internal_my_pe=%d, real_root=%d). Waiting... \n", shmem_internal_my_pe, real_root); fflush(stdout);
+
+        /* wait for data arrival message */
+        SHMEM_WAIT(cr->psync, 0);
+
+        printf("==> shmem_req_wait(): I am NOT the real_root. Done waiting. Calling shmem_internal_put_scalar()...\n"); fflush(stdout);
+
+        /* Clear pSync */
+        shmem_internal_put_scalar(SHMEM_CTX_DEFAULT, cr->psync, &zero, sizeof(zero), shmem_internal_my_pe);
+        printf("==> shmem_req_wait(): I am NOT the real_root. Back from calling shmem_internal_put_scalar(). Waiting...\n"); fflush(stdout);
+
+        SHMEM_WAIT_UNTIL(cr->psync, SHMEM_CMP_EQ, 0);
+
+        printf("==> shmem_req_wait(): I am NOT the real_root. Back from waiting.\n"); fflush(stdout);
+
+        if (1 == complete) 
+        {
+            printf("==> shmem_req_wait(): I am NOT the real_root. Sending ack back to root...\n"); fflush(stdout);
+
+            /* send ack back to root */
+            shmem_internal_atomic(SHMEM_CTX_DEFAULT, cr->psync, &one, sizeof(one), real_root, SHM_INTERNAL_SUM, SHM_INTERNAL_LONG);
+
+            printf("==> shmem_req_wait(): I am NOT the real_root. Back from sending ack back to root.\n"); fflush(stdout);
+        }
+    }
+
+    printf("==> shmem_req_wait(): Everyone: Calling shmem_internal_team_release_psyncs()...\n"); fflush(stdout);
+    shmem_internal_team_release_psyncs(cr->myteam, BCAST);              
+
+    // Q: should I not move this elsewhere? Is moving data
+    if (shmem_internal_my_pe == real_root && cr->dest != cr->source) 
+    {
+        printf("==> shmem_req_wait(): Trailing: Calling shmem_internal_copy_self()...\n"); fflush(stdout);
+        shmem_internal_copy_self(cr->dest, cr->source, cr->nelems * cr->type_size);            
+        printf("==> shmem_req_wait(): Trailing: Back from calling shmem_internal_copy_self().\n"); fflush(stdout);
+    }                                                               
+
+    printf("==> -shmem_req_wait()\n"); fflush(stdout);
+    return 0;
 }

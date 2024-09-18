@@ -63,13 +63,15 @@ shmem_internal_put_scalar(shmem_ctx_t ctx, void *target, const void *source, siz
 
     if (shmem_shr_transport_use_write(ctx, target, source, len, pe)) {
         shmem_shr_transport_put_scalar(ctx, target, source, len, pe);
-    } else {
+    } 
+    else 
+    {
 #ifndef DISABLE_OFI_INJECT
         shmem_transport_put_scalar((shmem_transport_ctx_t *)ctx, target, source, len, pe);
 #else
         long completion = 0;
         shmem_transport_put_nb((shmem_transport_ctx_t *)ctx, target, source, len, pe, &completion);
-	shmem_internal_put_wait(ctx, &completion);
+	    shmem_internal_put_wait(ctx, &completion);
 #endif
     }
 }

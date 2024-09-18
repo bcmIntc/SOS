@@ -164,6 +164,46 @@ shmem_internal_bcast(void *target, const void *source, size_t len,
     }
 }
 
+void shmem_internal_bcast_linear_nb(void *target, const void *source, size_t len,
+                                 int PE_root, int PE_start, int PE_stride, int PE_size,
+                                 long *pSync, int complete);
+// TODO: pare down the necessary params!
+// TODO: implement shmem_internal_bcast_tree_nb()!
+static inline
+void
+shmem_internal_bcast_nb(void *target, const void *source, size_t len,
+                     int PE_root, int PE_start, int PE_stride, int PE_size,
+                     long *pSync, int complete)
+{
+    switch (shmem_internal_bcast_type) {
+    case AUTO:
+        if (PE_size < shmem_internal_params.COLL_CROSSOVER) {
+            shmem_internal_bcast_linear_nb(target, source, len, PE_root, PE_start,
+                                        PE_stride, PE_size, pSync, complete);
+        } else {
+            //shmem_internal_bcast_tree(target, source, len, PE_root, PE_start,
+            //                          PE_stride, PE_size, pSync, complete);
+            printf("INFO: shmem_internal_bcast_nb(1): Overriding call to shmem_internal_bcast_tree with shmem_internal_bcast_linear_nb \n");
+            shmem_internal_bcast_linear_nb(target, source, len, PE_root, PE_start,
+                                        PE_stride, PE_size, pSync, complete);                                      
+        }
+        break;
+    case LINEAR:
+        shmem_internal_bcast_linear_nb(target, source, len, PE_root, PE_start,
+                                    PE_stride, PE_size, pSync, complete);
+        break;
+    case TREE:
+        //shmem_internal_bcast_tree(target, source, len, PE_root, PE_start,
+        //                          PE_stride, PE_size, pSync, complete);
+        printf("INFO: shmem_internal_bcast_nb(2): Overriding call to shmem_internal_bcast_tree with shmem_internal_bcast_linear_nb \n");
+        shmem_internal_bcast_linear_nb(target, source, len, PE_root, PE_start,
+                                    PE_stride, PE_size, pSync, complete);
+        break;
+    default:
+        RAISE_ERROR_MSG("Illegal broadcast type (%d)\n",
+                        shmem_internal_bcast_type);
+    }
+}
 
 void shmem_internal_op_to_all_linear(void *target, const void *source, size_t count, size_t type_size,
                                      int PE_start, int PE_stride, int PE_size,

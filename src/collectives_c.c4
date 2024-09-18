@@ -402,11 +402,21 @@ SHMEM_BIND_C_RMA(`SHMEM_DEF_BCAST')
         /* Write a record in g_shmem_broadcast[] */                     \
         g_shmem_broadcast[g_shmem_next_request].psync = psync;          \
         g_shmem_broadcast[g_shmem_next_request].myteam = myteam;        \
-        g_shmem_broadcast[g_shmem_next_request].type_size = sizeof(TYPE); \
+        g_shmem_broadcast[g_shmem_next_request].myteam->start = myteam->start;   \
+        g_shmem_broadcast[g_shmem_next_request].myteam->stride = myteam->stride; \
+        g_shmem_broadcast[g_shmem_next_request].myteam->size   = myteam->size;   \
+        g_shmem_broadcast[g_shmem_next_request].type_size = sizeof(TYPE);        \
         g_shmem_broadcast[g_shmem_next_request].dest = dest;            \
         g_shmem_broadcast[g_shmem_next_request].source = source;        \
         g_shmem_broadcast[g_shmem_next_request].nelems = nelems;        \
         g_shmem_broadcast[g_shmem_next_request].PE_root = PE_root;      \
+                                                                        \
+        printf("==> shmem_##STYPE##_broadcast_nb(): g_shmem_broadcast[g_shmem_next_request].myteam->start=%d, g_shmem_broadcast[g_shmem_next_request].PE_root=%d, g_shmem_broadcast[g_shmem_next_request].myteam->stride=%d \n", g_shmem_broadcast[g_shmem_next_request].myteam->start, g_shmem_broadcast[g_shmem_next_request].PE_root, g_shmem_broadcast[g_shmem_next_request].myteam->stride); fflush(stdout); \
+                                                                        \
+        /* Now make the ansyncronous call to move data and return */    \
+        shmem_internal_bcast_nb(dest, source, nelems * sizeof(TYPE),    \
+                             PE_root, myteam->start, myteam->stride,    \
+                             myteam->size, psync, 1);                   \
                                                                         \
         return 0;                                                       \
     }
