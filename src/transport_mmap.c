@@ -38,8 +38,11 @@ static void shm_create_key(char *key, size_t max_size, unsigned pe, size_t num) 
 }
 
 
-static void *shm_create_region(char* base, const char *key, int shm_size) {
+static void *shm_create_region(char* base, const char *key, size_t shm_size) {
   if (shm_size == 0) return NULL;
+
+    // bman
+    //printf("==>+shm_create_region(): shm_size = %ld \n", shm_size); fflush(stdout);
 
   shm_unlink(key);
   int fd = shm_open(key, O_RDWR | O_CREAT | O_TRUNC, 0666);
@@ -49,13 +52,15 @@ static void *shm_create_region(char* base, const char *key, int shm_size) {
   }
 
   if (ftruncate(fd, shm_size) == -1) {
-      fprintf(stderr, "mmap_init error ftruncate\n");
+      fprintf(stderr, "mmap_init error ftruncate: errno = %d, shm_size = %ld \n", errno, shm_size);
+      perror("ftruncate");
+      close(fd);
       exit(0);
   }
 
   void *shm_base_addr = mmap(base, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
   if (MAP_FAILED == shm_base_addr) {
-      fprintf(stderr, "mmap_init error mmap %s size %d\n", key, shm_size);
+      fprintf(stderr, "mmap_init error mmap %s size %ld\n", key, shm_size);
       exit(0);
   }
 
@@ -63,7 +68,7 @@ static void *shm_create_region(char* base, const char *key, int shm_size) {
 }
 
 
-static void *shm_create_region_data_seg(char* base, const char *key, int shm_size) {
+static void *shm_create_region_data_seg(char* base, const char *key, size_t shm_size) {
     if (shm_size == 0) return NULL;
 
     shm_unlink(key);
@@ -89,7 +94,7 @@ static void *shm_create_region_data_seg(char* base, const char *key, int shm_siz
 
     void *shm_base_addr = mmap(base, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
     if (MAP_FAILED == shm_base_addr) {
-        fprintf(stderr, "mmap_init error mmap %s size %d\n", key, shm_size);
+        fprintf(stderr, "mmap_init error mmap %s size %ld\n", key, shm_size);
         exit(1);
     }
 
@@ -99,7 +104,7 @@ static void *shm_create_region_data_seg(char* base, const char *key, int shm_siz
 }
 
 
-static void *shm_attach_region(char* base, const char *key, int shm_size) {
+static void *shm_attach_region(char* base, const char *key, unsigned int shm_size) {
   if (shm_size == 0) return NULL;
 
   int fd = shm_open(key, O_RDWR, 0);
@@ -143,6 +148,11 @@ shmem_transport_mmap_init(void)
     /* setup data region */
     base = FIND_BASE(shmem_internal_data_base, page_size);
     len = FIND_LEN(shmem_internal_data_base, shmem_internal_data_length, page_size);
+
+    // bman
+    //printf("==>shmem_transport_mmap_init(void): data len = %ld \n", len); fflush(stdout);
+    //
+
     shm_create_key(key_prefix, MPIDI_OFI_SHMGR_NAME_MAXLEN-10, shmem_internal_my_pe, 1);
     snprintf(key, MPIDI_OFI_SHMGR_NAME_MAXLEN, "%s-data", key_prefix);
     void* myaddr_data = shm_create_region_data_seg(base, key, len);
@@ -154,6 +164,11 @@ shmem_transport_mmap_init(void)
     /* setup heap region */
     base = FIND_BASE(shmem_internal_heap_base, page_size);
     len  = FIND_LEN(shmem_internal_heap_base, shmem_internal_heap_length, page_size);
+
+    // bman
+    //printf("==>shmem_transport_mmap_init(void): heap len = %ld \n", len); fflush(stdout);
+    //
+
     shm_create_key(key_prefix, MPIDI_OFI_SHMGR_NAME_MAXLEN-10, shmem_internal_my_pe, 2);
     snprintf(key, MPIDI_OFI_SHMGR_NAME_MAXLEN, "%s-heap", key_prefix);
     void* myaddr_heap = shm_create_region(base, key, len);
