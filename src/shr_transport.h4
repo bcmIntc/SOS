@@ -505,6 +505,73 @@ shmem_shr_transport_atomicv(shmem_ctx_t ctx, void *target, const void *source,
 }
 
 
+// bman: add perfmon hooks
+#if defined(USE_PERFMON_ATM)
+ #include <ctype.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <unistd.h>
+ #include <string.h>
+ #include <sys/ioctl.h>
+ #include <fcntl.h>
+ #include <fcntl.h>
+ #include <sys/syscall.h>
+
+static inline __attribute__((always_inline)) void start_perf_counters()
+{
+    if ((non_working_events & (1 << 0)) == 0)
+    {
+        ioctl(perf_event_fd[0], PERF_EVENT_IOC_RESET, 0);       // set counter to 0
+        ioctl(perf_event_fd[0], PERF_EVENT_IOC_ENABLE, 0);      // start counter
+        read(perf_event_fd[0], &start_counters[0], sizeof(start_counters[0]));
+    }
+    else
+    {
+        fprintf(stderr, "ERROR: no working events (only supprting 1)\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+static inline __attribute__((always_inline)) void my_start_counters() {
+    start_perf_counters();
+}
+
+static inline __attribute__((always_inline)) void my_stop_counters() 
+{
+    if ((non_working_events & (1 << 0)) == 0) {
+        ioctl(perf_event_fd[0], PERF_EVENT_IOC_DISABLE, 0);
+    }
+    else {
+        fprintf(stderr, "ERROR: no working events.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // Read result
+    if ((non_working_events & (1 << 0)) == 0) {
+        read(perf_event_fd[0], &end_counters[0], sizeof(end_counters[0]));
+    }
+    else {
+        fprintf(stderr, "ERROR: no working events.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // Now fill in the tracking structure
+    for (int x=0; x < eventCount; x++) {
+        if (non_working_events & (1 << x)) {
+            eventReadBuffer[x].tdiff[diff_count] = 666;         // mark of the devil means we have an issue
+        }
+        else {
+            eventReadBuffer[x].tdiff[diff_count] = end_counters[x] - start_counters[x];
+        }
+    }
+    diff_count = (diff_count + 1) % MAX_COUNTS;     // rollover (moved this from inside the loop)
+}
+
+#else
+ static inline __attribute__((always_inline)) void my_start_counters() {}
+ static inline __attribute__((always_inline)) void my_stop_counters() {}
+#endif
+
 
 static inline void
 shmem_shr_transport_fetch_atomic(shmem_ctx_t ctx, void *target, void *source,
@@ -539,10 +606,14 @@ shmem_shr_transport_fetch_atomic(shmem_ctx_t ctx, void *target, void *source,
                                                        __ATOMIC_ACQ_REL);                       \
                     break;
 
+
+/* bman: in here for hamr::shmem_long_atomic_fetch_add() call */
 #define SHMEM_DEF_SUM_OP(STYPE,TYPE,ITYPE)                                                      \
                 case ITYPE:                                                                     \
+                    /* my_start_counters(); */                                                  \
                     *(TYPE *)dest = __atomic_fetch_add((TYPE *)remote_ptr, *((TYPE *)source),   \
                                                        __ATOMIC_ACQ_REL);                       \
+                    /* my_stop_counters(); */                                                   \
                     break;
 
     switch (op) {

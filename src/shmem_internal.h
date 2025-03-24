@@ -527,7 +527,7 @@ static inline void shmem_internal_free(void *ptr)
 static inline int shmem_internal_get_shr_rank(int pe)
 {
 #ifdef USE_ON_NODE_COMMS
-    return shmem_runtime_get_node_rank(pe);
+    return shmem_runtime_get_node_rank(pe);                     // <=== bman: in here
 #elif defined(USE_MEMCPY)
     return pe == shmem_runtime_get_rank() ? 0 : -1;
 #else

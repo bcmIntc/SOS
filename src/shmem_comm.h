@@ -38,11 +38,24 @@ shmem_internal_put_nb(shmem_ctx_t ctx, void *target, const void *source, size_t 
     if (len == 0)
         return;
 
-    if (shmem_shr_transport_use_write(ctx, target, source, len, pe)) {
-        shmem_shr_transport_put(ctx, target, source, len, pe);
-    } else {
+#ifdef BMAN_TEST_OPT_GUIDE      // set via config
+    if (0 == shmem_shr_transport_use_write(ctx, target, source, len, pe)) {                  // <-- see this as true w/mmamp + shr_atm
         shmem_transport_put_nb((shmem_transport_ctx_t *)ctx, target, source, len, pe, completion);
     }
+    else
+    {
+        shmem_shr_transport_put(ctx, target, source, len, pe);
+    }
+#else
+    // OG
+    if (shmem_shr_transport_use_write(ctx, target, source, len, pe)) {                  // <-- see this as true w/mmamp + shr_atm
+        shmem_shr_transport_put(ctx, target, source, len, pe);
+    } 
+    else 
+    {
+        shmem_transport_put_nb((shmem_transport_ctx_t *)ctx, target, source, len, pe, completion);
+    }
+#endif
 }
 
 
@@ -61,17 +74,33 @@ shmem_internal_put_scalar(shmem_ctx_t ctx, void *target, const void *source, siz
 {
     shmem_internal_assert(len > 0);
 
+#ifdef BMAN_TEST_OPT_GUIDE      // set via config
+    if (0 == shmem_shr_transport_use_write(ctx, target, source, len, pe)) {
+ #ifndef DISABLE_OFI_INJECT
+        shmem_transport_put_scalar((shmem_transport_ctx_t *)ctx, target, source, len, pe);
+ #else
+        long completion = 0;
+        shmem_transport_put_nb((shmem_transport_ctx_t *)ctx, target, source, len, pe, &completion);
+        shmem_internal_put_wait(ctx, &completion);
+ #endif
+    } 
+    else {
+        shmem_shr_transport_put_scalar(ctx, target, source, len, pe);
+    }
+#else
+    // OG
     if (shmem_shr_transport_use_write(ctx, target, source, len, pe)) {
         shmem_shr_transport_put_scalar(ctx, target, source, len, pe);
     } else {
-#ifndef DISABLE_OFI_INJECT
+ #ifndef DISABLE_OFI_INJECT
         shmem_transport_put_scalar((shmem_transport_ctx_t *)ctx, target, source, len, pe);
-#else
+ #else
         long completion = 0;
         shmem_transport_put_nb((shmem_transport_ctx_t *)ctx, target, source, len, pe, &completion);
 	shmem_internal_put_wait(ctx, &completion);
-#endif
+ #endif
     }
+#endif
 }
 
 static inline
@@ -241,12 +270,23 @@ shmem_internal_atomic(shmem_ctx_t ctx, void *target, const void *source, size_t 
 {
     shmem_internal_assert(len > 0);
 
+#ifdef BMAN_TEST_OPT_GUIDE      // set via config
+    if (0 == shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
+        shmem_transport_atomic((shmem_transport_ctx_t *)ctx, target, source,
+                               len, pe, op, datatype);
+    } 
+    else {
+        shmem_shr_transport_atomic(ctx, target, source, len, pe, op, datatype);
+    }
+#else
+    // OG
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
         shmem_shr_transport_atomic(ctx, target, source, len, pe, op, datatype);
     } else {
         shmem_transport_atomic((shmem_transport_ctx_t *)ctx, target, source,
                                len, pe, op, datatype);
     }
+#endif
 }
 
 
@@ -257,12 +297,24 @@ shmem_internal_atomic_fetch(shmem_ctx_t ctx, void *target, const void *source, s
 {
     shmem_internal_assert(len > 0);
 
+#ifdef BMAN_TEST_OPT_GUIDE      // set via config
+    if (0 == shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
+        shmem_transport_atomic_fetch((shmem_transport_ctx_t *)ctx, target,
+                                     source, len, pe, datatype);
+    } 
+    else {
+        shmem_shr_transport_atomic_fetch(ctx, target, source, len, pe, datatype);
+    }
+#else
+    // OG
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
         shmem_shr_transport_atomic_fetch(ctx, target, source, len, pe, datatype);
     } else {
         shmem_transport_atomic_fetch((shmem_transport_ctx_t *)ctx, target,
                                      source, len, pe, datatype);
     }
+
+#endif
 }
 
 
@@ -308,6 +360,17 @@ shmem_internal_fetch_atomic(shmem_ctx_t ctx, void *target, void *source, void *d
 {
     shmem_internal_assert(len > 0);
 
+#ifdef BMAN_TEST_OPT_GUIDE      // set via config
+    if (0 == shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
+        shmem_transport_fetch_atomic((shmem_transport_ctx_t *)ctx, target,
+                                     source, dest, len, pe, op, datatype);
+    } 
+    else {
+        shmem_shr_transport_fetch_atomic(ctx, target, source, dest, len, pe,
+                                         op, datatype);
+    }
+#else
+    // OG
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
         shmem_shr_transport_fetch_atomic(ctx, target, source, dest, len, pe,
                                          op, datatype);
@@ -315,6 +378,7 @@ shmem_internal_fetch_atomic(shmem_ctx_t ctx, void *target, void *source, void *d
         shmem_transport_fetch_atomic((shmem_transport_ctx_t *)ctx, target,
                                      source, dest, len, pe, op, datatype);
     }
+#endif
 }
 
 
@@ -325,7 +389,17 @@ shmem_internal_fetch_atomic_nbi(shmem_ctx_t ctx, void *target, void *source,
                                 shm_internal_op_t op, shm_internal_datatype_t datatype)
 {
     shmem_internal_assert(len > 0);
-
+#ifdef BMAN_TEST_OPT_GUIDE      // set via config
+    if (0 == shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
+        shmem_transport_fetch_atomic_nbi((shmem_transport_ctx_t *)ctx, target,
+                                         source, dest, len, pe, op, datatype);
+    } 
+    else {
+        shmem_shr_transport_fetch_atomic(ctx, target, source, dest, len, pe,
+                                         op, datatype);
+    }
+#else
+    // OG
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
         shmem_shr_transport_fetch_atomic(ctx, target, source, dest, len, pe,
                                          op, datatype);
@@ -333,6 +407,7 @@ shmem_internal_fetch_atomic_nbi(shmem_ctx_t ctx, void *target, void *source,
         shmem_transport_fetch_atomic_nbi((shmem_transport_ctx_t *)ctx, target,
                                          source, dest, len, pe, op, datatype);
     }
+#endif
 }
 
 
