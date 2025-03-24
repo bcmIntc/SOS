@@ -22,13 +22,13 @@
 // bman
 #include <immintrin.h>
 
-#ifdef MAP_POPULATE
-  #undef MAP_POPULATE
-  #define MAP_POPULATE 0        // Run this to disable my hack to mmap(). Comment out to enable it, using the default value.
-#endif
+//#ifdef MAP_POPULATE
+//  #undef MAP_POPULATE
+//  #define MAP_POPULATE 0        // Run this to disable my hack to mmap(). Comment out to enable it, using the default value.
+//#endif
 
-#define LOCK_PAGES               // locks all shm pages
-//#define BMAN_HACKING          // turns on test code for memcpy replacements/hand-coded
+//#define LOCK_PAGES              // locks all shm pages
+//#define BMAN_HACKING            // turns on test code for memcpy replacements/hand-coded
 //#define USE_NONTEMPORAL_ALIGNED_MEMCPY  // requires BMAN_HACKING to also be set for this to take effect
 //#define BMAN_TRACK_ALIGNMENT    // independent of other flags
 

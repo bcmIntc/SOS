@@ -28,8 +28,13 @@ include(shmem_bind_c.m4)dnl
 #endif
 
 #ifdef USE_MMAP
-#include "transport_mmap.h"
+  #include "transport_mmap.h"
+
+  /* bman: TSX testing requires mmap */
+  #define USE_TSX_ATOMIC
 #endif
+
+
 
 static inline int
 shmem_shr_transport_init(void)
@@ -505,6 +510,78 @@ shmem_shr_transport_atomicv(shmem_ctx_t ctx, void *target, const void *source,
 }
 
 
+
+
+// Atomic Increment using TSX
+
+#if defined(USE_TSX_ATOMIC)
+
+// NOTE: This needs to ultimately use SHM itself in order to work. 
+//       The caller (HAMR) will call this with various pointers, so we cant simply allocate a counter internally.
+//       The app would need to do this - we just operate on it. So in reality, we are tightly-coupled to the mmap solution.
+//       It therefore makes more sense to just operate on the addresses, and *ASSUME* they are SHM.
+//
+#define BMAN_ATOMIC_INCREMENT_PROTOTYPE(TYPE_NAME, C_TYPE)                   \
+  static C_TYPE bman_##TYPE_NAME##_tsx_atomic_increment(C_TYPE * remote_ptr, C_TYPE * source) { \
+    int status;                                                 \
+    C_TYPE retval;                                              \
+    while (1) {                                                 \
+        status = _xbegin();                                     \
+        if (status == _XBEGIN_STARTED)                          \
+        {                                                       \
+            printf("Oooooo\n");                                 \
+            retval = *remote_ptr;                               \
+            *remote_ptr += *source;                             \
+            _xend();                                            \
+            break;                                              \
+        }                                                       \
+        else                                                    \
+        {                                                       \
+            retval = __atomic_fetch_add((C_TYPE *)remote_ptr, *((C_TYPE *)source), __ATOMIC_ACQ_REL); \
+            break;                                              \
+        }                                                       \
+    }                                                           \
+    return retval;                                              \
+}
+
+BMAN_ATOMIC_INCREMENT_PROTOTYPE(int, int)
+BMAN_ATOMIC_INCREMENT_PROTOTYPE(long, long)
+BMAN_ATOMIC_INCREMENT_PROTOTYPE(longlong, long long)
+BMAN_ATOMIC_INCREMENT_PROTOTYPE(uint, unsigned int)
+BMAN_ATOMIC_INCREMENT_PROTOTYPE(ulong, unsigned long)
+BMAN_ATOMIC_INCREMENT_PROTOTYPE(ulonglong, unsigned long long)
+BMAN_ATOMIC_INCREMENT_PROTOTYPE(int32, int32_t)
+BMAN_ATOMIC_INCREMENT_PROTOTYPE(int64, int64_t)
+BMAN_ATOMIC_INCREMENT_PROTOTYPE(uint32, uint32_t)
+BMAN_ATOMIC_INCREMENT_PROTOTYPE(uint64, uint64_t)
+BMAN_ATOMIC_INCREMENT_PROTOTYPE(size, size_t)
+BMAN_ATOMIC_INCREMENT_PROTOTYPE(ptrdiff, ptrdiff_t)
+
+#else
+
+#define BMAN_ATOMIC_INCREMENT_PROTOTYPE(TYPE_NAME, C_TYPE)                                      \
+  static C_TYPE bman_##TYPE_NAME##_tsx_atomic_increment(C_TYPE * remote_ptr, C_TYPE * source) { \
+    C_TYPE retval;                                                                              \
+    retval = __atomic_fetch_add((C_TYPE *)remote_ptr, *((C_TYPE *)source), __ATOMIC_ACQ_REL);   \
+    return retval;                                                                              \
+}
+
+BMAN_ATOMIC_INCREMENT_PROTOTYPE(int, int)
+BMAN_ATOMIC_INCREMENT_PROTOTYPE(long, long)
+BMAN_ATOMIC_INCREMENT_PROTOTYPE(longlong, long long)
+BMAN_ATOMIC_INCREMENT_PROTOTYPE(uint, unsigned int)
+BMAN_ATOMIC_INCREMENT_PROTOTYPE(ulong, unsigned long)
+BMAN_ATOMIC_INCREMENT_PROTOTYPE(ulonglong, unsigned long long)
+BMAN_ATOMIC_INCREMENT_PROTOTYPE(int32, int32_t)
+BMAN_ATOMIC_INCREMENT_PROTOTYPE(int64, int64_t)
+BMAN_ATOMIC_INCREMENT_PROTOTYPE(uint32, uint32_t)
+BMAN_ATOMIC_INCREMENT_PROTOTYPE(uint64, uint64_t)
+BMAN_ATOMIC_INCREMENT_PROTOTYPE(size, size_t)
+BMAN_ATOMIC_INCREMENT_PROTOTYPE(ptrdiff, ptrdiff_t)
+
+#endif  // USE_TSX_ATOMIC
+
+
 // bman: add perfmon hooks
 #if defined(USE_PERFMON_ATM)
  #include <ctype.h>
@@ -611,8 +688,11 @@ shmem_shr_transport_fetch_atomic(shmem_ctx_t ctx, void *target, void *source,
 #define SHMEM_DEF_SUM_OP(STYPE,TYPE,ITYPE)                                                      \
                 case ITYPE:                                                                     \
                     /* my_start_counters(); */                                                  \
-                    *(TYPE *)dest = __atomic_fetch_add((TYPE *)remote_ptr, *((TYPE *)source),   \
-                                                       __ATOMIC_ACQ_REL);                       \
+                    *(TYPE *)dest = bman_##STYPE##_tsx_atomic_increment((TYPE *)remote_ptr, (TYPE *)source); \
+                                                                                                \
+                    /* OG:  *(TYPE *)dest = __atomic_fetch_add((TYPE *)remote_ptr, *((TYPE *)source), */  \
+                    /*                                   __ATOMIC_ACQ_REL);                      */ \
+                                                                                                \
                     /* my_stop_counters(); */                                                   \
                     break;
 
