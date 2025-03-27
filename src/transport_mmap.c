@@ -34,6 +34,11 @@
 
 
 // bman
+#ifdef USE_TSX_ATOMIC
+ volatile int takenCount=666;
+ volatile int totalCount=666;
+#endif
+
 #if defined(USE_PERFMON_MMAP) || defined(USE_PERFMON_ATM)
  #include <ctype.h>
  int diff_count = 0;

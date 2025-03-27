@@ -30,11 +30,13 @@ include(shmem_bind_c.m4)dnl
 #ifdef USE_MMAP
   #include "transport_mmap.h"
 
-  /* bman: TSX testing requires mmap */
-  #define USE_TSX_ATOMIC
+  //#define USE_TSX_ATOMIC
 #endif
 
-
+#ifdef USE_TSX_ATOMIC
+  extern volatile int takenCount;
+  extern volatile int totalCount;
+#endif
 
 static inline int
 shmem_shr_transport_init(void)
@@ -57,6 +59,9 @@ shmem_shr_transport_init(void)
         RETURN_ERROR_MSG("mmap init failed (%d)\n", ret);
 #endif
 
+#ifdef USE_TSX_ATOMIC
+    takenCount = totalCount = 123;
+#endif
     return ret;
 }
 
@@ -98,6 +103,10 @@ shmem_shr_transport_fini(void)
     shmem_transport_cma_fini();
 #elif USE_MMAP
     shmem_transport_mmap_fini();
+#endif
+
+#ifdef USE_TSX_ATOMIC
+    //printf("==> TSX Status: TSX section was taken %.2f percent of the time.  \n", (float)takenCount/totalCount*100); // live dangerously
 #endif
 }
 
@@ -524,15 +533,16 @@ shmem_shr_transport_atomicv(shmem_ctx_t ctx, void *target, const void *source,
 #define BMAN_ATOMIC_INCREMENT_PROTOTYPE(TYPE_NAME, C_TYPE)                   \
   static C_TYPE bman_##TYPE_NAME##_tsx_atomic_increment(C_TYPE * remote_ptr, C_TYPE * source) { \
     int status;                                                 \
-    C_TYPE retval;                                              \
+    C_TYPE retval=0;                                            \
+    /* totalCount++; */                                         \
     while (1) {                                                 \
         status = _xbegin();                                     \
         if (status == _XBEGIN_STARTED)                          \
         {                                                       \
-            printf("Oooooo\n");                                 \
             retval = *remote_ptr;                               \
             *remote_ptr += *source;                             \
             _xend();                                            \
+            /* takenCount++;  */                                \
             break;                                              \
         }                                                       \
         else                                                    \
@@ -559,10 +569,18 @@ BMAN_ATOMIC_INCREMENT_PROTOTYPE(ptrdiff, ptrdiff_t)
 
 #else
 
+// bman: vtune
+#include <ittnotify.h>
+// /bman
+
+extern __itt_pt_region atomic_region;
+
 #define BMAN_ATOMIC_INCREMENT_PROTOTYPE(TYPE_NAME, C_TYPE)                                      \
   static C_TYPE bman_##TYPE_NAME##_tsx_atomic_increment(C_TYPE * remote_ptr, C_TYPE * source) { \
     C_TYPE retval;                                                                              \
+    __itt_mark_pt_region_begin(atomic_region);  \
     retval = __atomic_fetch_add((C_TYPE *)remote_ptr, *((C_TYPE *)source), __ATOMIC_ACQ_REL);   \
+    __itt_mark_pt_region_end(atomic_region);    \
     return retval;                                                                              \
 }
 
@@ -688,10 +706,9 @@ shmem_shr_transport_fetch_atomic(shmem_ctx_t ctx, void *target, void *source,
 #define SHMEM_DEF_SUM_OP(STYPE,TYPE,ITYPE)                                                      \
                 case ITYPE:                                                                     \
                     /* my_start_counters(); */                                                  \
-                    *(TYPE *)dest = bman_##STYPE##_tsx_atomic_increment((TYPE *)remote_ptr, (TYPE *)source); \
+                    *(TYPE *)dest = bman_##STYPE##_tsx_atomic_increment((TYPE *)remote_ptr, (TYPE *)source);  \
                                                                                                 \
-                    /* OG:  *(TYPE *)dest = __atomic_fetch_add((TYPE *)remote_ptr, *((TYPE *)source), */  \
-                    /*                                   __ATOMIC_ACQ_REL);                      */ \
+                    /* *(TYPE *)dest = __atomic_fetch_add((TYPE *)remote_ptr, *((TYPE *)source), __ATOMIC_ACQ_REL); */ \
                                                                                                 \
                     /* my_stop_counters(); */                                                   \
                     break;
