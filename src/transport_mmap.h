@@ -430,6 +430,7 @@ shmem_transport_mmap_put(void *target, const void *source, size_t len,
 #endif
 
 #ifndef BMAN_HACKING
+    //fflush(stdout); printf("(%d) ==> &dest = %p, &source = %p, len = %ld \n", getpid(), remote_ptr, source, len); fflush(stdout);
     memcpy(remote_ptr, source, len);
 #else
     // bman testing

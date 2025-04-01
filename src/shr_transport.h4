@@ -571,19 +571,23 @@ BMAN_ATOMIC_INCREMENT_PROTOTYPE(ptrdiff, ptrdiff_t)
 
 // vtune
 #include <ittnotify.h>
-extern __itt_domain* domain;
+//extern __itt_domain* domain;
+//extern __itt_pt_region atomic_region;
+
 
 #define BMAN_ATOMIC_INCREMENT_PROTOTYPE(TYPE_NAME, C_TYPE)                                      \
   static C_TYPE bman_##TYPE_NAME##_tsx_atomic_increment(C_TYPE * remote_ptr, C_TYPE * source) { \
     C_TYPE retval;                                                                              \
     static int entryCount = 0;                          \
-    if ((entryCount & 0x7F) == 0) {                   \
-        __itt_frame_begin_v3(domain, NULL);             \
-    }   \
+    /* Reduce #events: Every 128th: if ((entryCount & 0x7F) == 0) { */                   \
+       /* __itt_frame_begin_v3(domain, NULL);     */        \
+       /* __itt_mark_pt_region_begin(atomic_region); */ \
+    /* }  */  \
     retval = __atomic_fetch_add((C_TYPE *)remote_ptr, *((C_TYPE *)source), __ATOMIC_ACQ_REL);   \
-    if ((entryCount & 0x7F) == 0) {                   \
-        __itt_frame_end_v3(domain, NULL);               \
-    }   \
+    /* if ((entryCount & 0x7F) == 0) {    */               \
+       /* __itt_frame_end_v3(domain, NULL); */              \
+       /* __itt_mark_pt_region_end(atomic_region);  */ \
+    /* } */  \
     entryCount++;                                   \
     return retval;                                                                              \
 }
@@ -710,9 +714,9 @@ shmem_shr_transport_fetch_atomic(shmem_ctx_t ctx, void *target, void *source,
 #define SHMEM_DEF_SUM_OP(STYPE,TYPE,ITYPE)                                                      \
                 case ITYPE:                                                                     \
                     /* my_start_counters(); */                                                  \
-                    *(TYPE *)dest = bman_##STYPE##_tsx_atomic_increment((TYPE *)remote_ptr, (TYPE *)source);  \
+                    /* *(TYPE *)dest = bman_##STYPE##_tsx_atomic_increment((TYPE *)remote_ptr, (TYPE *)source); */  \
                                                                                                 \
-                    /* *(TYPE *)dest = __atomic_fetch_add((TYPE *)remote_ptr, *((TYPE *)source), __ATOMIC_ACQ_REL); */ \
+                    *(TYPE *)dest = __atomic_fetch_add((TYPE *)remote_ptr, *((TYPE *)source), __ATOMIC_ACQ_REL);  \
                                                                                                 \
                     /* my_stop_counters(); */                                                   \
                     break;

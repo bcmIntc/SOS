@@ -83,9 +83,6 @@ static void shm_create_key(char *key, size_t max_size, unsigned pe, size_t num) 
 static void *shm_create_region(char* base, const char *key, size_t shm_size) {
   if (shm_size == 0) return NULL;
 
-    // bman
-    //printf("==>+shm_create_region(): shm_size = %ld \n", shm_size); fflush(stdout);
-
   shm_unlink(key);
   int fd = shm_open(key, O_RDWR | O_CREAT | O_TRUNC, 0666);
   if (fd == -1) {
@@ -162,7 +159,7 @@ static void *shm_create_region_data_seg(char* base, const char *key, size_t shm_
 }
 
 
-static void *shm_attach_region(char* base, const char *key, unsigned int shm_size) {
+static void *shm_attach_region(char* base, const char *key, size_t shm_size) {
   if (shm_size == 0) return NULL;
 
   int fd = shm_open(key, O_RDWR, 0);
@@ -300,7 +297,7 @@ static PerfmonCommand* readPerfmonCommandsFromFile(const char* filePath, size_t*
         // Ensure there are exactly 4 constants, fill with empty strings if necessary
         while (i < NUM_CONSTANTS) {
             constants[i++] = strdup("");  // Use strdup to avoid uninitialized pointers
-            printf("constants2[%d] = %s \n", i, constants[i]); fflush(stdout);          // not seen
+            //printf("constants2[%d] = %s \n", i, constants[i]); fflush(stdout);          // not seen
         }
 
         // Copy event name string
@@ -447,7 +444,7 @@ int shmem_transport_mmap_init(void)
     len  = FIND_LEN(shmem_internal_heap_base, shmem_internal_heap_length, page_size);
 
     // bman
-    //printf("==>shmem_transport_mmap_init(void): heap len = %ld \n", len); fflush(stdout);
+    printf("==>shmem_transport_mmap_init(void): Calling shm_create_region(len = heap len = %ld) \n", len); fflush(stdout);
     //
     
     shm_create_key(key_prefix, MPIDI_OFI_SHMGR_NAME_MAXLEN-10, shmem_internal_my_pe, 2);
@@ -507,12 +504,16 @@ shmem_transport_mmap_startup(void)
 
             char key_prefix[MPIDI_OFI_SHMGR_NAME_MAXLEN-10];
             char key[MPIDI_OFI_SHMGR_NAME_MAXLEN];
-            int len = 0;
+            size_t len = 0;
 
 	    /* Attach data segment to neighbors: */
             len  = FIND_LEN(shmem_internal_data_base, shmem_internal_data_length, page_size);
             shm_create_key(key_prefix, MPIDI_OFI_SHMGR_NAME_MAXLEN-10, i, 1);
             snprintf(key, MPIDI_OFI_SHMGR_NAME_MAXLEN, "%s-data", key_prefix);
+
+            // bman
+            printf("==> Calling shm_attach_region(len = %ld) to attach to peer's DATA shm region.\n", len); fflush(stdout);
+
             shmem_transport_mmap_peers[peer_num].data_attach_ptr = shm_attach_region(NULL, key, len);
 
             if (shmem_transport_mmap_peers[peer_num].data_attach_ptr == NULL) {
@@ -527,6 +528,10 @@ shmem_transport_mmap_startup(void)
             len  = FIND_LEN(shmem_internal_heap_base, shmem_internal_heap_length, page_size);
             shm_create_key(key_prefix, MPIDI_OFI_SHMGR_NAME_MAXLEN-10, i, 2);
             snprintf(key, MPIDI_OFI_SHMGR_NAME_MAXLEN, "%s-heap", key_prefix);
+            
+            // bman
+            printf("==> Calling shm_attach_region(len = %ld) to attach to peer's HEAP shm region.\n", len); fflush(stdout);
+
             shmem_transport_mmap_peers[peer_num].heap_attach_ptr = shm_attach_region(NULL, key, len);
 
             if (shmem_transport_mmap_peers[peer_num].heap_attach_ptr == NULL) {
