@@ -30,7 +30,7 @@ include(shmem_bind_c.m4)dnl
 #ifdef USE_MMAP
   #include "transport_mmap.h"
 
-  //#define USE_TSX_ATOMIC
+  #define USE_TSX_ATOMIC
 #endif
 
 #ifdef USE_TSX_ATOMIC
@@ -60,7 +60,7 @@ shmem_shr_transport_init(void)
 #endif
 
 #ifdef USE_TSX_ATOMIC
-    takenCount = totalCount = 123;
+    takenCount = totalCount = 0;
 #endif
     return ret;
 }
@@ -106,7 +106,7 @@ shmem_shr_transport_fini(void)
 #endif
 
 #ifdef USE_TSX_ATOMIC
-    //printf("==> TSX Status: TSX section was taken %.2f percent of the time.  \n", (float)takenCount/totalCount*100); // live dangerously
+    //printf("==> [%d] TSX Status: TSX section was taken %.2f percent of the time. takenCount = %d, totalCount = %d \n", shmem_internal_my_pe, (float)takenCount/totalCount*100, takenCount, totalCount);
 #endif
 }
 
@@ -519,58 +519,9 @@ shmem_shr_transport_atomicv(shmem_ctx_t ctx, void *target, const void *source,
 }
 
 
-
-
-// Atomic Increment using TSX
-
-#if defined(USE_TSX_ATOMIC)
-
-// NOTE: This needs to ultimately use SHM itself in order to work. 
-//       The caller (HAMR) will call this with various pointers, so we cant simply allocate a counter internally.
-//       The app would need to do this - we just operate on it. So in reality, we are tightly-coupled to the mmap solution.
-//       It therefore makes more sense to just operate on the addresses, and *ASSUME* they are SHM.
-//
-#define BMAN_ATOMIC_INCREMENT_PROTOTYPE(TYPE_NAME, C_TYPE)                   \
-  static C_TYPE bman_##TYPE_NAME##_tsx_atomic_increment(C_TYPE * remote_ptr, C_TYPE * source) { \
-    int status;                                                 \
-    C_TYPE retval=0;                                            \
-    /* totalCount++; */                                         \
-    while (1) {                                                 \
-        status = _xbegin();                                     \
-        if (status == _XBEGIN_STARTED)                          \
-        {                                                       \
-            retval = *remote_ptr;                               \
-            *remote_ptr += *source;                             \
-            _xend();                                            \
-            /* takenCount++;  */                                \
-            break;                                              \
-        }                                                       \
-        else                                                    \
-        {                                                       \
-            retval = __atomic_fetch_add((C_TYPE *)remote_ptr, *((C_TYPE *)source), __ATOMIC_ACQ_REL); \
-            break;                                              \
-        }                                                       \
-    }                                                           \
-    return retval;                                              \
-}
-
-BMAN_ATOMIC_INCREMENT_PROTOTYPE(int, int)
-BMAN_ATOMIC_INCREMENT_PROTOTYPE(long, long)
-BMAN_ATOMIC_INCREMENT_PROTOTYPE(longlong, long long)
-BMAN_ATOMIC_INCREMENT_PROTOTYPE(uint, unsigned int)
-BMAN_ATOMIC_INCREMENT_PROTOTYPE(ulong, unsigned long)
-BMAN_ATOMIC_INCREMENT_PROTOTYPE(ulonglong, unsigned long long)
-BMAN_ATOMIC_INCREMENT_PROTOTYPE(int32, int32_t)
-BMAN_ATOMIC_INCREMENT_PROTOTYPE(int64, int64_t)
-BMAN_ATOMIC_INCREMENT_PROTOTYPE(uint32, uint32_t)
-BMAN_ATOMIC_INCREMENT_PROTOTYPE(uint64, uint64_t)
-BMAN_ATOMIC_INCREMENT_PROTOTYPE(size, size_t)
-BMAN_ATOMIC_INCREMENT_PROTOTYPE(ptrdiff, ptrdiff_t)
-
-#else
-
 // vtune
-#include <ittnotify.h>
+#if 0
+//#include <ittnotify.h>
 //extern __itt_domain* domain;
 //extern __itt_pt_region atomic_region;
 
@@ -578,7 +529,7 @@ BMAN_ATOMIC_INCREMENT_PROTOTYPE(ptrdiff, ptrdiff_t)
 #define BMAN_ATOMIC_INCREMENT_PROTOTYPE(TYPE_NAME, C_TYPE)                                      \
   static C_TYPE bman_##TYPE_NAME##_tsx_atomic_increment(C_TYPE * remote_ptr, C_TYPE * source) { \
     C_TYPE retval;                                                                              \
-    static int entryCount = 0;                          \
+    /* static int entryCount = 0;    */                      \
     /* Reduce #events: Every 128th: if ((entryCount & 0x7F) == 0) { */                   \
        /* __itt_frame_begin_v3(domain, NULL);     */        \
        /* __itt_mark_pt_region_begin(atomic_region); */ \
@@ -588,7 +539,7 @@ BMAN_ATOMIC_INCREMENT_PROTOTYPE(ptrdiff, ptrdiff_t)
        /* __itt_frame_end_v3(domain, NULL); */              \
        /* __itt_mark_pt_region_end(atomic_region);  */ \
     /* } */  \
-    entryCount++;                                   \
+    /* entryCount++;                      */             \
     return retval;                                                                              \
 }
 
@@ -604,8 +555,8 @@ BMAN_ATOMIC_INCREMENT_PROTOTYPE(uint32, uint32_t)
 BMAN_ATOMIC_INCREMENT_PROTOTYPE(uint64, uint64_t)
 BMAN_ATOMIC_INCREMENT_PROTOTYPE(size, size_t)
 BMAN_ATOMIC_INCREMENT_PROTOTYPE(ptrdiff, ptrdiff_t)
+#endif // vtune
 
-#endif  // USE_TSX_ATOMIC
 
 
 // bman: add perfmon hooks
@@ -691,35 +642,107 @@ shmem_shr_transport_fetch_atomic(shmem_ctx_t ctx, void *target, void *source,
 
     shmem_shr_transport_ptr(target, noderank, &remote_ptr);
 
-#define SHMEM_DEF_BAND_OP(STYPE,TYPE,ITYPE)                                                     \
-                case ITYPE:                                                                     \
-                    *(TYPE *)dest = __atomic_fetch_and((TYPE *)remote_ptr, *((TYPE *)source),   \
-                                                       __ATOMIC_ACQ_REL);                       \
+#ifdef USE_TSX_ATOMIC
+  #define SHMEM_DEF_BAND_OP(STYPE,TYPE,ITYPE)                               \
+                case ITYPE: {                                               \
+                    int status = _xbegin();                                 \
+                    if (status == _XBEGIN_STARTED)                          \
+                    {                                                       \
+                        *(TYPE *)dest = *(TYPE *)remote_ptr;                \
+                        *(TYPE *)remote_ptr &= *(TYPE *)source;             \
+                        _xend();                                            \
+                        break;                                              \
+                    }                                                       \
+                    else                                                    \
+                    {                                                       \
+                        *(TYPE *)dest = __atomic_fetch_and((TYPE *)remote_ptr, *((TYPE *)source), __ATOMIC_ACQ_REL); \
+                        break;                                              \
+                    }                                                       \
+                }
+#else
+  #define SHMEM_DEF_BAND_OP(STYPE,TYPE,ITYPE)                               \
+                case ITYPE:                                                 \
+                    *(TYPE *)dest = __atomic_fetch_and((TYPE *)remote_ptr, *((TYPE *)source), __ATOMIC_ACQ_REL); \
                     break;
+#endif
 
-#define SHMEM_DEF_BOR_OP(STYPE,TYPE,ITYPE)                                                      \
-                case ITYPE:                                                                     \
-                    *(TYPE *)dest = __atomic_fetch_or((TYPE *)remote_ptr, *((TYPE *)source),    \
-                                                      __ATOMIC_ACQ_REL);                        \
+#ifdef USE_TSX_ATOMIC
+  #define SHMEM_DEF_BOR_OP(STYPE,TYPE,ITYPE)                                \
+                case ITYPE: {                                               \
+                    /* *(TYPE *)dest = bman_##STYPE##_tsx_atomic_fetch_or((TYPE *)remote_ptr, (TYPE *)source); */ \
+                    int status = _xbegin();                                 \
+                    if (status == _XBEGIN_STARTED)                          \
+                    {                                                       \
+                        *(TYPE *)dest = *(TYPE *)remote_ptr;                \
+                        *(TYPE *)remote_ptr |= *(TYPE *)source;             \
+                        _xend();                                            \
+                        break;                                              \
+                    }                                                       \
+                    else                                                    \
+                    {                                                       \
+                        *(TYPE *)dest = __atomic_fetch_or((TYPE *)remote_ptr, *((TYPE *)source), __ATOMIC_ACQ_REL); \
+                        break;                                              \
+                    }                                                       \
+                }
+#else
+  #define SHMEM_DEF_BOR_OP(STYPE,TYPE,ITYPE)                                \
+                case ITYPE:                                                 \
+                    *(TYPE *)dest = __atomic_fetch_or((TYPE *)remote_ptr, *((TYPE *)source), __ATOMIC_ACQ_REL); \
                     break;
+#endif
 
-#define SHMEM_DEF_BXOR_OP(STYPE,TYPE,ITYPE)                                                     \
-                case ITYPE:                                                                     \
-                    *(TYPE *)dest = __atomic_fetch_xor((TYPE *)remote_ptr, *((TYPE *)source),   \
-                                                       __ATOMIC_ACQ_REL);                       \
+#ifdef USE_TSX_ATOMIC
+  #define SHMEM_DEF_BXOR_OP(STYPE,TYPE,ITYPE)                               \
+                case ITYPE: {                                               \
+                    /* *(TYPE *)dest = bman_##STYPE##_tsx_atomic_fetch_xor((TYPE *)remote_ptr, (TYPE *)source); */ \
+                    int status = _xbegin();                                 \
+                    if (status == _XBEGIN_STARTED)                          \
+                    {                                                       \
+                        *(TYPE *)dest = *(TYPE *)remote_ptr;                \
+                        *(TYPE *)remote_ptr ^= *(TYPE *)source;             \
+                        _xend();                                            \
+                        break;                                              \
+                    }                                                       \
+                    else                                                    \
+                    {                                                       \
+                        *(TYPE *)dest = __atomic_fetch_xor((TYPE *)remote_ptr, *((TYPE *)source), __ATOMIC_ACQ_REL); \
+                        break;                                              \
+                    }                                                       \
+                }                    
+#else
+  #define SHMEM_DEF_BXOR_OP(STYPE,TYPE,ITYPE)                               \
+                case ITYPE:                                                 \
+                    *(TYPE *)dest = __atomic_fetch_xor((TYPE *)remote_ptr, *((TYPE *)source), __ATOMIC_ACQ_REL); \
                     break;
+#endif
 
+#ifdef USE_TSX_ATOMIC
+  #define SHMEM_DEF_SUM_OP(STYPE,TYPE,ITYPE)                                \
+                case ITYPE: {                                               \
+                    /* totalCount++; */                                     \
+                    int status = _xbegin();                                 \
+                    if (status == _XBEGIN_STARTED)                          \
+                    {                                                       \
+                        *(TYPE *)dest = *(TYPE *)remote_ptr;                \
+                        *(TYPE *)remote_ptr += *(TYPE *)source;             \
+                        _xend();                                            \
+                        /* takenCount++;  */                                \
+                        break;                                              \
+                    }                                                       \
+                    else                                                    \
+                    {                                                       \
+                        *(TYPE *)dest = __atomic_fetch_add((TYPE *)remote_ptr, *((TYPE *)source), __ATOMIC_ACQ_REL); \
+                        break;                                              \
+                    }                                                       \
+                }
 
-/* bman: in here for hamr::shmem_long_atomic_fetch_add() call */
-#define SHMEM_DEF_SUM_OP(STYPE,TYPE,ITYPE)                                                      \
-                case ITYPE:                                                                     \
-                    /* my_start_counters(); */                                                  \
-                    /* *(TYPE *)dest = bman_##STYPE##_tsx_atomic_increment((TYPE *)remote_ptr, (TYPE *)source); */  \
-                                                                                                \
-                    *(TYPE *)dest = __atomic_fetch_add((TYPE *)remote_ptr, *((TYPE *)source), __ATOMIC_ACQ_REL);  \
-                                                                                                \
-                    /* my_stop_counters(); */                                                   \
-                    break;
+#else
+  #define SHMEM_DEF_SUM_OP(STYPE,TYPE,ITYPE)                                \
+                case ITYPE:                                                 \
+                    *(TYPE *)dest = __atomic_fetch_add((TYPE *)remote_ptr, *((TYPE *)source), __ATOMIC_ACQ_REL); \
+                    break;      
+#endif
+
 
     switch (op) {
         case SHM_INTERNAL_BAND:

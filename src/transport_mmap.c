@@ -106,8 +106,8 @@ static void *shm_create_region(char* base, const char *key, size_t shm_size) {
 #ifdef LOCK_PAGES
     // Lock the memory pages into RAM
     if (mlock(shm_base_addr, shm_size) != 0) {
-        // Err, but not fatal
         fprintf(stderr, "Error: Unable to pin pages.\n");
+        exit(1);
     }
 #endif
 
@@ -148,8 +148,8 @@ static void *shm_create_region_data_seg(char* base, const char *key, size_t shm_
 #ifdef LOCK_PAGES
     // Lock the memory pages into RAM
     if (mlock(shm_base_addr, shm_size) != 0) {
-        // Err, but not fatal
         fprintf(stderr, "shm_create_region_data_seg: Error: Unable to pin pages.\n");
+        exit(0);
     }
 #endif
 
@@ -444,7 +444,7 @@ int shmem_transport_mmap_init(void)
     len  = FIND_LEN(shmem_internal_heap_base, shmem_internal_heap_length, page_size);
 
     // bman
-    printf("==>shmem_transport_mmap_init(void): Calling shm_create_region(len = heap len = %ld) \n", len); fflush(stdout);
+    //printf("==>shmem_transport_mmap_init(void): Calling shm_create_region(len = heap len = %ld) \n", len); fflush(stdout);
     //
     
     shm_create_key(key_prefix, MPIDI_OFI_SHMGR_NAME_MAXLEN-10, shmem_internal_my_pe, 2);
@@ -512,7 +512,7 @@ shmem_transport_mmap_startup(void)
             snprintf(key, MPIDI_OFI_SHMGR_NAME_MAXLEN, "%s-data", key_prefix);
 
             // bman
-            printf("==> Calling shm_attach_region(len = %ld) to attach to peer's DATA shm region.\n", len); fflush(stdout);
+            //printf("==> Calling shm_attach_region(len = %ld) to attach to peer's DATA shm region.\n", len); fflush(stdout);
 
             shmem_transport_mmap_peers[peer_num].data_attach_ptr = shm_attach_region(NULL, key, len);
 
@@ -530,7 +530,7 @@ shmem_transport_mmap_startup(void)
             snprintf(key, MPIDI_OFI_SHMGR_NAME_MAXLEN, "%s-heap", key_prefix);
             
             // bman
-            printf("==> Calling shm_attach_region(len = %ld) to attach to peer's HEAP shm region.\n", len); fflush(stdout);
+            //printf("==> Calling shm_attach_region(len = %ld) to attach to peer's HEAP shm region.\n", len); fflush(stdout);
 
             shmem_transport_mmap_peers[peer_num].heap_attach_ptr = shm_attach_region(NULL, key, len);
 
