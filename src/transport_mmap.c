@@ -40,6 +40,9 @@
 #endif
 
 #if defined(USE_PERFMON_MMAP) || defined(USE_PERFMON_ATM)
+
+ SHOULD_BE_DISABLED2;
+
  #include <ctype.h>
  int diff_count = 0;
  int eventCount = 0;
@@ -97,17 +100,27 @@ static void *shm_create_region(char* base, const char *key, size_t shm_size) {
       exit(0);
   }
 
-  void *shm_base_addr = mmap(base, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED | MAP_POPULATE, fd, 0);
+  void *shm_base_addr = mmap(base, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+  //void *shm_base_addr = mmap(base, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED | MAP_POPULATE, fd, 0);
   if (MAP_FAILED == shm_base_addr) {
       fprintf(stderr, "mmap_init error mmap %s size %ld\n", key, shm_size);
       exit(0);
   }
 
-#ifdef LOCK_PAGES
+#if defined(LOCK_PAGES)
     // Lock the memory pages into RAM
     if (mlock(shm_base_addr, shm_size) != 0) {
-        fprintf(stderr, "Error: Unable to pin pages.\n");
+        fprintf(stderr, "shm_create_region(): Error: Unable to pin pages.\n");
+        munmap(shm_base_addr, shm_size);
+        shmem_finalize();
+        perror("mlock-shm_create_region");
         exit(1);
+    }
+#elif defined(FAULT_PAGES_MANUALLY)
+    // Fault in pages manually
+    long page_size = sysconf(_SC_PAGESIZE);
+    for (size_t i = 0; i < shm_size; i += page_size) {
+        ((char *)shm_base_addr)[i] = 0;
     }
 #endif
 
@@ -139,17 +152,27 @@ static void *shm_create_region_data_seg(char* base, const char *key, size_t shm_
         exit(1);
     }
 
-    void *shm_base_addr = mmap(base, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED | MAP_POPULATE, fd, 0);
+    //void *shm_base_addr = mmap(base, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED | MAP_POPULATE, fd, 0);
+    void *shm_base_addr = mmap(base, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
     if (MAP_FAILED == shm_base_addr) {
         fprintf(stderr, "mmap_init error mmap %s size %ld\n", key, shm_size);
         exit(1);
     }
 
-#ifdef LOCK_PAGES
+#if defined(LOCK_PAGES)
     // Lock the memory pages into RAM
     if (mlock(shm_base_addr, shm_size) != 0) {
-        fprintf(stderr, "shm_create_region_data_seg: Error: Unable to pin pages.\n");
-        exit(0);
+        fprintf(stderr, "shm_create_region_data_seg(): Error: Unable to pin pages.\n");
+        munmap(shm_base_addr, shm_size);
+        shmem_finalize();
+        perror("mlock-shm_create_region_data_seg");
+        exit(1);
+    }
+#elif defined(FAULT_PAGES_MANUALLY)
+    long page_size = sysconf(_SC_PAGESIZE);
+    // Fault in pages manually
+    for (size_t i = 0; i < shm_size; i += page_size) {
+        ((char *)shm_base_addr)[i] = 0;    
     }
 #endif
 
@@ -167,17 +190,27 @@ static void *shm_attach_region(char* base, const char *key, size_t shm_size) {
       fprintf(stderr, "mmap_init error shm_open\n");
       exit(0);
   }
-  void *shm_base_addr = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, 0);
+  //void *shm_base_addr = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, 0);
+  void *shm_base_addr = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
   if (MAP_FAILED == shm_base_addr) {
       fprintf(stderr, "mmap_init error mmap %s  size %d\n", key, shm_size);
       exit(0);
   }
 
-#ifdef LOCK_PAGES
+#if defined(LOCK_PAGES)
     // Lock the memory pages into RAM
     if (mlock(shm_base_addr, shm_size) != 0) {
-        // Err, but not fatal
         fprintf(stderr, "shm_attach_region: Error: Unable to pin pages.\n");
+        munmap(shm_base_addr, shm_size);
+        shmem_finalize();
+        perror("mlock-shm_attach_region");
+        exit(1);
+    }
+#elif defined(FAULT_PAGES_MANUALLY)
+    long page_size = sysconf(_SC_PAGESIZE);
+    // Fault in pages manually
+    for (size_t i = 0; i < shm_size; i += page_size) {
+        ((char *)shm_base_addr)[i] = 0;
     }
 #endif
 
@@ -201,6 +234,8 @@ static struct share_info_t my_info;
 
 // bman
 #if defined(USE_PERFMON_MMAP) || defined(USE_PERFMON_ATM)
+
+  SHOULD_NOT_BE_ENABLED3;
 
 #define ENV_VAR "PERFMON_FILE_PATH"
 #define MAX_STRING_LENGTH 1024
@@ -359,6 +394,8 @@ int shmem_transport_mmap_init(void)
 
 
 #if defined(USE_PERFMON_MMAP) || defined(USE_PERFMON_ATM)
+    FEATURE_SHOULD_BE_DISABLED4;
+
     size_t count;
     const char* filePath = getenv(ENV_VAR);
     if (!filePath) {
@@ -565,6 +602,8 @@ shmem_transport_mmap_fini(void)
 #endif
 
 #if defined(USE_PERFMON_MMAP) || defined(USE_PERFMON_ATM)
+    FEATURE_SHOULB_NOT_BE_ENABLED7;
+
     // Print out lockstep - i.e. present the samples temporally aligned
     int running_sum[MAX_EVENTS] = {0};
     //if (0 == shmem_internal_my_pe) 

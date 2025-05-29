@@ -30,7 +30,7 @@ include(shmem_bind_c.m4)dnl
 #ifdef USE_MMAP
   #include "transport_mmap.h"
 
-  #define USE_TSX_ATOMIC
+//  #define USE_TSX_ATOMIC
 #endif
 
 #ifdef USE_TSX_ATOMIC
@@ -234,6 +234,8 @@ shmem_shr_transport_get(shmem_ctx_t ctx, void *target, const void *source,
 }
 
 
+/* __atomic_exchange(type *remote_ptr, type *source, type *dest, int memorder)(): It stores the contents of *source into *remote_ptr. The original value of *remote_ptr is copied into *dest. */
+
 static inline void
 shmem_shr_transport_swap(shmem_ctx_t ctx, void *target, void *source,
                          void *dest, size_t len, int pe,
@@ -248,11 +250,30 @@ shmem_shr_transport_swap(shmem_ctx_t ctx, void *target, void *source,
 
     shmem_shr_transport_ptr(target, noderank, &remote_ptr);
 
-#define SHMEM_DEF_SWAP(STYPE,TYPE,ITYPE)                                \
-        case ITYPE:                                                     \
-                __atomic_exchange((TYPE *)remote_ptr, (TYPE *)source,   \
-                                  (TYPE *)dest, __ATOMIC_ACQ_REL);      \
+#ifdef USE_TSX_ATOMIC
+  #define SHMEM_DEF_SWAP(STYPE,TYPE,ITYPE)                          \
+        case ITYPE: {                                               \
+            int status = _xbegin();                                 \
+            if (status == _XBEGIN_STARTED)                          \
+            {                                                       \
+                *(TYPE *)dest = *(TYPE *)remote_ptr;                \
+                *(TYPE *)remote_ptr = *(TYPE *)source;              \
+                _xend();                                            \
+                break;                                              \
+            }                                                       \
+            else                                                    \
+            {                                                       \
+                __atomic_exchange((TYPE *)remote_ptr, (TYPE *)source, (TYPE *)dest, __ATOMIC_ACQ_REL);      \
+                break;                                              \
+            }                                                       \
+       }
+#else
+  #define SHMEM_DEF_SWAP(STYPE,TYPE,ITYPE)                          \
+        case ITYPE:                                                 \
+                __atomic_exchange((TYPE *)remote_ptr, (TYPE *)source, (TYPE *)dest, __ATOMIC_ACQ_REL);      \
             break;
+#endif
+
 
     switch (datatype) {
 SHMEM_DEFINE_FOR_EXTENDED_AMO(SHMEM_DEF_SWAP)
@@ -370,25 +391,98 @@ shmem_shr_transport_atomic(shmem_ctx_t ctx, void *target, const void *source,
 
     shmem_shr_transport_ptr(target, noderank, &remote_ptr);
 
-#define SHMEM_DEF_BAND_OP(STYPE,TYPE,ITYPE)                                                     \
+#ifdef USE_TSX_ATOMIC
+  #define SHMEM_DEF_BAND_OP(STYPE,TYPE,ITYPE)                               \
+                case ITYPE: {                                               \
+                    int status = _xbegin();                                 \
+                    if (status == _XBEGIN_STARTED)                          \
+                    {                                                       \
+                        *(TYPE *)remote_ptr &= *(TYPE *)source;             \
+                        _xend();                                            \
+                        break;                                              \
+                    }                                                       \
+                    else                                                    \
+                    {                                                       \
+                        __atomic_fetch_and((TYPE *)remote_ptr, *((TYPE *)source), __ATOMIC_RELEASE); \
+                        break;                                              \
+                    }                                                       \
+                }
+#else
+  #define SHMEM_DEF_BAND_OP(STYPE,TYPE,ITYPE)                                                   \
                 case ITYPE:                                                                     \
                     __atomic_fetch_and((TYPE *)remote_ptr, *((TYPE *)source), __ATOMIC_RELEASE);\
                     break;
+#endif
 
-#define SHMEM_DEF_BOR_OP(STYPE,TYPE,ITYPE)                                                      \
+#ifdef USE_TSX_ATOMIC
+  #define SHMEM_DEF_BOR_OP(STYPE,TYPE,ITYPE)                                \
+                case ITYPE: {                                               \
+                    int status = _xbegin();                                 \
+                    if (status == _XBEGIN_STARTED)                          \
+                    {                                                       \
+                        *(TYPE *)remote_ptr |= *(TYPE *)source;             \
+                        _xend();                                            \
+                        break;                                              \
+                    }                                                       \
+                    else                                                    \
+                    {                                                       \
+                        __atomic_fetch_or((TYPE *)remote_ptr, *((TYPE *)source), __ATOMIC_ACQ_REL); \
+                        break;                                              \
+                    }                                                       \
+                }
+#else
+  #define SHMEM_DEF_BOR_OP(STYPE,TYPE,ITYPE)                                                      \
                 case ITYPE:                                                                     \
                     __atomic_fetch_or((TYPE *)remote_ptr, *((TYPE *)source), __ATOMIC_RELEASE); \
                     break;
+#endif
 
-#define SHMEM_DEF_BXOR_OP(STYPE,TYPE,ITYPE)                                                     \
+#ifdef USE_TSX_ATOMIC
+  #define SHMEM_DEF_BXOR_OP(STYPE,TYPE,ITYPE)                               \
+                case ITYPE: {                                               \
+                    int status = _xbegin();                                 \
+                    if (status == _XBEGIN_STARTED)                          \
+                    {                                                       \
+                        *(TYPE *)remote_ptr ^= *(TYPE *)source;             \
+                        _xend();                                            \
+                        break;                                              \
+                    }                                                       \
+                    else                                                    \
+                    {                                                       \
+                        __atomic_fetch_xor((TYPE *)remote_ptr, *((TYPE *)source), __ATOMIC_ACQ_REL); \
+                        break;                                              \
+                    }                                                       \
+                }
+#else
+  #define SHMEM_DEF_BXOR_OP(STYPE,TYPE,ITYPE)                                                     \
                 case ITYPE:                                                                     \
                     __atomic_fetch_xor((TYPE *)remote_ptr, *((TYPE *)source), __ATOMIC_RELEASE);\
                     break;
+#endif
 
-#define SHMEM_DEF_SUM_OP(STYPE,TYPE,ITYPE)                                                      \
+#ifdef USE_TSX_ATOMIC
+  #define SHMEM_DEF_SUM_OP(STYPE,TYPE,ITYPE)                                \
+                case ITYPE: {                                               \
+                    int status = _xbegin();                                 \
+                    if (status == _XBEGIN_STARTED)                          \
+                    {                                                       \
+                        *(TYPE *)remote_ptr += *(TYPE *)source;             \
+                        _xend();                                            \
+                        break;                                              \
+                    }                                                       \
+                    else                                                    \
+                    {                                                       \
+                        __atomic_fetch_add((TYPE *)remote_ptr, *((TYPE *)source), __ATOMIC_ACQ_REL); \
+                        break;                                              \
+                    }                                                       \
+                }
+
+#else
+  #define SHMEM_DEF_SUM_OP(STYPE,TYPE,ITYPE)                                                      \
                 case ITYPE:                                                                     \
                     __atomic_fetch_add((TYPE *)remote_ptr, *((TYPE *)source), __ATOMIC_RELEASE);\
                     break;
+#endif
 
     switch (op) {
         case SHM_INTERNAL_BAND:
@@ -454,10 +548,28 @@ shmem_shr_transport_atomic_fetch(shmem_ctx_t ctx, void *target,
 
     shmem_shr_transport_ptr((void *)source, noderank, &remote_ptr);
 
-#define SHMEM_DEF_FETCH(STYPE,TYPE,ITYPE)                                       \
-        case ITYPE:                                                             \
-            __atomic_load((TYPE *)remote_ptr, (TYPE *)target, __ATOMIC_ACQUIRE);\
+#ifdef USE_TSX_ATOMIC
+  #define SHMEM_DEF_FETCH(STYPE,TYPE,ITYPE)                         \
+        case ITYPE: {                                               \
+            int status = _xbegin();                                 \
+            if (status == _XBEGIN_STARTED)                          \
+            {                                                       \
+                *(TYPE *)target = *(TYPE *)remote_ptr;              \
+                _xend();                                            \
+                break;                                              \
+            }                                                       \
+            else                                                    \
+            {                                                       \
+                __atomic_load((TYPE *)remote_ptr, (TYPE *)target, __ATOMIC_ACQUIRE);\
+                break;                                              \
+            }                                                       \
+        }
+#else
+  #define SHMEM_DEF_FETCH(STYPE,TYPE,ITYPE)                                      \
+        case ITYPE:                                                              \
+            __atomic_load((TYPE *)remote_ptr, (TYPE *)target, __ATOMIC_ACQUIRE); \
             break;
+#endif
 
     switch (datatype) {
 SHMEM_DEFINE_FOR_EXTENDED_AMO(SHMEM_DEF_FETCH)
@@ -487,10 +599,28 @@ shmem_shr_transport_atomic_set(shmem_ctx_t ctx, void *target,
 
     shmem_shr_transport_ptr(target, noderank, &remote_ptr);
 
-#define SHMEM_DEF_SET(STYPE,TYPE,ITYPE)                                                 \
-        case ITYPE:                                                                     \
-            __atomic_store((TYPE *)remote_ptr, (TYPE *)source, __ATOMIC_RELEASE);       \
+#ifdef USE_TSX_ATOMIC
+  #define SHMEM_DEF_SET(STYPE,TYPE,ITYPE)                           \
+        case ITYPE: {                                               \
+            int status = _xbegin();                                 \
+            if (status == _XBEGIN_STARTED)                          \
+            {                                                       \
+                *(TYPE *)remote_ptr = *(TYPE *)source;              \
+                _xend();                                            \
+                break;                                              \
+            }                                                       \
+            else                                                    \
+            {                                                       \
+                __atomic_store((TYPE *)remote_ptr, (TYPE *)source, __ATOMIC_RELEASE); \
+                break;                                              \
+            }                                                       \
+        }
+#else
+  #define SHMEM_DEF_SET(STYPE,TYPE,ITYPE)                                         \
+        case ITYPE:                                                               \
+            __atomic_store((TYPE *)remote_ptr, (TYPE *)source, __ATOMIC_RELEASE); \
             break;
+#endif
 
     switch (datatype) {
 SHMEM_DEFINE_FOR_EXTENDED_AMO(SHMEM_DEF_SET)
@@ -570,6 +700,8 @@ BMAN_ATOMIC_INCREMENT_PROTOTYPE(ptrdiff, ptrdiff_t)
  #include <fcntl.h>
  #include <fcntl.h>
  #include <sys/syscall.h>
+
+ FEATURE_SHOULD_BE_DISABLED;
 
 static inline __attribute__((always_inline)) void start_perf_counters()
 {
@@ -669,7 +801,6 @@ shmem_shr_transport_fetch_atomic(shmem_ctx_t ctx, void *target, void *source,
 #ifdef USE_TSX_ATOMIC
   #define SHMEM_DEF_BOR_OP(STYPE,TYPE,ITYPE)                                \
                 case ITYPE: {                                               \
-                    /* *(TYPE *)dest = bman_##STYPE##_tsx_atomic_fetch_or((TYPE *)remote_ptr, (TYPE *)source); */ \
                     int status = _xbegin();                                 \
                     if (status == _XBEGIN_STARTED)                          \
                     {                                                       \
@@ -694,7 +825,6 @@ shmem_shr_transport_fetch_atomic(shmem_ctx_t ctx, void *target, void *source,
 #ifdef USE_TSX_ATOMIC
   #define SHMEM_DEF_BXOR_OP(STYPE,TYPE,ITYPE)                               \
                 case ITYPE: {                                               \
-                    /* *(TYPE *)dest = bman_##STYPE##_tsx_atomic_fetch_xor((TYPE *)remote_ptr, (TYPE *)source); */ \
                     int status = _xbegin();                                 \
                     if (status == _XBEGIN_STARTED)                          \
                     {                                                       \

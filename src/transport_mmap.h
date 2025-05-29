@@ -22,18 +22,23 @@
 // bman
 #include <immintrin.h>
 
-#ifdef MAP_POPULATE
-  #undef MAP_POPULATE
-  #define MAP_POPULATE 0        // Run this to disable my hack to mmap(). Comment out to enable it, using the default value.
-#endif
+//#ifdef MAP_POPULATE
+//  #undef MAP_POPULATE
+//  #define MAP_POPULATE 0        // Run this to disable my hack to mmap(). Comment out to enable it, using the default value. Mutex with LOCK_PAGES.
+//#endif
 
-#define LOCK_PAGES              // locks all shm pages
-//#define BMAN_HACKING            // turns on test code for memcpy replacements/hand-coded
-//#define USE_NONTEMPORAL_ALIGNED_MEMCPY  // requires BMAN_HACKING to also be set for this to take effect
+//#define FAULT_PAGES_MANUALLY    // mutex with LOCK_PAGES, priority given to LOCK_PAGES. This touches each allocated page. TODO: investigate large page usage.
+//#define LOCK_PAGES              // locks all shm pages. Mutex with above. Has limited fuctionality when scaled.
+
+//#define BMAN_HACKING          // turns on test code for memcpy replacements/hand-coded jump table
+//#define USE_JUMP_TABLE          // implies BMAN_HACKING. Define to use a jumpt table tuned for 64B.
+
+//#define USE_INTRINSICS        // uses instrinsics instead of ASM for copy replacements. Implies BMAN_HACKING.
+
 //#define BMAN_TRACK_ALIGNMENT    // independent of other flags
 
 // These 2 are mutex, not enforced
-//#define USE_CLDEMOTE_NOBARRIER            // turns on cldemote w/o memory barrier
+//#define USE_CLDEMOTE_NOBARRIER            // turns on cldemote w/o memory barrier. Requires BMAN_HACKING
 //#define USE_CLDEMOTE_BARRIER              // turns on cldemote w/memory barrier
 
 // PAPI is being annoying and not giving me access to 'PAPI_L1_DCA' for L1 accesses.
@@ -68,6 +73,9 @@
 // TODO: combine these two ifdefs
 
 #ifdef USE_PERFMON_MMAP
+
+ FEATURE_SHOULD_BE_OFF134;
+
  // Set to use my hand-coded copy functions. Unset to use default memcpy.
  #define PROFILE_MEMCPY          // look at the put's memcpy perf
 
@@ -186,11 +194,12 @@ shmem_transport_mmap_ptr(const void *target, int pe, int noderank)
 __attribute__((aligned(64)))
 inline __attribute__((always_inline)) void demote_with_barrier_1(void *dst) 
 {
-    __asm__ __volatile__("cldemote (%0)" : : "r"(dst) : "memory");      // memory clobber results in memory barrier, preventing re-ording
+    __asm__ __volatile__("cldemote (%0)" : : "r"(dst) : "memory");      // memory clobber results in memory barrier, preventing compiler re-ording
 }
 
+// Only handles 1 cacheline. Means if my datasize is larger, or misaligned and large enough, would require multiple cldemotes. Trying here to handle 64Bytes, so this is really special case.
 __attribute__((aligned(64)))
-inline __attribute__((always_inline)) void demote_without_barrier_1(void *dst) 
+inline __attribute__((always_inline)) void demote_without_barrier(void *dst) 
 {
     __asm__ __volatile__("cldemote (%0)" : : "r"(dst));
 }
@@ -214,14 +223,14 @@ inline __attribute__((always_inline)) void demote_with_barrier(void *dst)
 }
 
 __attribute__((aligned(64)))
-inline __attribute__((always_inline)) void demote_without_barrier(void *dst)
+inline __attribute__((always_inline)) void demote_without_barrier_1(void *dst)
 {
     uintptr_t addr = (uintptr_t)dst;
 
     // Demote the first cache line
     __asm__ __volatile__("cldemote (%0)" : : "r"(addr));
 
-    // If the address is not cache-line aligned, also demote the second cache line
+    // If the address is not cache-line aligned, also demote the second cache line. bman: This should also consider the size of the data we are trying to demote; if 8 bytes, but not aligned, still is one flush.
     if (addr % 64) {
         __asm__ __volatile__("cldemote (%0)" : : "r"(addr + 64));
     }
@@ -248,8 +257,8 @@ inline __attribute__((always_inline)) void demote_with_barrier_arb(void *dst, si
 
 // AVX-512 (aligned)
 //__attribute__((aligned(64)))
-//inline __attribute__((always_inline)) 
-static void mm512_copy64B_aligned(void *dst, const void *src, size_t notused)
+inline __attribute__((always_inline)) 
+static void mm512_copy64B_aligned(void *__restrict__ dst, const void *__restrict__ src, size_t notused)
 {
     __m512i r0 = _mm512_load_si512(src);
     _mm512_store_si512(dst, r0);
@@ -257,24 +266,34 @@ static void mm512_copy64B_aligned(void *dst, const void *src, size_t notused)
 
 // AVX-512 (un-aligned)
 //__attribute__((aligned(64)))
-//inline __attribute__((always_inline)) 
-static void mm512_copy64B_unaligned(void *dst, const void *src, size_t notused)
+inline __attribute__((always_inline)) 
+static void mm512_copy64B_unaligned(void *__restrict__ dst, const void *__restrict__ src, size_t notused)
+{
+#ifdef USE_INTRINSICS
+    __m512i r0 = _mm512_loadu_si512(src);
+    _mm512_storeu_si512(dst, r0);
+#else
+    __asm__ __volatile__ (
+        "vmovdqu64 (%1), %%zmm0\n\t"   // Load 64 bytes from src into zmm0
+        "vmovdqu64 %%zmm0, (%0)\n\t"   // Store 64 bytes from zmm0 to dst
+        :
+        : "r"(dst), "r"(src)
+        : "zmm0", "memory"
+    );
+#endif
+}
+
+//__attribute__((aligned(64)))
+inline __attribute__((always_inline)) 
+static void mm512_copy64B_src_aligned_dest_unaligned(void *__restrict__ dst, const void *__restrict__ src, size_t notused)
 {
     __m512i r0 = _mm512_loadu_si512(src);
     _mm512_storeu_si512(dst, r0);
 }
 
 //__attribute__((aligned(64)))
-//inline __attribute__((always_inline)) 
-static void mm512_copy64B_src_aligned_dest_unaligned(void *dst, const void *src, size_t notused)
-{
-    __m512i r0 = _mm512_loadu_si512(src);
-    _mm512_storeu_si512(dst, r0);
-}
-
-//__attribute__((aligned(64)))
-//inline __attribute__((always_inline)) 
-static void mm512_copy64B_src_unaligned_dest_aligned(void *dst, const void *src, size_t notused)
+inline __attribute__((always_inline)) 
+static void mm512_copy64B_src_unaligned_dest_aligned(void *__restrict__ dst, const void *__restrict__ src, size_t notused)
 {
     __m512i r0 = _mm512_loadu_si512(src);
     _mm512_store_si512(dst, r0);
@@ -379,6 +398,9 @@ shmem_transport_mmap_put(void *target, const void *source, size_t len,
 #endif
 
 #ifdef BMAN_TRACK_ALIGNMENT
+
+    FEATURE_SHOULD_BE_OFF;
+
     // bman: check to see if the addresses are aligned in any way
     total_count++;
     if (is_aligned(source, len))        buff_source_size_aligned++;
@@ -435,18 +457,23 @@ shmem_transport_mmap_put(void *target, const void *source, size_t len,
 #else
     // bman testing
 
-    // Compute the index: 3-bit value indicating 64byte message size, plus alignment of src and dest
-    int index = (len == 64) << 2 | (( (uintptr_t)source & 63) == 0) << 1 | (( (uintptr_t)remote_ptr & 63) == 0);
+    //FEATURE_SHOULD_BE_OFF8;
 
-    // Jump!
+  #ifdef USE_JUMP_TABLE
+    // Compute the jump table index: a 3-bit value indicating 64byte message size, 64-byte alignmentness of src, 64-byte alignmentness of dest
+    int index = (len == 64) << 2 | (( (uintptr_t)source & 63) == 0) << 1 | (( (uintptr_t)remote_ptr & 63) == 0);
     jump_table[index](remote_ptr, source, len);
+  #else
+    memcpy(remote_ptr, source, len);
+  #endif    
 
     // Bump this line down to the LLC (should help in theory for !HT)
   #ifdef USE_CLDEMOTE_BARRIER
     demote_with_barrier(remote_ptr);
   #endif
   #ifdef USE_CLDEMOTE_NOBARRIER
-    demote_without_barrier(remote_ptr);
+    //demote_without_barrier(remote_ptr);
+    __asm__ __volatile__("cldemote (%0)" : : "r"(remote_ptr));
   #endif
 #endif // BMAN_HACKING
 
@@ -501,26 +528,7 @@ shmem_transport_mmap_get(void *target, const void *source, size_t len,
     }
 #endif
 
-#ifndef BMAN_HACKING
     memcpy(target, remote_ptr, len);
-#else
-  #if 0
-    if (len == 64)
-    {
-        //if ( (((uintptr_t)source & 0x3F) == 0) && (((uintptr_t)remote_ptr & 0x3F) == 0) )
-        if (is_aligned(source, 64) && is_aligned(remote_ptr, 64))
-        {
-            mm512_copy64B_aligned(remote_ptr, source, 666);
-        }
-        else
-        {
-            mm512_copy64B_unaligned(remote_ptr, source, 666);
-        }
-        return;
-    }
-  #endif
-    memcpy(remote_ptr, source, len);
-#endif
 }
 
 #endif
