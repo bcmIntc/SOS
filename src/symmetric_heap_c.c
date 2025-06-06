@@ -172,30 +172,40 @@ static void *mmap_alloc(size_t bytes)
                   shmem_internal_data_length + 2 * ONEGIG) & ~(ONEGIG - 1));
     void *ret;
 
+#if 0           // bman: for mmap, only do it in the relocation.
 #ifdef __linux__
     /* huge page support only on Linux for now, default is to use 2MB large pages */
-    if (shmem_internal_params.SYMMETRIC_HEAP_USE_HUGE_PAGES) {
+    if (shmem_internal_params.SYMMETRIC_HEAP_USE_HUGE_PAGES) 
+    {
         const char basename[] = "hugepagefile.SOS";
 
-        /* check what /proc/mounts has for explicit huge page support */
-        if (find_hugepage_dir(shmem_internal_params.SYMMETRIC_HEAP_PAGE_SIZE,
-                             &directory) == 0)
+        /* check what '/proc/mounts' has for explicit huge page support */
+        if (find_hugepage_dir(shmem_internal_params.SYMMETRIC_HEAP_PAGE_SIZE, &directory) == 0)
         {
             int size = snprintf(NULL, 0, "%s/%s.%d", directory, basename, getpid());
-
-            if (size < 0) {
+            if (size < 0) 
+            {
                 RAISE_WARN_STR("snprintf returned error, cannot use huge pages");
-            } else {
+            } 
+            else 
+            {
                 file_name = malloc(size + 1);
-                if (file_name) {
+                if (file_name) 
+                {
                     sprintf(file_name, "%s/%s.%d", directory, basename, getpid());
                     fd = open(file_name, O_CREAT | O_RDWR, 0755);
-                    if (fd < 0) {
+                    if (fd < 0) 
+                    {
                         RAISE_WARN_STR("file open failed, cannot use huge pages");
                         fd = 0;
-                    } else {
+                    } 
+                    else
+                    {
                         /* have to round up by the pagesize being used */
+                        printf("[%d] ==> mmap_alloc: using huge pages: %lu bytes, file_name = %s, shmem_internal_my_pe, shmem_internal_params.SYMMETRIC_HEAP_PAGE_SIZE = %lu, fd = %d, requested_base = %p", 
+                                                                                                shmem_internal_my_pe, bytes, file_name, shmem_internal_params.SYMMETRIC_HEAP_PAGE_SIZE, fd, requested_base);
                         bytes = CEILING(bytes, shmem_internal_params.SYMMETRIC_HEAP_PAGE_SIZE);
+                        printf("\tbytes(after CEIL) = %lu \n", bytes); // R: rounded up (ex: 5,369,757,696 -> 5,370,806,272)
                     }
                 }
             }
@@ -203,17 +213,34 @@ static void *mmap_alloc(size_t bytes)
     }
 #endif /* __linux__ */
 
-    ret = mmap(requested_base,
-               bytes,
-               PROT_READ | PROT_WRITE,
-               MAP_ANON | MAP_PRIVATE,
-               fd,
-               0);
+    if (shmem_internal_params.SYMMETRIC_HEAP_USE_HUGE_PAGES)
+    {
+        printf("[%d] ==> mmap_alloc::SYMMETRIC_HEAP_USE_HUGE_PAGES: mmapping... \n", shmem_internal_my_pe);    // note: need 'sudo sysctl -w vm.nr_hugepages=2560*numPEs' to pass page_walker
+        ftruncate(fd, bytes);
+        ret = mmap(requested_base,
+                   bytes,
+                   PROT_READ | PROT_WRITE,
+                   MAP_SHARED | MAP_HUGETLB,
+                   fd,
+                   0);
+    }
+    else
+#endif
+    {
+        ftruncate(fd, bytes);
+        ret = mmap(requested_base,
+                   bytes,
+                   PROT_READ | PROT_WRITE,
+                   MAP_ANON | MAP_PRIVATE,
+                   fd,
+                   0);
+    }
     if (ret == MAP_FAILED) {
-        RAISE_WARN_MSG("Unable to allocate sym. heap, size %zuB: %s\n"
+        RAISE_WARN_MSG("[%d] Unable to allocate sym. heap, size %zuB: %s\n"
                        RAISE_PE_PREFIX
                        "Try reducing SHMEM_SYMMETRIC_SIZE or number of PEs per node\n",
-                       bytes, strerror(errno), shmem_internal_my_pe);
+                       shmem_internal_my_pe, bytes, strerror(errno), shmem_internal_my_pe);
+        perror("mmap");
         ret = NULL;
     }
     if (fd) {

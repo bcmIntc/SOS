@@ -21,6 +21,10 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <fcntl.h>
+#ifdef __linux__
+ #include <mntent.h>
+ #include <sys/vfs.h>
+#endif
 
 #define SHMEM_INTERNAL_INCLUDE
 #include "shmem.h"
@@ -34,6 +38,13 @@
 
 
 // bman
+#ifndef FLOOR
+ #define FLOOR(a,b)      ((uint64_t)(a) - ( ((uint64_t)(a)) % (uint64_t)(b)))
+#endif
+#ifndef CEILING
+ #define CEILING(a,b)    ((uint64_t)(a) <= 0LL ? 0 : (FLOOR((a)-1,b) + (b)))
+#endif
+
 #ifdef USE_TSX_ATOMIC
  volatile int takenCount=666;
  volatile int totalCount=666;
@@ -82,28 +93,127 @@ static void shm_create_key(char *key, size_t max_size, unsigned pe, size_t num) 
     snprintf(key, max_size, "%s-%u-%zu", MPIDI_OFI_SHMGR_NAME_PREFIX, pe, num);
 }
 
+static int find_hugepage_dir(size_t page_size, char **directory)
+{
+    int ret = -1;
+    struct statfs pg_size;
+    struct mntent *mntent;
+    FILE *fd;
+    char *path;
 
+    if (!directory || !page_size) {
+        return ret;
+    }
+
+    fd = setmntent ("/proc/mounts", "r");
+    if (fd == NULL) {
+        return ret;
+    }
+
+    while ((mntent = getmntent(fd)) != NULL) {
+
+        if (strcmp (mntent->mnt_type, "hugetlbfs") != 0) {
+            continue;
+        }
+
+        path = mntent->mnt_dir;
+        if (statfs(path, &pg_size) == 0) {
+            if ((size_t) pg_size.f_bsize == page_size) {
+                *directory = strdup(path);
+                ret = 0;
+                break;
+            }
+        }
+    }
+
+    endmntent(fd);
+    return ret;
+}
+
+// creates a shared region for symmetric heap
 static void *shm_create_region(char* base, const char *key, size_t shm_size) {
   if (shm_size == 0) return NULL;
 
   shm_unlink(key);
-  int fd = shm_open(key, O_RDWR | O_CREAT | O_TRUNC, 0666);
-  if (fd == -1) {
-      fprintf(stderr, "mmap_init error shm_open with errno(%s)\n", strerror(errno));
-      exit(0);
+
+  void *shm_base_addr = NULL;    
+
+  // BMAN ADDED: huge pages file should already be created. We will open it
+  int mypid = getpid();
+  int fd = 0;
+  if ((shm_size > shmem_internal_params.SYMMETRIC_HEAP_PAGE_SIZE) && shmem_internal_params.SYMMETRIC_HEAP_USE_HUGE_PAGES) 
+  {
+    //const char basename[] = "hugepagefile.SOS";
+
+    /* check what /proc/mounts has for explicit huge page support */
+    char *directory = NULL;
+    char *file_name = NULL;
+    if (find_hugepage_dir(shmem_internal_params.SYMMETRIC_HEAP_PAGE_SIZE, &directory) == 0)
+    {
+        // DBG
+        //printf("[%d:%d] ==> +shm_create_region: SYMMETRIC_HEAP_USE_HUGE_PAGES. shm_size = %lu \n", mypid, shmem_my_pe(), shm_size); // shm_size = 5,369,757,696
+
+        //int size = snprintf(NULL, 0, "%s/%s.%d", directory, basename, getpid());        // <== append PID to hugePage file name.
+        //if (size < 0) {
+        //    RAISE_WARN_STR("snprintf returned error, cannot use huge pages");
+        //    exit(1);
+        //}
+        //else
+        {
+            size_t len = strlen(directory) + strlen(key) + 2;   // 2 for: '/' + '\0'
+            file_name = malloc(len);
+            if (1)
+            {
+                //sprintf(file_name, "%s/%s.%d", directory, basename, getpid());                                  // <== this will be wrong - shold be the pid of the neighbor we are processing!
+                sprintf(file_name, "%s%s", directory, key);                                  // <== this will be wrong - shold be the pid of the neighbor we are processing!
+                //printf("[%d:%d] ==> shm_create_region: Opening file_name = %s \n", mypid, shmem_my_pe(), file_name);
+
+                fd = open(file_name, O_CREAT | O_RDWR, 0755);
+                if (fd < 0) {
+                    RAISE_WARN_STR("file open failed, cannot use huge pages");
+                    fd = 0;
+                    exit(1);
+                }
+                else
+                {
+                    //printf("[%d:%d] ==> shm_create_region: Sucessfully opened %s. shm_size = %lu \n", mypid, shmem_my_pe(), file_name, shm_size); // /dev/hugepages/hugepagefile.SOS.497567, 1,074,790,400
+                    shm_size = CEILING(shm_size, shmem_internal_params.SYMMETRIC_HEAP_PAGE_SIZE);
+                    if (ftruncate(fd, shm_size) == -1) {
+                          fprintf(stderr, "shm_create_region: error ftruncate: errno = %d, shm_size = %ld \n", errno, shm_size);
+                          perror("ftruncate");
+                          close(fd);
+                          exit(0);
+                    }
+                    /* have to round up by the pagesize being used */
+                    //printf("[%d]     shm_create_region: shm_size' = %lu \n", shmem_my_pe(), shm_size); // 1,075,838,976
+                }
+            }
+        }
+    }
+    //printf("[%d:%d] ==> shm_create_region: Calling mmap(MAP_HUGETLB). base = %p, shm_size = %lu \n", mypid, shmem_my_pe(), base, shm_size);
+    shm_base_addr = mmap(base, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED | MAP_HUGETLB, fd, 0);
+  } // /BMAN ADDED
+  else 
+  {
+      fd = shm_open(key, O_RDWR | O_CREAT | O_TRUNC, 0666);
+      if (fd == -1) {
+          fprintf(stderr, "mmap_init error shm_open with errno(%s)\n", strerror(errno));
+          exit(0);
+      }
+
+      if (ftruncate(fd, shm_size) == -1) {
+          fprintf(stderr, "mmap_init error ftruncate: errno = %d, shm_size = %ld \n", errno, shm_size);
+          perror("ftruncate");
+          close(fd);
+          exit(0);
+      }
+      shm_base_addr = mmap(base, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
   }
 
-  if (ftruncate(fd, shm_size) == -1) {
-      fprintf(stderr, "mmap_init error ftruncate: errno = %d, shm_size = %ld \n", errno, shm_size);
-      perror("ftruncate");
-      close(fd);
-      exit(0);
-  }
-
-  void *shm_base_addr = mmap(base, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
   //void *shm_base_addr = mmap(base, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED | MAP_POPULATE, fd, 0);
   if (MAP_FAILED == shm_base_addr) {
-      fprintf(stderr, "mmap_init error mmap %s size %ld\n", key, shm_size);
+      fprintf(stderr, "shm_create_region: error mmap: %s, size: %ld\n", key, shm_size);
+      perror("shm_create_region mmap");
       exit(0);
   }
 
@@ -118,44 +228,119 @@ static void *shm_create_region(char* base, const char *key, size_t shm_size) {
     }
 #elif defined(FAULT_PAGES_MANUALLY)
     // Fault in pages manually
-    long page_size = sysconf(_SC_PAGESIZE);
+    long page_size = sysconf(_SC_PAGESIZE);                     // bman: BUG: this needs to determine the pagesize of the mapping
     for (size_t i = 0; i < shm_size; i += page_size) {
         ((char *)shm_base_addr)[i] = 0;
     }
 #endif
 
+  //printf("[%d] ==> -shm_create_region: returning shm_base_addr = %p \n", shmem_my_pe(), shm_base_addr);
+
+  close(fd);            // we don't need it after mmap
   return shm_base_addr;
 }
 
 
-static void *shm_create_region_data_seg(char* base, const char *key, size_t shm_size) {
+static void *shm_create_region_data_seg(char* base, const char *key, size_t shm_size) 
+{
     if (shm_size == 0) return NULL;
+    int fd = 0;
+    FILE *fp = NULL;
 
-    shm_unlink(key);
-    int fd = shm_open(key, O_RDWR | O_CREAT | O_TRUNC, 0666);
-    if (fd == -1) {
-        fprintf(stderr, "mmap_init data_seg error shm_open with errno(%s)\n", strerror(errno));
+
+  // bman added
+  void *shm_base_addr;
+  if ((shm_size > shmem_internal_params.SYMMETRIC_HEAP_PAGE_SIZE) && shmem_internal_params.SYMMETRIC_HEAP_USE_HUGE_PAGES)
+  {
+    //const char basename[] = "hugepagefile.SOS";
+
+    /* check what /proc/mounts has for explicit huge page support */
+    char *directory = NULL;
+    char *file_name = NULL;
+    if (find_hugepage_dir(shmem_internal_params.SYMMETRIC_HEAP_PAGE_SIZE, &directory) == 0)
+    {
+        // DBG
+        //printf("[%d:%d] ==> +shm_create_region_data_seg: SYMMETRIC_HEAP_USE_HUGE_PAGES. shm_size = %lu \n", getpid(), shmem_my_pe(), shm_size); // shm_size = 5,369,757,696
+
+        //int size = snprintf(NULL, 0, "%s/%s.%d", directory, basename, getpid());
+        //if (size < 0) {
+        //    RAISE_WARN_STR("snprintf returned error, cannot use huge pages");
+        //}
+        //else
+        {
+            size_t len = strlen(directory) + strlen(key) + 2;   // 2 for: '/' + '\0'
+            file_name = malloc(len);
+            //file_name = malloc(size + 1);
+            if (file_name)
+            {
+                sprintf(file_name, "%s%s", directory, key);
+                //printf("[%d:%d] ==> shm_create_region_data_seg: Opening file_name = %s \n", getpid(), shmem_my_pe(), file_name);
+
+                fd = open(file_name, O_CREAT | O_RDWR, 0755);
+                if (fd < 0) {
+                    RAISE_WARN_STR("file open failed, cannot use huge pages");
+                    fd = 0;
+                }
+                else
+                {
+                    /* Write all current contents of the data segment to the file */
+                    fp = fdopen(fd, "wb");
+                    size_t ret = fwrite(base, shm_size, 1, fp);
+                    if (ret == 0) {
+                        fprintf(stderr, "shm_create_region_data_seg: huge pages: error fwrite\n");
+                        exit(1);
+                    }
+                    if (ftruncate(fd, shm_size) == -1) {
+                        fprintf(stderr, "shm_create_region_data_seg: huge pages: error ftruncate with errno(%s)\n", strerror(errno));
+                        exit(1);
+                    }
+
+                    /* have to round up by the pagesize being used */
+                    //printf("[%d:%d] ==> shm_create_region_data_seg: Sucessfully opened %s. shm_size = %lu \n", getpid(), shmem_my_pe(), file_name, shm_size); // /dev/hugepages/hugepagefile.SOS.<pid>
+                    shm_size = CEILING(shm_size, shmem_internal_params.SYMMETRIC_HEAP_PAGE_SIZE);
+                    //printf("[%d]     shm_create_region_data_seg: shm_size' = %lu \n", shmem_my_pe(), shm_size); // 1,075,838,976
+                }
+            }
+        }
+    }
+    else 
+    {
+        fprintf(stderr, "shm_create_region_data_seg: huge pages: Unable to find huge page mount point. \n");
         exit(1);
     }
+  //  printf("[%d:%d] ==> shm_create_region_data_seg: Calling mmap(MAP_HUGETLB). base = %p, shm_size = %lu \n", getpid(), shmem_my_pe(), base, shm_size);
+    shm_base_addr = mmap(base, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED | MAP_HUGETLB, fd, 0);
+  } 
+  else
+  {
+        shm_unlink(key);
 
-    /* Write all current contents of the data segment to the file */
-    FILE *fp = fdopen(fd, "wb");
-    size_t ret = fwrite(base, shm_size, 1, fp);
+        fd = shm_open(key, O_RDWR | O_CREAT | O_TRUNC, 0666);
+        if (fd == -1) {
+            fprintf(stderr, "shm_create_region_data_seg: data_seg error shm_open with errno(%s)\n", strerror(errno));
+            exit(1);
+        }
+        /* Write all current contents of the data segment to the file */
+        fp = fdopen(fd, "wb");
+        size_t ret = fwrite(base, shm_size, 1, fp);
+        if (ret == 0) {
+            fprintf(stderr, "shm_create_region_data_seg: error fwrite\n");
+            exit(1);
+        }
+        if (ftruncate(fd, shm_size) == -1) {
+            fprintf(stderr, "shm_create_region_data_seg: error ftruncate with errno(%s)\n", strerror(errno));
+            exit(1);
+        }
 
-    if (ret == 0) {
-        fprintf(stderr, "mmap_init error fwrite\n");
-        exit(1);
-    }
-
-    if (ftruncate(fd, shm_size) == -1) {
-        fprintf(stderr, "mmap_init error ftruncate with errno(%s)\n", strerror(errno));
-        exit(1);
-    }
+        shm_base_addr = mmap(base, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+  }
+// /BMAN_ADDED
 
     //void *shm_base_addr = mmap(base, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED | MAP_POPULATE, fd, 0);
-    void *shm_base_addr = mmap(base, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+    //void *shm_base_addr = mmap(base, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+
     if (MAP_FAILED == shm_base_addr) {
-        fprintf(stderr, "mmap_init error mmap %s size %ld\n", key, shm_size);
+        fprintf(stderr, "shm_create_region_data_seg error: mmap: %s, size = %ld\n", key, shm_size);
         exit(1);
     }
 
@@ -177,23 +362,80 @@ static void *shm_create_region_data_seg(char* base, const char *key, size_t shm_
 #endif
 
     fclose(fp);
-
+    close(fd);            // we don't need it after mmap
+    
     return shm_base_addr;
 }
 
 
-static void *shm_attach_region(char* base, const char *key, size_t shm_size) {
+static void *shm_attach_region(char* base, const char *key, size_t shm_size) 
+{
   if (shm_size == 0) return NULL;
+  int fd = 0;
 
-  int fd = shm_open(key, O_RDWR, 0);
-  if (fd == -1) {
-      fprintf(stderr, "mmap_init error shm_open\n");
-      exit(0);
+/// bman added
+  void *shm_base_addr;
+  if ((shm_size > shmem_internal_params.SYMMETRIC_HEAP_PAGE_SIZE) && shmem_internal_params.SYMMETRIC_HEAP_USE_HUGE_PAGES)
+  {
+    const char basename[] = "hugepagefile.SOS";
+
+    /* check what /proc/mounts has for explicit huge page support */
+    char *directory = NULL;
+    char *file_name = NULL;
+    if (find_hugepage_dir(shmem_internal_params.SYMMETRIC_HEAP_PAGE_SIZE, &directory) == 0)
+    {
+        // DBG
+        //printf("[%d:%d] ==> +shm_attach_region: SYMMETRIC_HEAP_USE_HUGE_PAGES. Process Neighbor: key = %s, shm_size = %lu \n", getpid(), shmem_my_pe(), key, shm_size); // shm_size = 5,369,757,696
+
+        int size = snprintf(NULL, 0, "%s/%s.%d", directory, basename, getpid());
+        if (size < 0) {
+            RAISE_WARN_STR("snprintf returned error, cannot use huge pages");
+        }
+        else
+        {
+            size_t len = strlen(directory) + strlen(key) + 2;   // 2 for: '/' + '\0'
+            file_name = malloc(len);
+            //file_name = malloc(size + 1);
+            if (file_name)
+            {
+                sprintf(file_name, "%s%s", directory, key);                                          // <== this is wrong here - need the neighbor info
+                //printf("[%d:%d] ==> shm_attach_region: Opening file_name = %s \n", getpid(), shmem_my_pe(), file_name);
+
+                fd = open(file_name, O_CREAT | O_RDWR, 0755);
+                if (fd < 0) {
+                    RAISE_WARN_STR("file open failed, cannot use huge pages");
+                    fd = 0;
+                    exit(1);
+                }
+                else
+                {
+                    /* have to round up by the pagesize being used */
+                    //printf("[%d:%d] ==> shm_attach_region: Sucessfully opened %s. shm_size = %lu \n", getpid(), shmem_my_pe(), file_name, shm_size); // /dev/hugepages/hugepagefile.SOS.497567, 1,074,790,400
+                    shm_size = CEILING(shm_size, shmem_internal_params.SYMMETRIC_HEAP_PAGE_SIZE);
+                    //printf("[%d]     shm_attach_region: shm_size' = %lu \n", shmem_my_pe(), shm_size); // 1,075,838,976
+                }
+            }
+        }
+    }
+    //printf("[%d:%d] ==> shm_attach_region: Calling mmap(MAP_HUGETLB). base = %p, shm_size = %lu \n", getpid(), shmem_my_pe(), base, shm_size);
+    shm_base_addr = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_HUGETLB, fd, 0);
   }
+  else
+  {
+      fd = shm_open(key, O_RDWR, 0);                            // <== bman: this is the shm file of a neighbor, not ours.
+      if (fd == -1) {
+          fprintf(stderr, "mmap_init error shm_open\n");
+          exit(0);
+      }
+      shm_base_addr = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  }
+// /BMAN_ADDED
+
+
   //void *shm_base_addr = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, 0);
-  void *shm_base_addr = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  //void *shm_base_addr = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
   if (MAP_FAILED == shm_base_addr) {
-      fprintf(stderr, "mmap_init error mmap %s  size %d\n", key, shm_size);
+      fprintf(stderr, "shm_attach_region error. mmap: %s, size = %lu\n", key, shm_size);
       exit(0);
   }
 
@@ -214,6 +456,7 @@ static void *shm_attach_region(char* base, const char *key, size_t shm_size) {
     }
 #endif
 
+  close(fd);            // we don't need it after mmap
   return shm_base_addr;
 }
 
@@ -392,6 +635,9 @@ int shmem_transport_mmap_init(void)
     base = FIND_BASE(shmem_internal_data_base, page_size);
     len = FIND_LEN(shmem_internal_data_base, shmem_internal_data_length, page_size);
 
+    // bman
+    //printf("[%d] ==>shmem_transport_mmap_init(void): shmem_internal_data_base = %p -vs- base = %p, shmem_internal_data_length = %ld -vs- len = %ld \n", shmem_my_pe(), shmem_internal_data_base, base, shmem_internal_data_length, len); fflush(stdout);
+    //
 
 #if defined(USE_PERFMON_MMAP) || defined(USE_PERFMON_ATM)
     FEATURE_SHOULD_BE_DISABLED4;
@@ -463,9 +709,6 @@ int shmem_transport_mmap_init(void)
 #endif
 
 
-    // bman
-    //printf("==>shmem_transport_mmap_init(void): data len = %ld \n", len); fflush(stdout);
-    //
     // /bman  
     
     shm_create_key(key_prefix, MPIDI_OFI_SHMGR_NAME_MAXLEN-10, shmem_internal_my_pe, 1);
@@ -647,19 +890,48 @@ shmem_transport_mmap_fini(void)
     shm_create_key(key_prefix, MPIDI_OFI_SHMGR_NAME_MAXLEN-10, shmem_internal_my_pe, 1);
     snprintf(key, MPIDI_OFI_SHMGR_NAME_MAXLEN, "%s-data", key_prefix);
 
-    ret = shm_unlink(key);
-    if (ret != 0) {
-        RETURN_ERROR_MSG("could not get data segment: %s\n", \
-                         shmem_util_strerror(errno, errmsg, 256));
+    if (!shmem_internal_params.SYMMETRIC_HEAP_USE_HUGE_PAGES)
+    {
+        ret = shm_unlink(key);
+        if (ret != 0) {
+            RETURN_ERROR_MSG("could not get data segment: %s\n", \
+                             shmem_util_strerror(errno, errmsg, 256));
+        }
     }
+    else
+    {
+        char *directory = NULL;
+        char *file_name = NULL;
+        find_hugepage_dir(shmem_internal_params.SYMMETRIC_HEAP_PAGE_SIZE, &directory);
 
+        size_t len = strlen(directory) + strlen(key) + 2;   // 2 for: '/' + '\0'
+        file_name = malloc(len);
+        sprintf(file_name, "%s%s", directory, key);
+        //printf("==> unlinking(%s) \n", file_name); 
+        unlink(file_name);
+    }
     shm_create_key(key_prefix, MPIDI_OFI_SHMGR_NAME_MAXLEN-10, shmem_internal_my_pe, 2);
     snprintf(key, MPIDI_OFI_SHMGR_NAME_MAXLEN, "%s-heap", key_prefix);
 
-    ret = shm_unlink(key);
-    if (ret != 0) {
-        RETURN_ERROR_MSG("could not get heap segment: %s\n", \
-                         shmem_util_strerror(errno, errmsg, 256));
+    if (!shmem_internal_params.SYMMETRIC_HEAP_USE_HUGE_PAGES)
+    {
+        ret = shm_unlink(key);
+        if (ret != 0) {
+            RETURN_ERROR_MSG("could not get heap segment: %s\n", \
+                             shmem_util_strerror(errno, errmsg, 256));
+        }
+    }
+    else
+    {
+        char *directory = NULL;
+        char *file_name = NULL;
+        find_hugepage_dir(shmem_internal_params.SYMMETRIC_HEAP_PAGE_SIZE, &directory);
+
+        size_t len = strlen(directory) + strlen(key) + 2;   // 2 for: '/' + '\0'
+        file_name = malloc(len);
+        sprintf(file_name, "%s%s", directory, key);
+        //printf("==> unlinking(%s) \n", file_name); 
+        unlink(file_name);
     }
 
     if (NULL != shmem_transport_mmap_peers) {
@@ -669,10 +941,12 @@ shmem_transport_mmap_fini(void)
             if (shmem_internal_my_pe == i) continue;
 
             if (NULL != shmem_transport_mmap_peers[peer_num].data_attach_ptr) {
+                //printf("==> unmapping %lu bytes from peer data region. \n", data_len);
                 munmap(shmem_transport_mmap_peers[peer_num].data_attach_ptr, data_len);
             }
 
             if (NULL != shmem_transport_mmap_peers[peer_num].heap_attach_ptr) {
+                //printf("==> unmapping %lu bytes from peer heap region. \n", heap_len);
                 munmap(shmem_transport_mmap_peers[peer_num].heap_attach_ptr, heap_len);
             }
         }
