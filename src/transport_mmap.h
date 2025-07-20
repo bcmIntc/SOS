@@ -40,6 +40,9 @@
 // These 2 are mutex, not enforced
 //#define USE_CLDEMOTE_NOBARRIER            // turns on cldemote w/o memory barrier. Requires BMAN_HACKING
 //#define USE_CLDEMOTE_BARRIER              // turns on cldemote w/memory barrier
+//#if (defined(USE_CLDEMOTE_NOBARRIER) || defined(USE_CLDEMOTE_BARRIER)) && !defined(BMAN_HACKING)
+//  #define BMAN_HACKING
+//#endif
 
 // PAPI is being annoying and not giving me access to 'PAPI_L1_DCA' for L1 accesses.
 // Use this instead of PAPI. Still cannot get L1D$ write accesses.
@@ -252,6 +255,22 @@ inline __attribute__((always_inline)) void demote_with_barrier_arb(void *dst, si
     // Iterate over all affected cache lines
     for (uintptr_t addr = cl_start; addr < cl_end; addr += 64) {
         __asm__ __volatile__("cldemote (%0)" : : "r"(addr) : "memory");
+    }
+}
+
+__attribute__((aligned(64)))
+inline __attribute__((always_inline)) void demote_without_barrier_arb(void *dst, size_t size)
+{
+    uintptr_t start = (uintptr_t)dst;
+    uintptr_t end = start + size;
+
+    // Align start to the nearest cache line boundary
+    uintptr_t cl_start = start & ~(uintptr_t)(63);
+    uintptr_t cl_end = (end + 63) & ~(uintptr_t)(63); // Round up to next cache line if needed
+
+    // Iterate over all affected cache lines
+    for (uintptr_t addr = cl_start; addr < cl_end; addr += 64) {
+        __asm__ __volatile__("cldemote (%0)" : : "r"(addr));
     }
 }
 
@@ -473,7 +492,8 @@ shmem_transport_mmap_put(void *target, const void *source, size_t len,
   #endif
   #ifdef USE_CLDEMOTE_NOBARRIER
     //demote_without_barrier(remote_ptr);
-    __asm__ __volatile__("cldemote (%0)" : : "r"(remote_ptr));
+    //__asm__ __volatile__("cldemote (%0)" : : "r"(remote_ptr));
+    demote_without_barrier_arb(remote_ptr, len);
   #endif
 #endif // BMAN_HACKING
 

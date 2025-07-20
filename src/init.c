@@ -384,6 +384,9 @@ shmem_internal_heap_postinit(void)
 
 #ifdef HAVE_SCHED_GETAFFINITY
 #ifdef USE_HWLOC
+    // bman debug
+    if (0 == shmem_internal_my_pe) printf("==> Using hwloc!!!");
+
     ret = hwloc_topology_init(&shmem_internal_topology);
     SHMEM_CHECK_GOTO_MSG(ret != 0, hwloc_exit, "hwloc_topology_init failed (%s). Please verify your hwloc installation\n", strerror(errno));
 
@@ -393,6 +396,9 @@ shmem_internal_heap_postinit(void)
     ret = hwloc_topology_load(shmem_internal_topology);
     SHMEM_CHECK_GOTO_MSG(ret != 0, hwloc_exit, "hwloc_topology_load failed (%s). Please verify your hwloc installation\n", strerror(errno));
 #if defined(HWLOC_ENFORCE_SINGLE_SOCKET) || defined(HWLOC_ENFORCE_SINGLE_NUMA_NODE)
+    // bman debug
+    printf("\n==> Using hwloc:HWLOC_ENFORCE_SINGLE_SOCKET || HWLOC_ENFORCE_SINGLE_NUMA_NODE \n");
+
     hwloc_bitmap_t bindset = hwloc_bitmap_alloc();
     hwloc_bitmap_t bindset_all = hwloc_bitmap_alloc();
     hwloc_bitmap_t bindset_covering_obj = hwloc_bitmap_alloc();
@@ -403,6 +409,9 @@ shmem_internal_heap_postinit(void)
     ret = hwloc_get_proc_cpubind(shmem_internal_topology, getpid(), bindset_all, HWLOC_CPUBIND_PROCESS);
     SHMEM_CHECK_GOTO_MSG(ret != 0, hwloc_cleanup, "hwloc_get_proc_cpubind failed (%s). Please verify your hwloc installation\n", strerror(errno));
 #ifdef HWLOC_ENFORCE_SINGLE_SOCKET
+    // bman debug
+    printf("\n==> Using hwloc:HWLOC_ENFORCE_SINGLE_SOCKET \n");
+
     hwloc_obj_t covering_obj = hwloc_get_next_obj_covering_cpuset_by_type(shmem_internal_topology, bindset, HWLOC_OBJ_PACKAGE, NULL);
     SHMEM_CHECK_GOTO_MSG(!covering_obj, hwloc_cleanup,
                          "hwloc_get_next_obj_covering_cpuset_by_type failed (could not detect object of type 'HWLOC_OBJ_PACKAGE' in provided cpuset). Please verify your hwloc installation\n");

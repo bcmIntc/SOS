@@ -179,7 +179,7 @@ static void *shm_create_region(char* base, const char *key, size_t shm_size) {
   } 
   else 
   {
-      printf("[%d:%d] ==> +shm_create_region: Using normal pages for my Heap segment. shm_size = %lu \n", mypid, shmem_my_pe(), shm_size); // shm_size = 5,369,757,696
+      //printf("[%d:%d] ==> +shm_create_region: Using normal pages for my Heap segment. shm_size = %lu \n", mypid, shmem_my_pe(), shm_size); // shm_size = 5,369,757,696
       fd = shm_open(key, O_RDWR | O_CREAT | O_TRUNC, 0666);
       if (fd == -1) {
           fprintf(stderr, "mmap_init error shm_open with errno(%s)\n", strerror(errno));
@@ -296,7 +296,7 @@ static void *shm_create_region_data_seg(char* base, const char *key, size_t shm_
         shm_unlink(key);
 
         // DBG
-        printf("[%d:%d] ==> +shm_create_region_data_seg: Using normal pages for my Data segment. shm_size = %lu \n", getpid(), shmem_my_pe(), shm_size);
+        //printf("[%d:%d] ==> +shm_create_region_data_seg: Using normal pages for my Data segment. shm_size = %lu \n", getpid(), shmem_my_pe(), shm_size);
 
         fd = shm_open(key, O_RDWR | O_CREAT | O_TRUNC, 0666);
         if (fd == -1) {
@@ -391,7 +391,7 @@ static void *shm_attach_region(char* base, const char *key, size_t shm_size)
   else
   {
       // DBG
-      printf("[%d:%d] ==> +shm_attach_region: Using normal pages. Process Neighbor: key = %s, shm_size = %lu \n", getpid(), shmem_my_pe(), key, shm_size); // shm_size = 5,369,757,696
+      //printf("[%d:%d] ==> +shm_attach_region: Using normal pages. Process Neighbor: key = %s, shm_size = %lu \n", getpid(), shmem_my_pe(), key, shm_size); // shm_size = 5,369,757,696
 
       fd = shm_open(key, O_RDWR, 0);                            // <== bman: this is the shm file of a neighbor, not ours.
       if (fd == -1) {
