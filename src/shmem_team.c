@@ -15,6 +15,9 @@
 #include "shmem_team.h"
 #include "shmem_collectives.h"
 #include "shmem_remote_pointer.h"
+// bman
+#include <unistd.h>
+#include <assert.h>
 
 #include <math.h>
 
@@ -25,6 +28,11 @@
 
 #define N_PSYNC_BYTES             8
 #define PSYNC_CHUNK_SIZE          (N_PSYNCS_PER_TEAM * SHMEM_SYNC_SIZE)
+
+
+// bman hacking
+//#define BMAN_FORCE_PSYNC_COLLISION
+
 
 
 shmem_internal_team_t shmem_internal_team_world;
@@ -85,6 +93,9 @@ int shmem_internal_team_init(void)
     memset(&shmem_internal_team_world.config, 0, sizeof(shmem_team_config_t));
     for (size_t i = 0; i < N_PSYNCS_PER_TEAM; i++)
         shmem_internal_team_world.psync_avail[i] = 1;
+#if defined(BMAN_FORCE_PSYNC_COLLISION)
+	shmem_internal_team_world.psync_avail[0] = 0;								// bman: forces WORLD to 2nd PSYNC.
+#endif
     SHMEM_TEAM_WORLD = (shmem_team_t) &shmem_internal_team_world;
 
     /* Initialize SHMEM_TEAM_SHARED */
@@ -95,6 +106,9 @@ int shmem_internal_team_init(void)
     memset(&shmem_internal_team_shared.config, 0, sizeof(shmem_team_config_t));
     for (size_t i = 0; i < N_PSYNCS_PER_TEAM; i++)
         shmem_internal_team_shared.psync_avail[i] = 1;
+#if defined(BMAN_FORCE_PSYNC_COLLISION)
+        shmem_internal_team_shared.psync_avail[1] = 0;							// bman: forces SHARED to 1st PSYNC. This should collide.
+#endif
     SHMEM_TEAM_SHARED = (shmem_team_t) &shmem_internal_team_shared;
 
     /* Initialize SHMEM_TEAM_NODE */
@@ -533,20 +547,80 @@ int shmem_internal_team_destroy(shmem_internal_team_t *team)
     return 0;
 }
 
+// bman
+typedef struct __s_psync_list 
+{
+	long * adx;
+	struct __s_psync_list *pNext;
+} t_psync_list;
+
+t_psync_list * gPsyncListHead = NULL;
+
+static void addPsync(long * psync_address)
+{
+	int my_pid = getpid();
+	//printf("[%d] ==>BMAN: addPsync(): Adding %p. (sizeof(t_psync_list) = %ld) \n", my_pid, psync_address, sizeof(t_psync_list)); fflush(stdout);
+
+	t_psync_list * pPsync = (t_psync_list *)malloc(sizeof(t_psync_list));		// 16B
+	if (!pPsync) {
+		fprintf(stderr, "ERROR: addPsync() failed to malloc! \n");
+	}
+	pPsync->adx   = psync_address;
+	pPsync->pNext = NULL;
+
+	if (NULL == gPsyncListHead) 
+	{
+		// First entry
+		//printf("[%d] First Entry: gPsyncListHead = %p, pPsync = %p before assignment.\n", my_pid, gPsyncListHead, pPsync); fflush(stdout);
+		gPsyncListHead = pPsync;
+	} 
+	else 
+	{
+		// Walk the list and Append
+		t_psync_list *tmp = gPsyncListHead;
+		//printf("[%d] Appending: gPsyncListHead = %p, pPsync = %p before assignment.\n", my_pid, gPsyncListHead, pPsync); fflush(stdout);
+
+		while (tmp->pNext)  
+		{
+			if (tmp->adx == psync_address) {
+				// Now, this will pop alot as it re-uses the same one. I need to pop my list... but that sounds hard.
+				// Since is single-process, single-thread, and all barriers/syncs are synchronous, we will see only stack-like behaviour. 
+				printf("[%d] !!! PE[%d]: Found duplicate PSYNC: List[%p] -vs- New[%p] \n", my_pid, shmem_internal_my_pe, tmp->adx, psync_address);
+			} 
+			else {
+				printf("[%d] PE[%d]: Adding New PSYNC: %p \n", my_pid, shmem_internal_my_pe, psync_address);
+			}
+			tmp = tmp->pNext;
+		}
+
+//		assert(tmp != NULL && printf("tmp\n"));		// this pops
+//		assert(tmp->pNext != NULL && printf("tmp2\n"));
+
+		tmp->pNext = pPsync;
+	}
+}
+// /bman	R: with no other changes, this works and does not detect any duplicates running HAMR. 
+
 /* Returns a psync from the given team that can be safely used for the
  * specified collective operation. */
 long * shmem_internal_team_choose_psync(shmem_internal_team_t *team, shmem_internal_team_op_t op)
 {
-
     switch (op) {
         case SYNC:
             return &shmem_internal_psync_barrier_pool[team->psync_idx * SHMEM_SYNC_SIZE];
 
         default:
             for (int i = 0; i < N_PSYNCS_PER_TEAM; i++) {
-                if (team->psync_avail[i]) {
+                if (team->psync_avail[i]) 
+				{
                     team->psync_avail[i] = 0;
-                    return &shmem_internal_psync_pool[(team->psync_idx + i) * PSYNC_CHUNK_SIZE];
+
+					// bman: track what we return
+					addPsync(&shmem_internal_psync_pool[(team->psync_idx + i) * PSYNC_CHUNK_SIZE]);
+					
+                   // BUG?? I think we can collide given the right conditions -- return &shmem_internal_psync_pool[(team->psync_idx + i) * PSYNC_CHUNK_SIZE];
+					//size_t base_chunk = team->psync_idx * N_PSYNCS_PER_TEAM;
+					//return &shmem_internal_psync_pool[(base_chunk + i) * PSYNC_CHUNK_SIZE];		
                 }
             }
 
@@ -555,13 +629,15 @@ long * shmem_internal_team_choose_psync(shmem_internal_team_t *team, shmem_inter
             shmem_internal_quiet(SHMEM_CTX_DEFAULT);
 
             size_t psync = team->psync_idx * SHMEM_SYNC_SIZE;
-            shmem_internal_sync(team->start, team->stride, team->size,
-                                &shmem_internal_psync_barrier_pool[psync]);
+            shmem_internal_sync(team->start, team->stride, team->size, &shmem_internal_psync_barrier_pool[psync]);
 
             for (int i = 0; i < N_PSYNCS_PER_TEAM; i++) {
                 team->psync_avail[i] = 1;
             }
             team->psync_avail[0] = 0;
+
+			// bman: track what we return
+			//addPsync(&shmem_internal_psync_pool[psync]);
 
             return &shmem_internal_psync_pool[psync];
     }

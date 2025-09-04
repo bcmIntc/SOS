@@ -18,6 +18,11 @@
 
 #include "shmem_synchronization.h"
 
+// bman
+#include <execinfo.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
 
 enum coll_type_t {
     AUTO = 0,
@@ -44,10 +49,29 @@ void shmem_internal_sync_linear(int PE_start, int PE_stride, int PE_size, long *
 void shmem_internal_sync_tree(int PE_start, int PE_stride, int PE_size, long *pSync);
 void shmem_internal_sync_dissem(int PE_start, int PE_stride, int PE_size, long *pSync);
 
+
+// bman
+static void print_stacktrace(void) 
+{
+    void *buffer[50];
+    int nptrs = backtrace(buffer, 50);
+
+    printf("backtrace() returned %d addresses\n", nptrs);
+
+    // Print raw addresses
+    backtrace_symbols_fd(buffer, nptrs, STDOUT_FILENO);
+	printf("\n");
+}
+// /bman
+
+
 static inline
 void
 shmem_internal_sync(int PE_start, int PE_stride, int PE_size, long *pSync)
 {
+	// bman
+	char algo_str[32];
+
     if (shmem_internal_params.BARRIERS_FLUSH) {
         fflush(stdout);
         fflush(stderr);
@@ -58,18 +82,28 @@ shmem_internal_sync(int PE_start, int PE_stride, int PE_size, long *pSync)
     switch (shmem_internal_barrier_type) {
     case AUTO:
         if (PE_size < shmem_internal_params.COLL_CROSSOVER) {
+			// bman
+			strcpy(algo_str, "LINEAR");
             shmem_internal_sync_linear(PE_start, PE_stride, PE_size, pSync);
         } else {
+			// bman
+			strcpy(algo_str, "TREE");
             shmem_internal_sync_tree(PE_start, PE_stride, PE_size, pSync);
         }
         break;
     case LINEAR:
+		// bman
+		strcpy(algo_str, "LINEAR");
         shmem_internal_sync_linear(PE_start, PE_stride, PE_size, pSync);
         break;
     case TREE:
+		// bman
+		strcpy(algo_str, "TREE");
         shmem_internal_sync_tree(PE_start, PE_stride, PE_size, pSync);
         break;
     case DISSEM:
+		// bman
+		strcpy(algo_str, "DISSEM");
         shmem_internal_sync_dissem(PE_start, PE_stride, PE_size, pSync);
         break;
     default:
@@ -80,6 +114,13 @@ shmem_internal_sync(int PE_start, int PE_stride, int PE_size, long *pSync)
     /* Ensure remote updates are visible in memory */
     shmem_internal_membar_acq_rel();
     shmem_transport_syncmem();
+
+	// bman
+	//setbuf(stdout, NULL);
+	//printf("[%d] ==> shmem_internal_sync(%s): pSync = %p \n", shmem_internal_my_pe, algo_str, pSync);
+	//print_stacktrace();
+	// /bman
+
 }
 
 

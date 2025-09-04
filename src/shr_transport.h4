@@ -375,7 +375,7 @@ shmem_shr_transport_mswap(shmem_ctx_t ctx, void *target, void *source,
 #endif
 }
 
-
+// bman: why do we have fetching ops that do not take the return val (i.e. OG value)? Why fetch? A: cuz there is no fetching verions of gnu builtins!
 static inline
 void
 shmem_shr_transport_atomic(shmem_ctx_t ctx, void *target, const void *source,

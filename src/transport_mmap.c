@@ -36,6 +36,10 @@
 #define MPIDI_OFI_SHMGR_NAME_MAXLEN (128)
 #define MPIDI_OFI_SHMGR_NAME_PREFIX "/sos_shm_mmap_area"
 
+// bman
+//#define USE_MAP_POPULATE		// define to use MAP_POPULATE during mmap
+//#define FAULT_PAGES_MANUALLY
+
 
 // bman
 //#define HUGEPAGE_SIZE_THRESHOLD sysconf(_SC_PAGESIZE)                                 // R: fails mmap() alignment pre-check. Cannot map < hugePageSize. We could create a huge-page allocator. Let's not.
@@ -192,10 +196,13 @@ static void *shm_create_region(char* base, const char *key, size_t shm_size) {
           close(fd);
           exit(0);
       }
+#if defined(USE_MAP_POPULATE)	
+	  shm_base_addr = mmap(base, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED | MAP_POPULATE, fd, 0);
+#else
       shm_base_addr = mmap(base, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+#endif
   }
 
-  //void *shm_base_addr = mmap(base, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED | MAP_POPULATE, fd, 0);
   if (MAP_FAILED == shm_base_addr) {
       fprintf(stderr, "shm_create_region: error mmap: %s, size: %ld\n", key, shm_size);
       perror("shm_create_region mmap");
@@ -314,8 +321,11 @@ static void *shm_create_region_data_seg(char* base, const char *key, size_t shm_
             fprintf(stderr, "shm_create_region_data_seg: error ftruncate with errno(%s)\n", strerror(errno));
             exit(1);
         }
-
+#if defined (USE_MAP_POPULATE)
+		shm_base_addr = mmap(base, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED | MAP_POPULATE, fd, 0);
+#else
         shm_base_addr = mmap(base, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+#endif
   }
 
   // OG:
@@ -398,7 +408,11 @@ static void *shm_attach_region(char* base, const char *key, size_t shm_size)
           fprintf(stderr, "mmap_init error shm_open\n");
           exit(0);
       }
+#if defined(USE_MAP_POPULATE)
+	  shm_base_addr = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, 0);
+#else
       shm_base_addr = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+#endif
   }
 
   // OG:

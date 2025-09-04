@@ -50,6 +50,9 @@ shmem_internal_build_kary_tree(int radix, int PE_start, int stride,
 {
     int i;
 
+	// bman. R: not seen - using single team.
+	printf("[%d] shmem_internal_build_kary_tree(): radix = %d \n", shmem_internal_my_pe, radix);
+
     /* my_id is the index in a theoretical 0...N-1 array of
        participating tasks. where the 0th entry is the root */
     int my_id = (((shmem_internal_my_pe - PE_start) / stride) + PE_size - PE_root) % PE_size;
@@ -295,15 +298,20 @@ shmem_internal_sync_tree(int PE_start, int PE_stride, int PE_size, long *pSync)
     /* need 1 slot */
     shmem_internal_assert(SHMEM_BARRIER_SYNC_SIZE >= 1);
 
-    if (PE_size == shmem_internal_num_pes) {
+    if (PE_size == shmem_internal_num_pes) 
+	{
         /* we're the full tree, use the binomial tree */
         parent = full_tree_parent;
         num_children = full_tree_num_children;
         children = full_tree_children;
-    } else {
+
+		// bman
+		//printf("==>[%d] shmem_internal_sync_tree(): Full Tree: parent=%d, num_children=%d, PSYNC=%p \n", shmem_internal_my_pe, parent, num_children, pSync); fflush(stdout);
+    } 
+	else 
+	{
         children = alloca(sizeof(int) * tree_radix);
-        shmem_internal_build_kary_tree(tree_radix, PE_start, PE_stride, PE_size,
-                                       0, &parent, &num_children, children);
+        shmem_internal_build_kary_tree(tree_radix, PE_start, PE_stride, PE_size, 0, &parent, &num_children, children);
     }
 
     if (num_children != 0) {
