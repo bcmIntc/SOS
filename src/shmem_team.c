@@ -213,13 +213,22 @@ int shmem_internal_team_init(void)
     shmem_internal_psync_pool = shmem_internal_shmalloc(sizeof(long) * psync_len);
     if (NULL == shmem_internal_psync_pool) goto cleanup;
 
-    for (long i = 0; i < psync_len; i++) {
+	// bman: these are all as I calculated in my PSYNC whiteboard
+	printf("==> [%d] shmem_internal_team_init(): Allocated shmem_internal_psync_pool at %p, SHMEM_SYNC_SIZE=%d, psync_len=%ld \n", shmem_internal_my_pe, shmem_internal_psync_pool, SHMEM_SYNC_SIZE, psync_len);
+	//printf("\t[%d] TEAMS_MAX = %ld\n", shmem_internal_my_pe, shmem_internal_params.TEAMS_MAX);
+	//printf("\t[%d] PSYNC_CHUNK_SIZE = %d\n", shmem_internal_my_pe, PSYNC_CHUNK_SIZE);
+	//printf("\t[%d] SHMEM_SYNC_SIZE = %d\n", shmem_internal_my_pe, SHMEM_SYNC_SIZE);
+	//printf("\t[%d] psync_len = %ld\n", shmem_internal_my_pe, psync_len);
+
+    for (long i = 0; i < psync_len; i++) 
+	{
+		// bman: look at the offsets to confirm my assumptions.
+		//printf("==> [%d] shmem_internal_team_init(): &shmem_internal_psync_pool[%ld] = %p \n", shmem_internal_my_pe, i, &shmem_internal_psync_pool[i]);
         shmem_internal_psync_pool[i] = SHMEM_SYNC_VALUE;
     }
 
     /* Convenience pointer to the group-3 pSync array (for barriers and syncs): */
-    shmem_internal_psync_barrier_pool = &shmem_internal_psync_pool[PSYNC_CHUNK_SIZE *
-                                                         shmem_internal_params.TEAMS_MAX];
+    shmem_internal_psync_barrier_pool = &shmem_internal_psync_pool[PSYNC_CHUNK_SIZE * shmem_internal_params.TEAMS_MAX];
 
     psync_pool_avail = shmem_internal_shmalloc(2 * N_PSYNC_BYTES);
     if (NULL == psync_pool_avail) goto cleanup;

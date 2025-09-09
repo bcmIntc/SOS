@@ -17,6 +17,37 @@
 
 #define N_PSYNCS_PER_TEAM   2
 
+// bman: hierarchical PSYNC
+#define SHMEM_MAX_RADIX 4
+typedef struct 
+{
+    int radix;						// 4 by default
+    int parent;						// -1 for root, else parent rank in team
+    int children[SHMEM_MAX_RADIX];	// up to radix child ranks, -1 for none
+    int num_children;
+
+    // Hierarchical PSYNC
+    long *ps_up;				// length = radix (per-parent, child->parent signals)
+    long *ps_dn;				// length = radix (parent->child signals)  (optional; you can reuse ps_up with phases)
+    size_t ps_stride;			// bytes between slots (>= cache line)
+} shmem_internal_tree_node_t;
+
+typedef struct 
+{
+    // one per PE in the team:
+    shmem_internal_tree_node_t node;
+
+    // global pool bookkeeping
+    long *   ps_pool_base;		// symmetric base for this team
+    size_t   ps_pool_bytes;
+    uint64_t ps_epoch;			// toggled every op to avoid clears
+
+    // map pSync pointer -> instance id (for concurrent collectives)
+    // (optional) lockless hash or small fixed registry
+} shmem_internal_tree_meta_t;
+
+// /bman
+
 struct shmem_internal_team_t {
     int                            my_pe;
     int                            start, stride, size;
@@ -26,6 +57,10 @@ struct shmem_internal_team_t {
     long                           config_mask;
     size_t                         contexts_len;
     struct shmem_transport_ctx_t **contexts;
+
+	// Hierarchical PSYNC
+	shmem_internal_tree_meta_t hierarchical_psync_metaData;
+	shmem_internal_tree_node_t hierarchical_psync_node;
 };
 typedef struct shmem_internal_team_t shmem_internal_team_t;
 
