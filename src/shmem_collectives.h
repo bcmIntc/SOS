@@ -117,7 +117,7 @@ shmem_internal_sync(int PE_start, int PE_stride, int PE_size, long *pSync)
 
 	// bman
 	//setbuf(stdout, NULL);
-	printf("==> [%d] shmem_internal_sync(%s): pSync=%p, PE_start=%d, PE_stride=%d, PE_size=%d \n", shmem_internal_my_pe, algo_str, pSync, PE_start, PE_stride, PE_size);
+	//printf("==> [%d] shmem_internal_sync(%s): pSync=%p, PE_start=%d, PE_stride=%d, PE_size=%d \n", shmem_internal_my_pe, algo_str, pSync, PE_start, PE_stride, PE_size);
 	//print_stacktrace();
 	// /bman
 

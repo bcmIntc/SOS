@@ -214,7 +214,7 @@ int shmem_internal_team_init(void)
     if (NULL == shmem_internal_psync_pool) goto cleanup;
 
 	// bman: these are all as I calculated in my PSYNC whiteboard
-	printf("==> [%d] shmem_internal_team_init(): Allocated shmem_internal_psync_pool at %p, SHMEM_SYNC_SIZE=%d, psync_len=%ld \n", shmem_internal_my_pe, shmem_internal_psync_pool, SHMEM_SYNC_SIZE, psync_len);
+	//printf("==> [%d] shmem_internal_team_init(): Allocated shmem_internal_psync_pool at %p, SHMEM_SYNC_SIZE=%d, psync_len=%ld \n", shmem_internal_my_pe, shmem_internal_psync_pool, SHMEM_SYNC_SIZE, psync_len);
 	//printf("\t[%d] TEAMS_MAX = %ld\n", shmem_internal_my_pe, shmem_internal_params.TEAMS_MAX);
 	//printf("\t[%d] PSYNC_CHUNK_SIZE = %d\n", shmem_internal_my_pe, PSYNC_CHUNK_SIZE);
 	//printf("\t[%d] SHMEM_SYNC_SIZE = %d\n", shmem_internal_my_pe, SHMEM_SYNC_SIZE);
