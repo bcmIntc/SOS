@@ -509,6 +509,8 @@ int shmem_internal_collectives_init(void);
 /* internal allocation, without a barrier */
 void *shmem_internal_shmalloc(size_t size);
 void* shmem_internal_get_next(intptr_t incr);
+// bman added
+void * shmem_internal_align(size_t alignment, size_t size);
 
 void dlfree(void*);
 

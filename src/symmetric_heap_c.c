@@ -308,6 +308,17 @@ shmem_internal_shmalloc(size_t size)
     return ret;
 }
 
+void*
+shmem_internal_align(size_t alignment, size_t size) 
+{
+    void *ret = NULL;
+
+    SHMEM_MUTEX_LOCK(shmem_internal_mutex_alloc);
+    ret = dlmemalign(alignment, size);
+    SHMEM_MUTEX_UNLOCK(shmem_internal_mutex_alloc);
+
+    return ret;
+}
 
 void SHMEM_FUNCTION_ATTRIBUTES *
 shmem_malloc(size_t size)
