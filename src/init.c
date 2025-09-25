@@ -134,6 +134,10 @@ shmem_internal_randr_fini(void)
     return;
 }
 
+#if 0
+	// bman: follows MSR_PSYNC_EXIT_LATENCY in collectives.c
+	void shmem_internal_collectives_fini();
+#endif
 
 static void
 shmem_internal_shutdown(void)
@@ -158,6 +162,12 @@ shmem_internal_shutdown(void)
     shmem_internal_randr_fini();
 
     shmem_internal_symmetric_fini();
+
+#if 0
+	// bman MSR_PSYNC_EXIT_LATENCY
+	shmem_internal_collectives_fini();
+#endif
+
     shmem_runtime_fini();
 }
 

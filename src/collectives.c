@@ -21,17 +21,22 @@
 #include "shmem_collectives.h"
 #include "shmem_internal_op.h"
 
-
 //
 // bman
 //
 #include "assert.h"
+#include "time.h"
+#include <x86intrin.h> // For __rdtsc()
+
+
 #define HIERARCHICAL_PSYNC
-//#define USE_ALTERNATE_WAIT_1						// define to use alternatives to SHMEM_WAIT API. HIERARCHICAL_PSYNC must be set for this to have any effect. Very slow. SUCKS.
-#define USE_ALTERNATE_WAIT_2						// define to use alternative 2 (uses mmpause in wait loop to avoid speculative RFO)
+//#define USE_ALTERNATE_WAIT_1		// define to use alternatives to SHMEM_WAIT API. HIERARCHICAL_PSYNC must be set for this to have any effect. Very slow. SUCKS.
+#define USE_ALTERNATE_WAIT_2		// define to use alternative 2 (uses mmpause in wait loop to avoid speculative RFO)
 
 #define HIERARCHICAL_PSYNC_MAX_RADIX	8		// max #children per psync node in the tree-based algo (hard-coding my allocation to an extent)
 #define HIERARCHICAL_PSYNC_PADDING		64		// using 128 as the max spread for :)$ - 64 is min
+
+//#define MSR_PSYNC_EXIT_LATENCY					// define to measure the PSYNC exit latency: the last PE to arrive until all PEs release and return from the barrier.
 
 typedef struct {
     long val;												// actual slot value we will operate on
@@ -66,10 +71,12 @@ char *coll_type_str[] = { "AUTO",
 static int *full_tree_children;
 static int full_tree_num_children;
 static int full_tree_parent;
+
 #if defined(HIERARCHICAL_PSYNC)
  static int parent_num_children;
  static int my_index_in_parent_children;
 #endif
+
 static long tree_radix = -1;
 
 
@@ -139,9 +146,88 @@ shmem_internal_circular_iter_next(int curr, int PE_start, int PE_stride, int PE_
     return next;
 }
 
+#ifdef MSR_PSYNC_EXIT_LATENCY
 
-int
-shmem_internal_collectives_init(void)
+int *parents;
+int deepest_leaf, max_depth;
+uint32_t iteration=0;
+#define TIX_TO_NS(tix, freq) ((tix) * (1e9 / (freq)))
+#define EXIT_LATENCY_ARRAY_SIZE 1024
+uint64_t elapsed_ns[EXIT_LATENCY_ARRAY_SIZE] = {0};
+uint64_t tsc_overhead, tsc_freq;
+uint64_t start_time, stop_time;
+ 
+// rdtsc helper
+static inline uint64_t rdtsc(void)
+{
+    unsigned hi, lo;
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+// measure average rdtsc overhead in cycles
+static uint64_t measure_rdtsc_overhead(int reps)
+{
+    uint64_t sum = 0;
+    for (int i = 0; i < reps; i++) {
+        uint64_t t0 = rdtsc();
+        uint64_t t1 = rdtsc();
+        sum += (t1 - t0);
+    }
+    return sum / reps;
+}
+
+static uint64_t calibrate_tsc()
+{
+    struct timespec start, end;
+    unsigned long long tsc_start, tsc_end;
+    unsigned int temp;
+
+    // Record the starting TSC and time
+    _mm_lfence();
+    tsc_start = __rdtscp(&temp);
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    // Busy-wait for approximately 1 second
+    while (1) {
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        if ((end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9 >= 1.0) {
+            break;
+        }
+    }
+
+    // Record the ending TSC
+    tsc_end = __rdtscp(&temp);
+
+    // Calculate elapsed time in seconds
+    uint64_t elapsed_time = (end.tv_sec  - start.tv_sec) +
+                            (end.tv_nsec - start.tv_nsec) / 1e9;
+
+    // Calculate TSC frequency
+    return ((tsc_end - tsc_start) / elapsed_time);
+}
+
+
+// bman: i made this
+void shmem_internal_collectives_fini()
+{
+	if (shmem_internal_my_pe == deepest_leaf) 
+	{
+		int x;
+		uint64_t sum=0;
+		for (x = 0; x < EXIT_LATENCY_ARRAY_SIZE; x++) {	
+			if (elapsed_ns[x] == 0) break;
+			sum += elapsed_ns[x];
+		}
+		uint64_t avg = sum / (x-1);
+		printf("==>Average elapsed_ns = %ld ns \n", avg);
+	}
+}
+
+#endif
+
+
+int shmem_internal_collectives_init(void)
 {
     int i, j, k;
     int tmp_radix;
@@ -191,6 +277,8 @@ shmem_internal_collectives_init(void)
     for (i = 1 ; i <= shmem_internal_num_pes ; i *= tree_radix) 
 	{
         tmp_radix = (shmem_internal_num_pes / i < tree_radix) ? (shmem_internal_num_pes / i) + 1 : tree_radix;
+		assert(tmp_radix < HIERARCHICAL_PSYNC_MAX_RADIX);
+
         my_root = (shmem_internal_my_pe / (tmp_radix * i)) * (tmp_radix * i);
         if (my_root != shmem_internal_my_pe) break;
 
@@ -223,6 +311,14 @@ shmem_internal_collectives_init(void)
     }
     full_tree_parent = my_root;												// set the root of the tree. Each PE owns its own view of the tree.
 
+
+#if defined(MSR_PSYNC_EXIT_LATENCY)
+	// Since we create the tree breadth-first, we can just assume the largest PE is the furthest
+	deepest_leaf = shmem_internal_num_pes - 1;
+	tsc_freq = calibrate_tsc();
+    tsc_overhead = measure_rdtsc_overhead(tsc_freq);
+    printf("[%d] MSR_PSYNC_EXIT_LATENCY: deepest_leaf = %d\n", shmem_internal_my_pe, deepest_leaf); fflush(stdout);
+#endif
 #if defined(HIERARCHICAL_PSYNC)
 	// Determine # of children my parent has (i.e. siblings)
 	parent_num_children = 0;
@@ -233,7 +329,7 @@ shmem_internal_collectives_init(void)
 	    if (my_root != full_tree_parent) break;
 	    for (j = 1 ; j < tmp_radix ; ++j) 
 		{
-	        if (full_tree_parent + i * j < shmem_internal_num_pes) 
+	        if ((full_tree_parent + (i * j)) < shmem_internal_num_pes) 
 			{
 	            parent_num_children++;
 	        }
@@ -433,11 +529,10 @@ static void wait_method1(long *variable, long value)
 
 
 //
-
-static void wait_method2(volatile long *variable, long value)
+static inline __attribute__((always_inline)) void wait_method2(volatile long *variable, long value)
 {
     // Pure spinning - no MWAIT
-    while (*variable != value) {
+    while (*variable != value) {				// <-- hotspot for local HITM
         _mm_pause();		// Provide a hint to the processor that the code sequence is a spin-wait loop.
     }
 }
@@ -490,6 +585,7 @@ static void wait_method_mwait(volatile long *variable, long value)
     }
 	printf("[%d]-mwait()\n", shmem_internal_my_pe); fflush(stdout);
 }
+
 //
 
 void shmem_internal_sync_tree(int PE_start, int PE_stride, int PE_size, long *pSync)
@@ -499,6 +595,7 @@ void shmem_internal_sync_tree(int PE_start, int PE_stride, int PE_size, long *pS
 
     /* need 1 slot */
     shmem_internal_assert(SHMEM_BARRIER_SYNC_SIZE >= 1);
+
 
     if (PE_size == shmem_internal_num_pes) 
 	{
@@ -518,6 +615,24 @@ void shmem_internal_sync_tree(int PE_start, int PE_stride, int PE_size, long *pS
         children = alloca(sizeof(int) * tree_radix);
         shmem_internal_build_kary_tree(tree_radix, PE_start, PE_stride, PE_size, 0, &parent, &num_children, children);
     }
+
+#if defined(MSR_PSYNC_EXIT_LATENCY)
+	// We calculated deepest_leaf during init -- we will slow him down as him being late should have the largest impact.
+	if (shmem_internal_my_pe == deepest_leaf) 
+	{
+		unsigned int tmp;	
+	    struct timespec req, rem;
+
+		//printf("==> [%d] MSR_PSYNC_EXIT_LATENCY: waiting... \n", shmem_internal_my_pe); fflush(stdout);
+	    req.tv_sec  = 0;
+	    req.tv_nsec = 100000;   // 100,000ns == 100us
+	    nanosleep(&req, &rem);
+
+		// latch the start time and then the time right before I exit. Prefer the TSC.
+	    _mm_lfence();
+		start_time = __rdtscp(&tmp);
+	}
+#endif
 
 #if defined(HIERARCHICAL_PSYNC)
 	//
@@ -607,7 +722,8 @@ void shmem_internal_sync_tree(int PE_start, int PE_stride, int PE_size, long *pS
 			// Release children (write into each child’s down slot)
 			for (int i = 0; i < num_children; i++) {
 			    int child = children[i];
-				shmem_internal_put_scalar(SHMEM_CTX_DEFAULT, &(pPsyncNodes[child].DownSlot.val), &one, sizeof(one), child); // cannot use plain store as this wont go remote if needed
+				shmem_internal_put_scalar(SHMEM_CTX_DEFAULT, &(pPsyncNodes[child].DownSlot.val), &one, sizeof(one), child); 
+				// cannot use plain store ^ as this wont go remote if needed
 			}
         }
     }
@@ -670,6 +786,20 @@ void shmem_internal_sync_tree(int PE_start, int PE_stride, int PE_size, long *pS
         SHMEM_WAIT_UNTIL(pSync, SHMEM_CMP_EQ, 0);
     }
 #endif // OG
+
+#ifdef MSR_PSYNC_EXIT_LATENCY
+	if (shmem_internal_my_pe == deepest_leaf) 
+	{
+		//printf("==> deepest_leaf: storing duration... \n");
+        unsigned int tmp;
+		stop_time = __rdtscp(&tmp);
+		int idx = iteration % EXIT_LATENCY_ARRAY_SIZE;
+		elapsed_ns[idx] = TIX_TO_NS(stop_time - start_time - tsc_overhead, tsc_freq);
+		iteration++;
+		//printf("==> deepest_leaf: stored elapsed_ns[%d]=%ld (stop_time=%ld, start_time=%ld, tsc_overhead=%ld, tsc_freq=%ld)\n",
+		//									idx, elapsed_ns[idx], stop_time, start_time, tsc_overhead, tsc_freq); fflush(stdout);
+	}
+#endif
 }
 
 
