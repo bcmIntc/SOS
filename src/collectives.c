@@ -30,23 +30,43 @@
 
 
 #define HIERARCHICAL_PSYNC
+//#define HIERARCHICAL_HYBRID			// define to change the node structure. Requires HIERARCHICAL_PSYNC be set.
 //#define USE_ALTERNATE_WAIT_1		// define to use alternatives to SHMEM_WAIT API. HIERARCHICAL_PSYNC must be set for this to have any effect. Very slow. SUCKS.
-#define USE_ALTERNATE_WAIT_2		// define to use alternative 2 (uses mmpause in wait loop to avoid speculative RFO)
+//#define USE_ALTERNATE_WAIT_2		// define to use alternative 2 (uses mmpause in wait loop to avoid speculative RFO)
+#define USE_ALTERNATE_WAIT_3		// define to use alternative 3 (like _2, but uses a backoff)
 
-#define HIERARCHICAL_PSYNC_MAX_RADIX	8		// max #children per psync node in the tree-based algo (hard-coding my allocation to an extent)
+
+//#define HIERARCHICAL_PSYNC_MAX_RADIX	8		// max #children per psync node in the tree-based algo (hard-coding my allocation to an extent)
+#define HIERARCHICAL_PSYNC_MAX_RADIX	2		// !! NOTE: Must agree with shmem_internal_collectives_init::tree_radix !!
 #define HIERARCHICAL_PSYNC_PADDING		64		// using 128 as the max spread for :)$ - 64 is min
 
 //#define MSR_PSYNC_EXIT_LATENCY					// define to measure the PSYNC exit latency: the last PE to arrive until all PEs release and return from the barrier.
 
-typedef struct {
-    long val;												// actual slot value we will operate on
-    char pad[HIERARCHICAL_PSYNC_PADDING - sizeof(long)];	// pad to separate from next slot
-} t_padded_slot;
 
-typedef struct {
-    t_padded_slot DownSlot;								// single down slot, also padded
-    t_padded_slot UpSlots[HIERARCHICAL_PSYNC_MAX_RADIX];	// each slot padded
-} t_hierarchical_node;
+#if !defined(HIERARCHICAL_HYBRID)
+	typedef struct {
+		long val;												// actual slot value we will operate on
+	    char pad[HIERARCHICAL_PSYNC_PADDING - sizeof(long)];	// pad to separate from next slot
+	} t_padded_slot;
+
+	typedef struct {
+	    t_padded_slot DownSlot;								// single down slot, also padded
+		t_padded_slot UpSlots[HIERARCHICAL_PSYNC_MAX_RADIX];	// each slot padded
+	} t_hierarchical_node;
+
+#else
+
+	// Hybrid
+	typedef struct {
+		// Pack UpSlots for parent read efficiency (children write once, but the parent reads frequently)
+	    long UpSlots[HIERARCHICAL_PSYNC_MAX_RADIX];  // 1-2 cache lines
+		char pad1[64 - (HIERARCHICAL_PSYNC_MAX_RADIX * sizeof(long)) % 64];
+
+	    // Keep DownSlot separate (since each child reads its own frequently)
+		long DownSlot;
+	    char pad2[56];
+	} __attribute__((aligned(64))) t_hierarchical_node;
+#endif
 
 t_hierarchical_node *pPsyncNodes = NULL;
 
@@ -234,7 +254,9 @@ int shmem_internal_collectives_init(void)
     int my_root = 0;
     char *type;
 
-    tree_radix = shmem_internal_params.COLL_RADIX;	// tree_radix = 4
+    //tree_radix = shmem_internal_params.COLL_RADIX;	// tree_radix = 4
+	if (shmem_internal_my_pe == 0) printf("\n!! HACK: setting tree_radix = 2 (instead of 4) \n");
+    tree_radix = 2;	// bman: see if this affects
 
     /* initialize barrier_all psync array */
 #if defined(HIERARCHICAL_PSYNC)
@@ -248,10 +270,17 @@ int shmem_internal_collectives_init(void)
     for (int pe = 0; pe < shmem_internal_num_pes; pe++) 
 	{
         // Initialize UP and DOWN slots
+	#if !defined(HIERARCHICAL_HYBRID)
 		pPsyncNodes[pe].DownSlot.val = SHMEM_SYNC_VALUE;
         for (int i = 0; i < HIERARCHICAL_PSYNC_MAX_RADIX; i++) {
             pPsyncNodes[pe].UpSlots[i].val = SHMEM_SYNC_VALUE;
         }
+	#else
+		pPsyncNodes[pe].DownSlot = SHMEM_SYNC_VALUE;
+        for (int i = 0; i < HIERARCHICAL_PSYNC_MAX_RADIX; i++) {
+            pPsyncNodes[pe].UpSlots[i] = SHMEM_SYNC_VALUE;
+        }
+	#endif
     }
 
 #else
@@ -277,7 +306,9 @@ int shmem_internal_collectives_init(void)
     for (i = 1 ; i <= shmem_internal_num_pes ; i *= tree_radix) 
 	{
         tmp_radix = (shmem_internal_num_pes / i < tree_radix) ? (shmem_internal_num_pes / i) + 1 : tree_radix;
-		assert(tmp_radix < HIERARCHICAL_PSYNC_MAX_RADIX);
+		
+		// DBG
+		assert(tmp_radix <= HIERARCHICAL_PSYNC_MAX_RADIX);
 
         my_root = (shmem_internal_my_pe / (tmp_radix * i)) * (tmp_radix * i);
         if (my_root != shmem_internal_my_pe) break;
@@ -286,7 +317,7 @@ int shmem_internal_collectives_init(void)
 		{
             if (shmem_internal_my_pe + i * j < shmem_internal_num_pes) 
 			{
-                full_tree_num_children++;
+                full_tree_num_children++;			// bman: note this grows beyond HIERARCHICAL_PSYNC_MAX_RADIX - includes grandkids and greats.
             }
         }
     }
@@ -508,7 +539,8 @@ shmem_internal_sync_linear(int PE_start, int PE_stride, int PE_size, long *pSync
 
 
 // bman
-static void wait_method1(long *variable, long value)
+#ifdef USE_ALTERNATE_WAIT_1
+static void wait_method(long *variable, long value)
 {
 	const int MAX_BACKOFF = 20;
 	int backoff_us = 2;
@@ -526,16 +558,66 @@ static void wait_method1(long *variable, long value)
 		backoff_us = MIN(backoff_us * 2, MAX_BACKOFF);
 	}
 }
-
+#endif
 
 //
-static inline __attribute__((always_inline)) void wait_method2(volatile long *variable, long value)
+#ifdef USE_ALTERNATE_WAIT_2
+static inline __attribute__((always_inline)) void wait_method(volatile long *variable, long value)
 {
     // Pure spinning - no MWAIT
     while (*variable != value) {				// <-- hotspot for local HITM
         _mm_pause();		// Provide a hint to the processor that the code sequence is a spin-wait loop.
     }
 }
+#endif
+
+#ifdef USE_ALTERNATE_WAIT_3
+  #if 0
+    /*   Load Local HITM                   :     119931
+         Load Remote HITM                  :        115
+    */
+    static inline __attribute__((always_inline)) void wait_method(volatile long *variable, long value)
+    {
+        // Exponential backoff
+        const int MAX_BACKOFF = 20;
+        const int BACKOFF_MULTIPLIER = 2;
+        int backoff = 1;
+
+        //while (*variable != value) {                                                                          // <-- huge hotspot for local HITM
+        while (atomic_load_explicit(variable, memory_order_acquire) != value) {
+            for (int i = 0; i < backoff; i++) _mm_pause();
+            backoff = (backoff < MAX_BACKOFF) ? backoff * BACKOFF_MULTIPLIER : MAX_BACKOFF;
+        }
+    }
+  #else
+    /*
+      Load Local HITM                   :     144416
+      Load Remote HITM                  :        190
+    */
+    //static inline __attribute__((always_inline)) void wait_method3(volatile long *variable, long value)
+    static void wait_method(volatile long *variable, long value)
+    {
+        const int MAX_BACKOFF = 1024;   // cap on the inner loop
+        int iter = 1;
+
+        while (atomic_load_explicit(variable, memory_order_acquire) != value) {                                 // <-- hotspot: READER
+            // Quadratic backoff: 1, 4, 9, 16, ...
+            int backoff = iter * iter;
+            if (backoff > MAX_BACKOFF) {
+                backoff = MAX_BACKOFF;
+            }
+
+            for (int i = 0; i < backoff; i++) {
+                _mm_pause();
+            }
+
+            if (backoff < MAX_BACKOFF) {
+                iter++;
+            }
+        }
+    }
+  #endif
+#endif // WAIT_3
 
 #include <cpuid.h>
 static int check_mwait_support(void) 
@@ -645,37 +727,69 @@ void shmem_internal_sync_tree(int PE_start, int PE_stride, int PE_size, long *pS
 	{
 		/* Leaf node */
 
+		//printf("[%d] +Leaf Node, signaling parent...\n", shmem_internal_my_pe); fflush(stdout);
+
 		// No children, so no up-slot management needed
 
 		// signal parent
+	  #if !defined(HIERARCHICAL_HYBRID)
 		shmem_long_atomic_set(&(pPsyncNodes[parent].UpSlots[my_index_in_parent_children].val), 1, parent);
-
-		// wait for release from parent
-	  #if defined(USE_ALTERNATE_WAIT_1)
-		wait_method1(&(pPsyncNodes[shmem_internal_my_pe].DownSlot.val), 1);
-	  #elif defined(USE_ALTERNATE_WAIT_2)
-		wait_method2(&(pPsyncNodes[shmem_internal_my_pe].DownSlot.val), 1);
 	  #else
-		SHMEM_WAIT_UNTIL(&(pPsyncNodes[shmem_internal_my_pe].DownSlot.val), SHMEM_CMP_EQ, 1);
+		shmem_long_atomic_set(&(pPsyncNodes[parent].UpSlots[my_index_in_parent_children]), 1, parent);
 	  #endif
 
+		//printf("[%d] Leaf Node: about to wait on release from parent(%d)...\n", shmem_internal_my_pe, parent); fflush(stdout);
+
+		// wait for release from parent
+	  #if defined(USE_ALTERNATE_WAIT_1) || defined(USE_ALTERNATE_WAIT_2) || defined(USE_ALTERNATE_WAIT_3)
+	    #if !defined(HIERARCHICAL_HYBRID)
+		  wait_method(&(pPsyncNodes[shmem_internal_my_pe].DownSlot.val), 1);
+		#else
+		  wait_method(&(pPsyncNodes[shmem_internal_my_pe].DownSlot), 1);
+		#endif
+	  #else
+	    #if !defined(HIERARCHICAL_HYBRID)
+		  SHMEM_WAIT_UNTIL(&(pPsyncNodes[shmem_internal_my_pe].DownSlot.val), SHMEM_CMP_EQ, 1);
+		#else
+		  SHMEM_WAIT_UNTIL(&(pPsyncNodes[shmem_internal_my_pe].DownSlot), SHMEM_CMP_EQ, 1);
+		#endif
+	  #endif
+
+		//printf("[%d] Leaf Node: Just waited on parent release. Now resetting my downslot.\n", shmem_internal_my_pe); fflush(stdout);
+
 		// reset my slots 
+	  #if !defined(HIERARCHICAL_HYBRID)
 		pPsyncNodes[shmem_internal_my_pe].DownSlot.val = 0;
+	  #else
+		pPsyncNodes[shmem_internal_my_pe].DownSlot = 0;
+	  #endif
+
+		//printf("[%d] -Leaf Node\n", shmem_internal_my_pe); fflush(stdout);
     }
 	else
 	{
         /* Node with children */
 
+		//printf("[%d] +Waiting on children\n", shmem_internal_my_pe); fflush(stdout);
+
         // Wait for children
-        for (int i = 0; i < num_children; i++) {
-		  #if defined(USE_ALTERNATE_WAIT_1)
-			wait_method1(&(pPsyncNodes[shmem_internal_my_pe].UpSlots[i].val), 1);
-		  #elif defined(USE_ALTERNATE_WAIT_2)
-			wait_method2(&(pPsyncNodes[shmem_internal_my_pe].UpSlots[i].val), 1);
+        for (int i = 0; i < num_children; i++) 
+		{
+		  #if defined(USE_ALTERNATE_WAIT_1) || defined(USE_ALTERNATE_WAIT_2) || defined(USE_ALTERNATE_WAIT_3)
+			#if !defined(HIERARCHICAL_HYBRID)
+			  wait_method(&(pPsyncNodes[shmem_internal_my_pe].UpSlots[i].val), 1);
+			#else
+			  wait_method(&(pPsyncNodes[shmem_internal_my_pe].UpSlots[i]), 1);
+			#endif
 		  #else
-            SHMEM_WAIT_UNTIL(&(pPsyncNodes[shmem_internal_my_pe].UpSlots[i].val), SHMEM_CMP_EQ, 1);		// bman: likely losing efficiency here - mwait? Cuz kids are upating and we are spinning.
+			#if !defined(HIERARCHICAL_HYBRID)
+              SHMEM_WAIT_UNTIL(&(pPsyncNodes[shmem_internal_my_pe].UpSlots[i].val), SHMEM_CMP_EQ, 1);		// bman: likely losing efficiency here - mwait? Cuz kids are upating and we are spinning.
+			#else
+              SHMEM_WAIT_UNTIL(&(pPsyncNodes[shmem_internal_my_pe].UpSlots[i]), SHMEM_CMP_EQ, 1);		// bman: likely losing efficiency here - mwait? Cuz kids are upating and we are spinning.
+			#endif
 		  #endif
 		}
+
 
         if (parent == shmem_internal_my_pe) 
 		{
@@ -683,6 +797,25 @@ void shmem_internal_sync_tree(int PE_start, int PE_stride, int PE_size, long *pS
 
 			// No parent to signal, no parent to wait on, i.e. no active down-slot to manage
 
+		#if defined(HIERARCHICAL_HYBRID)
+
+            // Clear my up-slots -- Can do all at once since Upslots are packed
+            memset(pPsyncNodes[shmem_internal_my_pe].UpSlots, 0, num_children * sizeof(long));
+
+			// Pre-compute child PE numbers for better code locality
+			int child_pes[HIERARCHICAL_PSYNC_MAX_RADIX];
+			for (int i = 0; i < num_children; i++) {
+			    child_pes[i] = children[i];
+			}
+
+			// Use SHMEM puts to write to remote PE memory
+			long one = 1;
+			for (int i = 0; i < num_children; i++) {
+			    shmem_internal_put_scalar(SHMEM_CTX_DEFAULT, 
+						                 &(pPsyncNodes[child_pes[i]].DownSlot), 
+									     &one, sizeof(one), child_pes[i]);
+			}
+		#else
 			// Clear my up slots (updated by children who are waiting for me to release them)
 			for (int i = 0; i < num_children; i++)  {
 				pPsyncNodes[shmem_internal_my_pe].UpSlots[i].val = 0;
@@ -694,35 +827,61 @@ void shmem_internal_sync_tree(int PE_start, int PE_stride, int PE_size, long *pS
 			    int child = children[i];
 				shmem_internal_put_scalar(SHMEM_CTX_DEFAULT, &(pPsyncNodes[child].DownSlot.val), &one, sizeof(one), child);
 			}
+		#endif
+
+			//printf("[%d] -Root\n", shmem_internal_my_pe); fflush(stdout);
         }
         else 
 		{
             /* Middle node */
 
             // Signal parent
+		#if !defined(HIERARCHICAL_HYBRID)
 			shmem_long_atomic_set(&(pPsyncNodes[parent].UpSlots[my_index_in_parent_children].val), 1, parent);
+		#else
+			shmem_long_atomic_set(&(pPsyncNodes[parent].UpSlots[my_index_in_parent_children]), 1, parent);
+		#endif
 
             // Wait for parent release (on my ds)
-		#if defined(USE_ALTERNATE_WAIT_1)
-			wait_method1(&(pPsyncNodes[shmem_internal_my_pe].DownSlot.val), 1);
-		#elif defined(USE_ALTERNATE_WAIT_2)
-			wait_method2(&(pPsyncNodes[shmem_internal_my_pe].DownSlot.val), 1);
+		#if defined(USE_ALTERNATE_WAIT_1) || defined(USE_ALTERNATE_WAIT_2) || defined(USE_ALTERNATE_WAIT_3)
+		  #if !defined(HIERARCHICAL_HYBRID)
+			  wait_method(&(pPsyncNodes[shmem_internal_my_pe].DownSlot.val), 1);
+		  #else
+			  wait_method(&(pPsyncNodes[shmem_internal_my_pe].DownSlot), 1);
+		  #endif
 		#else
-	        SHMEM_WAIT_UNTIL(&(pPsyncNodes[shmem_internal_my_pe].DownSlot.val), SHMEM_CMP_EQ, 1);	// bman: likely losing efficiency here - mwait?
+			#if !defined(HIERARCHICAL_HYBRID)
+	          SHMEM_WAIT_UNTIL(&(pPsyncNodes[shmem_internal_my_pe].DownSlot.val), SHMEM_CMP_EQ, 1);	// bman: likely losing efficiency here - mwait?
+			#else
+	          SHMEM_WAIT_UNTIL(&(pPsyncNodes[shmem_internal_my_pe].DownSlot), SHMEM_CMP_EQ, 1);	// bman: likely losing efficiency here - mwait?
+			#endif
 		#endif	
 
 			// Reset my down slot
+		#if !defined(HIERARCHICAL_HYBRID)
 			pPsyncNodes[shmem_internal_my_pe].DownSlot.val = 0;
+		#else
+			pPsyncNodes[shmem_internal_my_pe].DownSlot = 0;
+		#endif
 
 			// Clear my upslots (updated by children who are waiting for me to release them)
+        #if defined(HIERARCHICAL_HYBRID)
+            memset(pPsyncNodes[shmem_internal_my_pe].UpSlots, 0, num_children * sizeof(long));
+        #else
 			for (int i = 0; i < num_children; i++) {
 				pPsyncNodes[shmem_internal_my_pe].UpSlots[i].val = 0;  // this is local memory
 			}
+		#endif
 
 			// Release children (write into each child’s down slot)
-			for (int i = 0; i < num_children; i++) {
+			for (int i = 0; i < num_children; i++) 
+			{
 			    int child = children[i];
+			#if !defined(HIERARCHICAL_HYBRID)
 				shmem_internal_put_scalar(SHMEM_CTX_DEFAULT, &(pPsyncNodes[child].DownSlot.val), &one, sizeof(one), child); 
+			#else
+				shmem_internal_put_scalar(SHMEM_CTX_DEFAULT, &(pPsyncNodes[child].DownSlot), &one, sizeof(one), child); 
+			#endif
 				// cannot use plain store ^ as this wont go remote if needed
 			}
         }
