@@ -188,7 +188,8 @@ extern hwloc_topology_t shmem_internal_topology;
 
 #ifdef ENABLE_ERROR_CHECKING
 #define SHMEM_ERR_CHECK_INITIALIZED()                                    \
-    do {                                                                 \
+    do { \
+		assert(0);                                                                 \
         if (!shmem_internal_initialized) {                               \
             RETURN_ERROR_STR(PACKAGE_NAME " library not initialized\n"); \
             abort();                                                     \

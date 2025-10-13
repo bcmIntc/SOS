@@ -24,6 +24,27 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+//#define PERF_COUNTERS
+#ifdef  PERF_COUNTERS
+// bman
+#include <linux/perf_event.h>
+#include <sys/syscall.h>
+#include <sys/ioctl.h>
+
+struct perf_counter {
+    int fd;
+    const char* name;
+    uint32_t type;
+    uint64_t config;
+    uint64_t config1;  // 0 for most events, set for offcore
+    int needs_config1; // Flag to indicate if config1 is used
+};
+
+int setup_perf_counter_smart(uint32_t type, uint64_t config, uint64_t config1, int needs_config1);
+int num_counters;
+extern struct perf_counter counters[];
+#endif
+
 enum coll_type_t {
     AUTO = 0,
     LINEAR,
@@ -145,8 +166,45 @@ static inline
 void
 shmem_internal_barrier_all(void)
 {
+#ifdef PERF_COUNTERS
+    // Start all counters
+    for (int i = 0; i < num_counters; i++)
+    {
+        if (counters[i].fd >= 0)
+        {
+            ioctl(counters[i].fd, PERF_EVENT_IOC_RESET, 0);
+            ioctl(counters[i].fd, PERF_EVENT_IOC_ENABLE, 0);
+        }
+    }
+    sleep(1);
+#endif
+
     shmem_internal_quiet(SHMEM_CTX_DEFAULT);
     shmem_internal_sync(0, 1, shmem_internal_num_pes, shmem_internal_barrier_all_psync);
+
+#ifdef PERF_COUNTERS
+    // Wait for post-barrier settle R: no diff
+    _mm_lfence();
+	usleep(10000);
+
+    // Stop and read results
+    for (int i = 0; i < num_counters; i++)
+    {
+        if (counters[i].fd >= 0)
+        {
+            ioctl(counters[i].fd, PERF_EVENT_IOC_DISABLE, 0);
+        }
+    }
+    for (int i = 0; i < num_counters; i++)
+    {
+        if (counters[i].fd >= 0)
+        {
+            long long count = 0;
+            read(counters[i].fd, &count, sizeof(count));
+            printf("[%d] %s: %lld\n", shmem_internal_my_pe, counters[i].name, count);
+        }
+    }
+#endif
 }
 
 
