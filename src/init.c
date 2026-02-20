@@ -357,6 +357,41 @@ shmem_internal_heap_preinit(int tl_requested, int *tl_provided)
     abort();
 }
 
+// bman
+static void print_bitmap_hex(hwloc_bitmap_t bitmap, const char *label) 
+{
+  #if 1
+	// first decode the bitmap
+	int num_entries = hwloc_bitmap_nr_ulongs(bitmap);
+	unsigned long masks[num_entries];
+	unsigned long MASK = 1;
+
+	printf("PE[%d] %s: \n", shmem_internal_my_pe, label);
+	hwloc_bitmap_to_ulongs(bitmap, num_entries, masks);
+	
+	int count = 0;
+	for (int i=0; i < num_entries; i++) {
+		for (int j=0; j < sizeof(unsigned long) * 8; j++) {
+			if (masks[i] & (MASK << j)) {
+				printf("    => (%d) \n", j);
+				fflush(stdout);
+				count++;
+			}
+		}
+	}
+	if (count > 1) printf("!!PE[%d]: Found a bitmap with %d CPUs set! \n", shmem_internal_my_pe, count); 
+  #endif
+
+  #if 0
+	// Print the bitmap
+    char *str;
+    hwloc_bitmap_taskset_asprintf(&str, bitmap);
+	printf("%s: %s\n", label, str);
+    free(str);
+  #endif
+}
+
+
 int
 shmem_internal_heap_postinit(void)
 {
@@ -386,6 +421,9 @@ shmem_internal_heap_postinit(void)
 
 #ifdef HAVE_SCHED_GETAFFINITY
 #ifdef USE_HWLOC
+	unsigned numa_node_id = -1;
+	unsigned socket_id    = -1;
+
     ret = hwloc_topology_init(&shmem_internal_topology);
     SHMEM_CHECK_GOTO_MSG(ret != 0, hwloc_exit, "hwloc_topology_init failed (%s). Please verify your hwloc installation\n", strerror(errno));
 
@@ -394,6 +432,100 @@ shmem_internal_heap_postinit(void)
 
     ret = hwloc_topology_load(shmem_internal_topology);
     SHMEM_CHECK_GOTO_MSG(ret != 0, hwloc_exit, "hwloc_topology_load failed (%s). Please verify your hwloc installation\n", strerror(errno));
+
+	hwloc_bitmap_t bindset_all = hwloc_bitmap_alloc();
+	hwloc_bitmap_t bindset_covering_obj = hwloc_bitmap_alloc();
+
+	hwloc_get_proc_cpubind(shmem_internal_topology, getpid(), bindset_all, HWLOC_CPUBIND_PROCESS);
+	print_bitmap_hex(bindset_all, "~~Initial CPU binding~~");
+
+	hwloc_obj_t covering_obj = NULL;
+	bool binding_modified = false;
+
+	// Try NUMA node first
+	covering_obj = hwloc_get_next_obj_covering_cpuset_by_type(shmem_internal_topology, bindset_all, HWLOC_OBJ_NUMANODE, NULL);
+	if (covering_obj) {
+		printf("PE[%d] binding to NUMA node %u\n", shmem_internal_my_pe, covering_obj->os_index);
+		hwloc_bitmap_copy(bindset_covering_obj, covering_obj);  // Bind to NUMA
+		binding_modified = true;
+	} 
+	else {
+	    // Binding spans multiple NUMA nodes - try socket
+	    covering_obj = hwloc_get_next_obj_covering_cpuset_by_type(shmem_internal_topology, bindset_all, HWLOC_OBJ_PACKAGE, NULL);
+		SHMEM_CHECK_GOTO_MSG(!covering_obj, hwloc_cleanup, "hwloc_get_next_obj_covering_cpuset_by_type failed \
+					(could not detect object of type 'HWLOC_OBJ_PACKAGE' in provided cpuset). Please verify your hwloc installation\n");
+		// Binding fits within single socket - keep it
+		printf("Binding spans NUMA nodes but fits within socket %u\n", covering_obj->os_index);
+	    hwloc_bitmap_copy(bindset_covering_obj, covering_obj);
+	    binding_modified = true;
+	}
+
+#if 0
+	if (covering_obj) 
+	{
+		hwloc_bitmap_and(bindset_covering_obj, bindset_all, covering_obj->cpuset);
+	    if (hwloc_bitmap_isequal(bindset_covering_obj, bindset_all)) 
+		{
+		    // Perfect fit in single NUMA node
+			printf("Binding within NUMA node %u\n", covering_obj->os_index);
+	        binding_modified = true;
+		}
+		else
+		{
+			// Spans multiple NUMA nodes - try socket		<== bman: this is not true - we checked for equality only - 
+	        covering_obj = hwloc_get_next_obj_covering_cpuset_by_type(shmem_internal_topology, bindset_all, HWLOC_OBJ_PACKAGE, NULL);
+			SHMEM_CHECK_GOTO_MSG(!covering_obj, hwloc_cleanup, "hwloc_get_next_obj_covering_cpuset_by_type failed \
+						(could not detect object of type 'HWLOC_OBJ_PACKAGE' in provided cpuset). Please verify your hwloc installation\n");
+		
+	        hwloc_bitmap_and(bindset_covering_obj, bindset_all, covering_obj->cpuset);
+		    if (hwloc_bitmap_isequal(bindset_covering_obj, bindset_all))	
+			{
+			    // Perfect fit in single socket
+				printf("Binding within socket %u\n", covering_obj->os_index);
+	               binding_modified = true;
+		    }
+			else 
+			{
+			    // Spans multiple sockets - keep original
+			    printf("Binding spans multiple sockets, keeping original\n");
+				hwloc_bitmap_copy(bindset_covering_obj, bindset_all);
+	            binding_modified = true;
+		    }
+		}
+	}
+	else
+	{
+		// No NUMA structure - try socket directly
+	    covering_obj = hwloc_get_next_obj_covering_cpuset_by_type(shmem_internal_topology, bindset_all, HWLOC_OBJ_PACKAGE, NULL);
+		SHMEM_CHECK_GOTO_MSG(!covering_obj, hwloc_cleanup, "hwloc_get_next_obj_covering_cpuset_by_type failed \
+						(could not detect object of type 'HWLOC_OBJ_PACKAGE' in provided cpuset). Please verify your hwloc installation\n");
+	
+	    hwloc_bitmap_and(bindset_covering_obj, bindset_all, covering_obj->cpuset);
+		if (hwloc_bitmap_isequal(bindset_covering_obj, bindset_all)) 
+		{
+			printf("Binding within socket %u\n", covering_obj->os_index);
+            binding_modified = true;
+	    }
+		else 
+		{
+		    // Spans multiple sockets - keep original
+			printf("Binding spans multiple sockets, keeping original\n");
+            hwloc_bitmap_copy(bindset_covering_obj, bindset_all);
+	        binding_modified = true;
+		}
+	}
+#endif
+
+	// Bind to the parent NUMA | SOCKET. Note that we are NOT re-mapping any CPUs. We preserve the user's wishes, if any.
+	// I suppose the same could be said about this code.
+	if (binding_modified) {
+		hwloc_set_proc_cpubind(shmem_internal_topology, getpid(), bindset_covering_obj, HWLOC_CPUBIND_PROCESS);
+	}
+
+	//print_bitmap_hex(bindset_covering_obj, "### CPU binding After HWLOC code ran ###");
+
+// OG
+#if 0
 #if defined(HWLOC_ENFORCE_SINGLE_SOCKET) || defined(HWLOC_ENFORCE_SINGLE_NUMA_NODE)
     hwloc_bitmap_t bindset = hwloc_bitmap_alloc();
     hwloc_bitmap_t bindset_all = hwloc_bitmap_alloc();
@@ -406,8 +538,7 @@ shmem_internal_heap_postinit(void)
     SHMEM_CHECK_GOTO_MSG(ret != 0, hwloc_cleanup, "hwloc_get_proc_cpubind failed (%s). Please verify your hwloc installation\n", strerror(errno));
 #ifdef HWLOC_ENFORCE_SINGLE_SOCKET
     hwloc_obj_t covering_obj = hwloc_get_next_obj_covering_cpuset_by_type(shmem_internal_topology, bindset, HWLOC_OBJ_PACKAGE, NULL);
-    SHMEM_CHECK_GOTO_MSG(!covering_obj, hwloc_cleanup,
-                         "hwloc_get_next_obj_covering_cpuset_by_type failed (could not detect object of type 'HWLOC_OBJ_PACKAGE' in provided cpuset). Please verify your hwloc installation\n");
+    SHMEM_CHECK_GOTO_MSG(!covering_obj, hwloc_cleanup, "hwloc_get_next_obj_covering_cpuset_by_type failed (could not detect object of type 'HWLOC_OBJ_PACKAGE' in provided cpuset). Please verify your hwloc installation\n");
 #else /* HWLOC_ENFORCE_SINGLE_NUMA_NODE */
     hwloc_obj_t covering_obj = hwloc_get_next_obj_covering_cpuset_by_type(shmem_internal_topology, bindset, HWLOC_OBJ_NUMANODE, NULL);
     SHMEM_CHECK_GOTO_MSG(!covering_obj, hwloc_cleanup,
@@ -422,7 +553,13 @@ shmem_internal_heap_postinit(void)
         hwloc_bitmap_free(bindset_all);
         hwloc_bitmap_free(bindset_covering_obj);
 #endif // HWLOC_ENFORCE_SINGLE_SOCKET || HWLOC_ENFORCE_SINGLE_NUMA_NODE
+#endif // if 0
+
+	hwloc_cleanup:
+		hwloc_bitmap_free(bindset_all);
+	    hwloc_bitmap_free(bindset_covering_obj);
     hwloc_exit:
+
 #endif // USE_HWLOC
 
     if (shmem_internal_params.DEBUG) {
