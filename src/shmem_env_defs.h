@@ -111,6 +111,8 @@ SHMEM_INTERNAL_ENV_DEF(OFI_DISABLE_MULTIRAIL, bool, false, SHMEM_INTERNAL_ENV_CA
                        "Disable usage of multirail functionality")
 SHMEM_INTERNAL_ENV_DEF(OFI_DISABLE_SINGLE_EP, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Disable single endpoint resource optimization (enable separate Tx and Rx EPs)")
+SHMEM_INTERNAL_ENV_DEF(OFI_TX_MUX_ENDPOINTS, long, 1, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Number of TX endpoints per context for transmit multiplexing (1 = disabled)")
 #endif
 
 #ifdef USE_UCX
