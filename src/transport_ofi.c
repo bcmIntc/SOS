@@ -1823,6 +1823,8 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
         if (ctx->tx_stx_idxs == NULL) {
             RAISE_ERROR_STR("Out of memory allocating TX muxing STX index array");
         }
+        /* Initialize to -1 (no STX) so the cleanup loop can safely check all entries */
+        memset(ctx->tx_stx_idxs, -1, n * sizeof(int));
 
         /* Slot 0 is the primary endpoint already created above */
         ctx->tx_ep_arr[0]  = ctx->ep;
@@ -1864,29 +1866,35 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
             if (extra_stx >= 0) {
                 ret = fi_ep_bind(extra_ep,
                                  &shmem_transport_ofi_stx_pool[extra_stx].stx->fid, 0);
-                OFI_CHECK_RETURN_STR(ret, "fi_ep_bind STX to extra TX endpoint failed");
+                OFI_CHECK_RETURN_MSG(ret, "fi_ep_bind STX to extra TX endpoint %d failed (%s)\n",
+                                     i, fi_strerror(ret));
             }
 
             /* Bind shared put counter */
             ret = fi_ep_bind(extra_ep, &ctx->put_cntr->fid, FI_WRITE);
-            OFI_CHECK_RETURN_STR(ret, "fi_ep_bind put CNTR to extra TX endpoint failed");
+            OFI_CHECK_RETURN_MSG(ret, "fi_ep_bind put CNTR to extra TX endpoint %d failed (%s)\n",
+                                 i, fi_strerror(ret));
 
             /* Bind shared get counter */
             ret = fi_ep_bind(extra_ep, &ctx->get_cntr->fid, FI_READ);
-            OFI_CHECK_RETURN_STR(ret, "fi_ep_bind get CNTR to extra TX endpoint failed");
+            OFI_CHECK_RETURN_MSG(ret, "fi_ep_bind get CNTR to extra TX endpoint %d failed (%s)\n",
+                                 i, fi_strerror(ret));
 
             /* Bind shared CQ */
             ret = fi_ep_bind(extra_ep, &ctx->cq->fid,
                              FI_SELECTIVE_COMPLETION | FI_TRANSMIT | FI_RECV);
-            OFI_CHECK_RETURN_STR(ret, "fi_ep_bind CQ to extra TX endpoint failed");
+            OFI_CHECK_RETURN_MSG(ret, "fi_ep_bind CQ to extra TX endpoint %d failed (%s)\n",
+                                 i, fi_strerror(ret));
 
             /* Bind address vector */
             ret = fi_ep_bind(extra_ep, &shmem_transport_ofi_avfd->fid, 0);
-            OFI_CHECK_RETURN_STR(ret, "fi_ep_bind AV to extra TX endpoint failed");
+            OFI_CHECK_RETURN_MSG(ret, "fi_ep_bind AV to extra TX endpoint %d failed (%s)\n",
+                                 i, fi_strerror(ret));
 
             /* Enable the endpoint */
             ret = fi_enable(extra_ep);
-            OFI_CHECK_RETURN_STR(ret, "fi_enable on extra TX endpoint failed");
+            OFI_CHECK_RETURN_MSG(ret, "fi_enable on extra TX endpoint %d failed (%s)\n",
+                                 i, fi_strerror(ret));
         }
 
         DEBUG_MSG("TX muxing: context %d using %d TX endpoints\n", id, ctx->num_tx_eps);
