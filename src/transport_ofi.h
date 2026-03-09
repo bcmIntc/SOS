@@ -337,12 +337,37 @@ struct shmem_transport_ctx_t {
     int                             stx_idx;
     struct shmem_internal_tid       tid;
     struct shmem_internal_team_t   *team;
+    /* TX Muxing: allows a context to use multiple TX endpoints to improve
+     * transmit throughput by distributing operations across endpoints.
+     * When num_tx_eps <= 1 (disabled), ctx->ep is used directly.
+     * When num_tx_eps > 1, tx_ep_arr[0..num_tx_eps-1] holds all TX endpoints,
+     * where tx_ep_arr[0] == ctx->ep.  All endpoints share the same counters
+     * and CQ so existing quiet/fence/wait logic works unchanged. */
+    int                             num_tx_eps;     /* Total TX eps; 1 = muxing disabled */
+    int                             tx_ep_idx;      /* Round-robin index (0..num_tx_eps-1) */
+    struct fid_ep                 **tx_ep_arr;      /* All TX eps (NULL if num_tx_eps <= 1) */
+    int                            *tx_stx_idxs;    /* STX index per additional TX ep (NULL if num_tx_eps <= 1) */
 };
 
 typedef struct shmem_transport_ctx_t shmem_transport_ctx_t;
 extern shmem_transport_ctx_t shmem_transport_ctx_default;
 
 extern struct fid_ep* shmem_transport_ofi_target_ep;
+
+/* Select the TX endpoint for the next operation using round-robin scheduling.
+ * When TX muxing is disabled (num_tx_eps <= 1), returns ctx->ep directly.
+ * Otherwise, cycles through tx_ep_arr to distribute TX load across endpoints.
+ * Must be called with the context lock held (or from a private/serialized ctx). */
+static inline
+struct fid_ep* shmem_transport_ofi_get_tx_ep(shmem_transport_ctx_t *ctx)
+{
+    if (ctx->num_tx_eps <= 1)
+        return ctx->ep;
+
+    int idx = ctx->tx_ep_idx;
+    ctx->tx_ep_idx = (idx + 1 >= ctx->num_tx_eps) ? 0 : idx + 1;
+    return ctx->tx_ep_arr[idx];
+}
 
 #ifdef USE_CTX_LOCK
 #define SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx)                                       \
@@ -628,16 +653,19 @@ void shmem_transport_put_scalar(shmem_transport_ctx_t* ctx, void *target, const
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
     SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
 
-    do {
+    {
+        struct fid_ep *tx_ep = shmem_transport_ofi_get_tx_ep(ctx);
+        do {
 
-        ret = fi_inject_write(ctx->ep,
-                              source,
-                              len,
-                              GET_DEST(dst),
-                              (uint64_t) addr,
-                              key);
+            ret = fi_inject_write(tx_ep,
+                                  source,
+                                  len,
+                                  GET_DEST(dst),
+                                  (uint64_t) addr,
+                                  key);
 
-    } while (try_again(ctx, ret, &polled));
+        } while (try_again(ctx, ret, &polled));
+    }
     SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
 }
 
@@ -667,13 +695,16 @@ void shmem_transport_ofi_put_large(shmem_transport_ctx_t* ctx, void *target, con
 
         SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
 
-        do {
-            ret = fi_write(ctx->ep,
-                           frag_source, frag_len,
-                           GET_MR_DESC(shmem_transport_ofi_get_mr_desc_index(source)),
-                           GET_DEST(dst), frag_target,
-                           key, NULL);
-        } while (try_again(ctx, ret, &polled));
+        {
+            struct fid_ep *tx_ep = shmem_transport_ofi_get_tx_ep(ctx);
+            do {
+                ret = fi_write(tx_ep,
+                               frag_source, frag_len,
+                               GET_MR_DESC(shmem_transport_ofi_get_mr_desc_index(source)),
+                               GET_DEST(dst), frag_target,
+                               key, NULL);
+            } while (try_again(ctx, ret, &polled));
+        }
 
         frag_source += frag_len;
         frag_target += frag_len;
@@ -720,7 +751,7 @@ void shmem_transport_put_nb(shmem_transport_ctx_t* ctx, void *target, const void
                                             .data          = 0
                                           };
         do {
-            ret = fi_writemsg(ctx->ep, &msg, FI_COMPLETION | FI_DELIVERY_COMPLETE);
+            ret = fi_writemsg(shmem_transport_ofi_get_tx_ep(ctx), &msg, FI_COMPLETION | FI_DELIVERY_COMPLETE);
         } while (try_again(ctx, ret, &polled));
         SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
 
@@ -769,7 +800,7 @@ void shmem_transport_put_signal_nbi(shmem_transport_ctx_t* ctx, void *target, co
                                       };
 
         do {
-            ret = fi_writemsg(ctx->ep, &msg, FI_DELIVERY_COMPLETE | FI_INJECT);
+            ret = fi_writemsg(shmem_transport_ofi_get_tx_ep(ctx), &msg, FI_DELIVERY_COMPLETE | FI_INJECT);
         } while (try_again(ctx, ret, &polled));
 
         SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
@@ -816,9 +847,12 @@ void shmem_transport_put_signal_nbi(shmem_transport_ctx_t* ctx, void *target, co
 
             SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
 
-            do {
-                ret = fi_writemsg(ctx->ep, &msg, FI_DELIVERY_COMPLETE);
-            } while (try_again(ctx, ret, &polled));
+            {
+                struct fid_ep *tx_ep = shmem_transport_ofi_get_tx_ep(ctx);
+                do {
+                    ret = fi_writemsg(tx_ep, &msg, FI_DELIVERY_COMPLETE);
+                } while (try_again(ctx, ret, &polled));
+            }
 
             frag_source += frag_len;
             frag_target += frag_len;
@@ -867,7 +901,7 @@ void shmem_transport_put_signal_nbi(shmem_transport_ctx_t* ctx, void *target, co
                                          };
 
     do {
-        ret = fi_atomicmsg(ctx->ep, &msg_signal, flags_signal);
+        ret = fi_atomicmsg(shmem_transport_ofi_get_tx_ep(ctx), &msg_signal, flags_signal);
     } while (try_again(ctx, ret, &polled));
 
     SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
@@ -915,16 +949,19 @@ void shmem_transport_get(shmem_transport_ctx_t* ctx, void *target, const void *s
     if (len <= shmem_transport_ofi_max_msg_size) {
 
         SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_get_cntr);
-        do {
-            ret = fi_read(ctx->ep,
-                          target,
-                          len,
-                          GET_MR_DESC(shmem_transport_ofi_get_mr_desc_index(target)),
-                          GET_DEST(dst),
-                          (uint64_t) addr,
-                          key,
-                          NULL);
-        } while (try_again(ctx, ret, &polled));
+        {
+            struct fid_ep *tx_ep = shmem_transport_ofi_get_tx_ep(ctx);
+            do {
+                ret = fi_read(tx_ep,
+                              target,
+                              len,
+                              GET_MR_DESC(shmem_transport_ofi_get_mr_desc_index(target)),
+                              GET_DEST(dst),
+                              (uint64_t) addr,
+                              key,
+                              NULL);
+            } while (try_again(ctx, ret, &polled));
+        }
     }
     else {
         uint8_t *frag_target = (uint8_t *) target;
@@ -938,13 +975,16 @@ void shmem_transport_get(shmem_transport_ctx_t* ctx, void *target, const void *s
 
             SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_get_cntr);
 
-            do {
-                ret = fi_read(ctx->ep,
-                              frag_target, frag_len,
-                              GET_MR_DESC(shmem_transport_ofi_get_mr_desc_index(target)),
-                              GET_DEST(dst), frag_source,
-                              key, NULL);
-            } while (try_again(ctx, ret, &polled));
+            {
+                struct fid_ep *tx_ep = shmem_transport_ofi_get_tx_ep(ctx);
+                do {
+                    ret = fi_read(tx_ep,
+                                  frag_target, frag_len,
+                                  GET_MR_DESC(shmem_transport_ofi_get_mr_desc_index(target)),
+                                  GET_DEST(dst), frag_source,
+                                  key, NULL);
+                } while (try_again(ctx, ret, &polled));
+            }
 
             frag_source += frag_len;
             frag_target += frag_len;
@@ -1038,18 +1078,21 @@ void shmem_transport_cswap_nbi(shmem_transport_ctx_t* ctx, void *target, const
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
     SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_get_cntr);
 
-    do {
-        ret = fi_compare_atomicmsg(ctx->ep,
-                                   &msg,
-                                   &comparev,
-                                   NULL,
-                                   1,
-                                   &resultv,
-                                   GET_MR_DESC_ADDR(shmem_transport_ofi_get_mr_desc_index(dest)),
-                                   1,
-                                   FI_INJECT);  /* FI_DELIVERY_COMPLETE is not required as 
-                                                   it is implied for fetch atomicmsgs */
-    } while (try_again(ctx, ret, &polled));
+    {
+        struct fid_ep *tx_ep = shmem_transport_ofi_get_tx_ep(ctx);
+        do {
+            ret = fi_compare_atomicmsg(tx_ep,
+                                       &msg,
+                                       &comparev,
+                                       NULL,
+                                       1,
+                                       &resultv,
+                                       GET_MR_DESC_ADDR(shmem_transport_ofi_get_mr_desc_index(dest)),
+                                       1,
+                                       FI_INJECT);  /* FI_DELIVERY_COMPLETE is not required as
+                                                        it is implied for fetch atomicmsgs */
+        } while (try_again(ctx, ret, &polled));
+    }
     SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
 }
 
@@ -1079,22 +1122,25 @@ void shmem_transport_cswap(shmem_transport_ctx_t* ctx, void *target, const void 
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
     SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_get_cntr);
 
-    do {
-        ret = fi_compare_atomic(ctx->ep,
-                                source,
-                                1,
-                                GET_MR_DESC(shmem_transport_ofi_get_mr_desc_index(source)),
-                                operand,
-                                NULL,
-                                dest,
-                                GET_MR_DESC(shmem_transport_ofi_get_mr_desc_index(dest)),
-                                GET_DEST(dst),
-                                (uint64_t) addr,
-                                key,
-                                SHMEM_TRANSPORT_DTYPE(datatype),
-                                FI_CSWAP,
-                                NULL);
-    } while (try_again(ctx, ret, &polled));
+    {
+        struct fid_ep *tx_ep = shmem_transport_ofi_get_tx_ep(ctx);
+        do {
+            ret = fi_compare_atomic(tx_ep,
+                                    source,
+                                    1,
+                                    GET_MR_DESC(shmem_transport_ofi_get_mr_desc_index(source)),
+                                    operand,
+                                    NULL,
+                                    dest,
+                                    GET_MR_DESC(shmem_transport_ofi_get_mr_desc_index(dest)),
+                                    GET_DEST(dst),
+                                    (uint64_t) addr,
+                                    key,
+                                    SHMEM_TRANSPORT_DTYPE(datatype),
+                                    FI_CSWAP,
+                                    NULL);
+        } while (try_again(ctx, ret, &polled));
+    }
     SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
 #endif
 }
@@ -1118,22 +1164,25 @@ void shmem_transport_mswap(shmem_transport_ctx_t* ctx, void *target, const void 
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
     SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_get_cntr);
 
-    do {
-        ret = fi_compare_atomic(ctx->ep,
-                                source,
-                                1,
-                                GET_MR_DESC(shmem_transport_ofi_get_mr_desc_index(source)),
-                                mask,
-                                NULL,
-                                dest,
-                                GET_MR_DESC(shmem_transport_ofi_get_mr_desc_index(dest)),
-                                GET_DEST(dst),
-                                (uint64_t) addr,
-                                key,
-                                SHMEM_TRANSPORT_DTYPE(datatype),
-                                FI_MSWAP,
-                                NULL);
-    } while (try_again(ctx, ret, &polled));
+    {
+        struct fid_ep *tx_ep = shmem_transport_ofi_get_tx_ep(ctx);
+        do {
+            ret = fi_compare_atomic(tx_ep,
+                                    source,
+                                    1,
+                                    GET_MR_DESC(shmem_transport_ofi_get_mr_desc_index(source)),
+                                    mask,
+                                    NULL,
+                                    dest,
+                                    GET_MR_DESC(shmem_transport_ofi_get_mr_desc_index(dest)),
+                                    GET_DEST(dst),
+                                    (uint64_t) addr,
+                                    key,
+                                    SHMEM_TRANSPORT_DTYPE(datatype),
+                                    FI_MSWAP,
+                                    NULL);
+        } while (try_again(ctx, ret, &polled));
+    }
     SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
 }
 
@@ -1155,16 +1204,19 @@ void shmem_transport_atomic(shmem_transport_ctx_t* ctx, void *target, const void
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
     SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
 
-    do {
-        ret = fi_inject_atomic(ctx->ep,
-                               source,
-                               1,
-                               GET_DEST(dst),
-                               (uint64_t) addr,
-                               key,
-                               SHMEM_TRANSPORT_DTYPE(datatype),
-                               op);
-    } while (try_again(ctx, ret, &polled));
+    {
+        struct fid_ep *tx_ep = shmem_transport_ofi_get_tx_ep(ctx);
+        do {
+            ret = fi_inject_atomic(tx_ep,
+                                   source,
+                                   1,
+                                   GET_DEST(dst),
+                                   (uint64_t) addr,
+                                   key,
+                                   SHMEM_TRANSPORT_DTYPE(datatype),
+                                   op);
+        } while (try_again(ctx, ret, &polled));
+    }
     SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
 }
 
@@ -1206,16 +1258,19 @@ void shmem_transport_atomicv(shmem_transport_ctx_t* ctx, void *target, const voi
 
         SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
 
-        do {
-            ret = fi_inject_atomic(ctx->ep,
-                                   source,
-                                   len,
-                                   GET_DEST(dst),
-                                   (uint64_t) addr,
-                                   key,
-                                   dt,
-                                   op);
-        } while (try_again(ctx, ret, &polled));
+        {
+            struct fid_ep *tx_ep = shmem_transport_ofi_get_tx_ep(ctx);
+            do {
+                ret = fi_inject_atomic(tx_ep,
+                                       source,
+                                       len,
+                                       GET_DEST(dst),
+                                       (uint64_t) addr,
+                                       key,
+                                       dt,
+                                       op);
+            } while (try_again(ctx, ret, &polled));
+        }
 
     } else if (full_len <=
                MIN(shmem_transport_ofi_bounce_buffer_size, max_atomic_size) &&
@@ -1241,9 +1296,12 @@ void shmem_transport_atomicv(shmem_transport_ctx_t* ctx, void *target, const voi
                                                .context       = buff,
                                                .data          = 0
                                              };
-        do {
-            ret = fi_atomicmsg(ctx->ep, &msg, FI_COMPLETION | FI_DELIVERY_COMPLETE);
-        } while (try_again(ctx, ret, &polled));
+        {
+            struct fid_ep *tx_ep = shmem_transport_ofi_get_tx_ep(ctx);
+            do {
+                ret = fi_atomicmsg(tx_ep, &msg, FI_COMPLETION | FI_DELIVERY_COMPLETE);
+            } while (try_again(ctx, ret, &polled));
+        }
 
     } else {
         size_t sent = 0;
@@ -1254,20 +1312,23 @@ void shmem_transport_atomicv(shmem_transport_ctx_t* ctx, void *target, const voi
                                    (max_atomic_size/SHMEM_Dtsize[dt]));
             polled = 0;
             SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
-            do {
-                ret = fi_atomic(ctx->ep,
-                                (void *)((char *)source +
-                                         (sent*SHMEM_Dtsize[dt])),
-                                chunksize,
-                                GET_MR_DESC(shmem_transport_ofi_get_mr_desc_index(source)),
-                                GET_DEST(dst),
-                                ((uint64_t) addr +
-                                 (sent*SHMEM_Dtsize[dt])),
-                                key,
-                                dt,
-                                op,
-                                NULL);
-            } while (try_again(ctx, ret, &polled));
+            {
+                struct fid_ep *tx_ep = shmem_transport_ofi_get_tx_ep(ctx);
+                do {
+                    ret = fi_atomic(tx_ep,
+                                    (void *)((char *)source +
+                                             (sent*SHMEM_Dtsize[dt])),
+                                    chunksize,
+                                    GET_MR_DESC(shmem_transport_ofi_get_mr_desc_index(source)),
+                                    GET_DEST(dst),
+                                    ((uint64_t) addr +
+                                     (sent*SHMEM_Dtsize[dt])),
+                                    key,
+                                    dt,
+                                    op,
+                                    NULL);
+                } while (try_again(ctx, ret, &polled));
+            }
 
             sent += chunksize;
         }
@@ -1313,15 +1374,18 @@ void shmem_transport_fetch_atomic_nbi(shmem_transport_ctx_t* ctx, void *target,
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
     SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_get_cntr);
 
-    do {
-        ret = fi_fetch_atomicmsg(ctx->ep,
-                                 &msg,
-                                 &resultv,
-                                 GET_MR_DESC_ADDR(shmem_transport_ofi_get_mr_desc_index(dest)),
-                                 1,
-                                 FI_INJECT); /* FI_DELIVERY_COMPLETE is not required as it's
-                                                implied for fetch atomicmsgs */
-    } while (try_again(ctx, ret, &polled));
+    {
+        struct fid_ep *tx_ep = shmem_transport_ofi_get_tx_ep(ctx);
+        do {
+            ret = fi_fetch_atomicmsg(tx_ep,
+                                     &msg,
+                                     &resultv,
+                                     GET_MR_DESC_ADDR(shmem_transport_ofi_get_mr_desc_index(dest)),
+                                     1,
+                                     FI_INJECT); /* FI_DELIVERY_COMPLETE is not required as it's
+                                                    implied for fetch atomicmsgs */
+        } while (try_again(ctx, ret, &polled));
+    }
     SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
 }
 
@@ -1352,20 +1416,23 @@ void shmem_transport_fetch_atomic(shmem_transport_ctx_t* ctx, void *target,
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
     SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_get_cntr);
 
-    do {
-        ret = fi_fetch_atomic(ctx->ep,
-                              source,
-                              1,
-                              GET_MR_DESC(shmem_transport_ofi_get_mr_desc_index(source)),
-                              dest,
-                              GET_MR_DESC(shmem_transport_ofi_get_mr_desc_index(dest)),
-                              GET_DEST(dst),
-                              (uint64_t) addr,
-                              key,
-                              SHMEM_TRANSPORT_DTYPE(datatype),
-                              op,
-                              NULL);
-    } while (try_again(ctx, ret, &polled));
+    {
+        struct fid_ep *tx_ep = shmem_transport_ofi_get_tx_ep(ctx);
+        do {
+            ret = fi_fetch_atomic(tx_ep,
+                                  source,
+                                  1,
+                                  GET_MR_DESC(shmem_transport_ofi_get_mr_desc_index(source)),
+                                  dest,
+                                  GET_MR_DESC(shmem_transport_ofi_get_mr_desc_index(dest)),
+                                  GET_DEST(dst),
+                                  (uint64_t) addr,
+                                  key,
+                                  SHMEM_TRANSPORT_DTYPE(datatype),
+                                  op,
+                                  NULL);
+        } while (try_again(ctx, ret, &polled));
+    }
     SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
 #endif
 }
