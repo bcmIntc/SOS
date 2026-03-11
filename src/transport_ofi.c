@@ -1599,6 +1599,15 @@ int query_for_fabric(struct fabric_info *info)
             info->p_info = fallback;
         }
         else {
+            /* Node ranks must have been initialized by the runtime (enable_node_ranks=1)
+             * for correct intra-node NIC assignment.  shmem_runtime_get_node_size() returns
+             * 1 when node ranks were not collected, which means get_node_rank() would
+             * dereference a NULL location_array and crash. */
+            if (shmem_runtime_get_node_size() < 1)
+                RAISE_ERROR_MSG("Node ranks are not available from the runtime but are required "
+                                "for multirail NIC assignment. Ensure the runtime was initialized "
+                                "with node rank support (SHMEM_TEAM_SHARED_ONLY_SELF must not be set).\n");
+
             int idx = 0;
             struct fi_info **prov_list = (struct fi_info **) malloc(num_nics * sizeof(struct fi_info *));
             for (struct fi_info *cur_fabric = multirail_fabric_list_head; cur_fabric; cur_fabric = cur_fabric->next) {
@@ -1608,12 +1617,9 @@ int query_for_fabric(struct fabric_info *info)
 #ifdef USE_HWLOC
             info->p_info = assign_nic_with_hwloc(info->p_info, prov_list, num_nics);
 #else
-            /* Round-robin assignment of NICs to PEs
-             * FIXME: A more suitable indexing value would be
-             * shmem_team_my_pe(SHMEM_TEAM_NODE) % num_nics, but it is too early in initialization to
-             * do that here. We would also want to replace the similar occurrences in the
-             * assign_nic_with_hwloc function. */
-            info->p_info = prov_list[shmem_internal_my_pe % num_nics];
+            /* Round-robin assignment of NICs to PEs using intra-node rank for correct
+             * distribution across PEs sharing the same node. */
+            info->p_info = prov_list[shmem_runtime_get_node_rank(shmem_internal_my_pe) % num_nics];
 #endif
             free(prov_list);
         }
