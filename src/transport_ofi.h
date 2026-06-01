@@ -1238,6 +1238,7 @@ void shmem_transport_atomicv(shmem_transport_ctx_t* ctx, void *target, const voi
     SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
 }
 
+#define FI_CXI_PCIE_AMO (1ULL << 57)
 
 /* Note: Both non-NBI and NBI versions of fetching atomic routines are
  * nonblocking.  The NBI routines buffer (i.e. inject) the source argument and
@@ -1258,6 +1259,7 @@ void shmem_transport_fetch_atomic_nbi(shmem_transport_ctx_t* ctx, void *target,
     shmem_internal_assert(SHMEM_Dtsize[SHMEM_TRANSPORT_DTYPE(datatype)] == len);
 
     struct fi_ioc resultv = { .addr = dest, .count = 1 };
+
     const struct fi_ioc sourcev = { .addr = (void *) source, .count = 1 };
     const struct fi_rma_ioc rmav= { .addr = (uint64_t) addr, .count = 1, .key = key };
     const struct fi_msg_atomic msg = {
@@ -1282,7 +1284,7 @@ void shmem_transport_fetch_atomic_nbi(shmem_transport_ctx_t* ctx, void *target,
                                  &resultv,
                                  GET_MR_DESC_ADDR(shmem_transport_ofi_get_mr_desc_index(dest)),
                                  1,
-                                 FI_INJECT); /* FI_DELIVERY_COMPLETE is not required as it's
+                                 FI_CXI_PCIE_AMO); /* FI_DELIVERY_COMPLETE is not required as it's
                                                 implied for fetch atomicmsgs */
     } while (try_again(ctx, ret, &polled));
     SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
