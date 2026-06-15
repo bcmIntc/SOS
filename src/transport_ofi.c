@@ -1943,8 +1943,6 @@ static void shmem_transport_ofi_prefault_atu(void)
     }
     *dummy_target = 0;
 
-    uint64_t dummy_result = 0;
-
     /* Barrier to ensure all PEs start pre-faulting at the same time.
      * This prevents some PEs from receiving pre-fault operations before
      * they've finished their own initialization. */
@@ -1972,7 +1970,7 @@ static void shmem_transport_ofi_prefault_atu(void)
             /* Touch this page with an atomic operation.
              * The operation doesn't matter - we just need the NIC to translate
              * the address, which populates the ATU cache. */
-            shmem_uint64_atomic_fetch(&dummy_result, (uint64_t*)page_addr, pe);
+            (void) shmem_uint64_atomic_fetch((uint64_t*)page_addr, pe);
         }
 
         /* Progress indicator for large jobs */
