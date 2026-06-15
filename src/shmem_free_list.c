@@ -22,7 +22,7 @@
 #include "shmem.h"
 #include "shmem_free_list.h"
 
-#define NUM_ELEMENTS	2
+#define NUM_ELEMENTS	128
 
 shmem_free_list_t*
 shmem_free_list_init(size_t element_size,
