@@ -140,3 +140,13 @@ SHMEM_INTERNAL_ENV_DEF(BOUNCE_MLOCK, bool, false, SHMEM_INTERNAL_ENV_CAT_OTHER,
                        "Lock bounce buffer memory preventing buffers from being paged out to swap")
 SHMEM_INTERNAL_ENV_DEF(BOUNCE_SHEAP, bool, true, SHMEM_INTERNAL_ENV_CAT_OTHER,
                        "Allocate bounce buffers using symmetric heap, if supported by transport")
+
+SHMEM_INTERNAL_ENV_DEF(ATU_PREFAULT, bool, false, SHMEM_INTERNAL_ENV_CAT_OTHER,
+                       "Pre-fault ATU cache during initialization to reduce runtime base registrations. "
+                       "Adds startup cost but improves steady-state latency. Recommended for CXI provider.")
+SHMEM_INTERNAL_ENV_DEF(ATU_PREFAULT_STRIDE, long, 1, SHMEM_INTERNAL_ENV_CAT_OTHER,
+                       "Page stride for ATU pre-faulting (1=every page, 16=every 16th page). "
+                       "Higher values reduce startup time but may miss some pages. "
+                       "At 2MB pages: stride=1 is ~512 ops/PE, stride=16 is ~32 ops/PE.")
+SHMEM_INTERNAL_ENV_DEF(ATU_PREFAULT_QUIET, bool, false, SHMEM_INTERNAL_ENV_CAT_OTHER,
+                       "Suppress ATU pre-fault progress messages (useful for large runs).")

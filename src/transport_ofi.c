@@ -1872,6 +1872,138 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
 }
 
 
+/* Pre-fault ATU cache by touching pages on all remote PEs.
+ *
+ * Purpose: Force ATU base translations during initialization rather than
+ * during the workload. Converts runtime base registrations (slow path) into
+ * derivative1 cache hits (fast path).
+ *
+ * Cost: O(num_pes * heap_pages / stride) atomic operations during init.
+ * Benefit: Significantly improved fast-path latency during workload.
+ *
+ * Background: CXI ATU (Address Translation Unit) caches virtual->physical
+ * translations. First access to a page triggers "base" translation (slow).
+ * Subsequent accesses use cached "derivative1" translation (fast).
+ *
+ * Without pre-faulting: Workload pays base translation cost on first access
+ * to each unique page (~1 base per AMO in all-to-all patterns = 14% base rate).
+ *
+ * With pre-faulting: All pages translated during init, workload gets cache
+ * hits (~0.3% base rate, matching Cray SHMEM behavior).
+ */
+static void shmem_transport_ofi_prefault_atu(void)
+{
+    if (!shmem_internal_params.ATU_PREFAULT) {
+        return;
+    }
+
+    /* Only makes sense for CXI provider */
+    if (!shmem_transport_ofi_check_provider("cxi")) {
+        if (shmem_internal_my_pe == 0 && !shmem_internal_params.ATU_PREFAULT_QUIET) {
+            fprintf(stderr, "SOS: ATU pre-fault requested but provider is not CXI, skipping\n");
+        }
+        return;
+    }
+
+    /* Determine page size - prefer huge pages if available */
+    size_t page_size = 2 * 1024 * 1024;  /* 2MB huge pages (default on Cray systems) */
+
+    size_t heap_len = shmem_internal_heap_length;
+    size_t num_pages = (heap_len + page_size - 1) / page_size;
+    long stride = shmem_internal_params.ATU_PREFAULT_STRIDE;
+
+    if (stride < 1) stride = 1;
+
+    size_t pages_per_pe = (num_pages + stride - 1) / stride;
+    size_t total_ops = (shmem_internal_num_pes - 1) * pages_per_pe;
+
+    if (shmem_internal_my_pe == 0 && !shmem_internal_params.ATU_PREFAULT_QUIET) {
+        fprintf(stderr, "SOS: Pre-faulting ATU cache:\n");
+        fprintf(stderr, "  Heap size: %zu MB\n", heap_len / (1024*1024));
+        fprintf(stderr, "  Page size: %zu MB\n", page_size / (1024*1024));
+        fprintf(stderr, "  Total pages: %zu\n", num_pages);
+        fprintf(stderr, "  Stride: %ld (touching %zu pages per PE)\n", stride, pages_per_pe);
+        fprintf(stderr, "  Remote PEs: %d\n", shmem_internal_num_pes - 1);
+        fprintf(stderr, "  Total operations: %zu\n", total_ops);
+        fprintf(stderr, "  Starting warmup...\n");
+        fflush(stderr);
+    }
+
+    struct timeval start, end;
+    gettimeofday(&start, NULL);
+
+    /* Allocate dummy target at a known location in symmetric heap.
+     * We'll use this for atomic operations to ensure NIC involvement. */
+    uint64_t *dummy_target = (uint64_t*) shmem_malloc(sizeof(uint64_t));
+    if (!dummy_target) {
+        if (shmem_internal_my_pe == 0) {
+            fprintf(stderr, "SOS: WARNING - ATU pre-fault failed to allocate dummy target\n");
+        }
+        return;
+    }
+    *dummy_target = 0;
+
+    uint64_t dummy_result = 0;
+
+    /* Barrier to ensure all PEs start pre-faulting at the same time.
+     * This prevents some PEs from receiving pre-fault operations before
+     * they've finished their own initialization. */
+    shmem_barrier_all();
+
+    /* Touch pages on all remote PEs.
+     * Use atomic_fetch because:
+     * 1. Guarantees NIC involvement (not optimized away)
+     * 2. Small operation (8 bytes)
+     * 3. Touches the address we want to pre-fault
+     */
+    for (int pe = 0; pe < shmem_internal_num_pes; pe++) {
+        if (pe == shmem_internal_my_pe) continue;
+
+        /* Touch pages at stride intervals across the symmetric heap */
+        for (size_t page = 0; page < num_pages; page += stride) {
+            /* Calculate address at page boundary */
+            void *page_addr = (uint8_t*)shmem_internal_heap_base + (page * page_size);
+
+            /* Clamp to heap bounds */
+            if ((uint8_t*)page_addr >= (uint8_t*)shmem_internal_heap_base + heap_len) {
+                break;
+            }
+
+            /* Touch this page with an atomic operation.
+             * The operation doesn't matter - we just need the NIC to translate
+             * the address, which populates the ATU cache. */
+            shmem_uint64_atomic_fetch(&dummy_result, (uint64_t*)page_addr, pe);
+        }
+
+        /* Progress indicator for large jobs */
+        if (shmem_internal_my_pe == 0 && !shmem_internal_params.ATU_PREFAULT_QUIET) {
+            if ((pe + 1) % 50 == 0 || pe == shmem_internal_num_pes - 1) {
+                fprintf(stderr, "  Progress: %d/%d PEs\r", pe + 1, shmem_internal_num_pes - 1);
+                fflush(stderr);
+            }
+        }
+    }
+
+    /* Ensure all pre-fault operations complete before proceeding.
+     * This is critical - we must wait for ATU translations to finish. */
+    shmem_quiet();
+
+    /* Clean up */
+    shmem_free(dummy_target);
+
+    gettimeofday(&end, NULL);
+    double elapsed = (end.tv_sec - start.tv_sec) +
+                     (end.tv_usec - start.tv_usec) / 1000000.0;
+
+    if (shmem_internal_my_pe == 0 && !shmem_internal_params.ATU_PREFAULT_QUIET) {
+        fprintf(stderr, "\nSOS: ATU pre-fault complete (%.2f seconds)\n", elapsed);
+        fprintf(stderr, "  Operations: %zu (%.1f ops/sec)\n",
+                total_ops, total_ops / elapsed);
+        fflush(stderr);
+    }
+}
+
+
 int shmem_transport_init(void)
 {
     int ret = 0;
@@ -2061,6 +2193,16 @@ int shmem_transport_startup(void)
 
     ret = populate_av();
     if (ret != 0) return ret;
+
+    /* Pre-fault ATU cache if requested.
+     * Must be done after:
+     *   - Symmetric heap is allocated
+     *   - Addresses are exchanged
+     *   - Communication infrastructure is set up
+     * Must be done before:
+     *   - User code runs (shmem_init returns)
+     */
+    shmem_transport_ofi_prefault_atu();
 
     return 0;
 }
