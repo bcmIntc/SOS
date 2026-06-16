@@ -26,7 +26,11 @@
 #ifdef __linux__
 #include <mntent.h>
 #include <sys/vfs.h>
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25  /* synchronous THP promotion, Linux 5.18+ */
 #endif
+#endif
+#include <dlfcn.h>
 
 #define SHMEM_INTERNAL_INCLUDE
 #include "shmem.h"
@@ -126,6 +130,127 @@ static int find_hugepage_dir(size_t page_size, char **directory)
     endmntent(fd);
     return ret;
 }
+
+/* DSMML runtime support — loaded via dlopen when SHMEM_SYMMETRIC_HEAP_USE_DSMML=1.
+ * Types mirror dsmml.h exactly so dlopen works without a build-time dependency. */
+
+typedef enum {
+    DSMML_RC_SUCCESS        = 0,
+    DSMML_RC_FAILURE        = 1,
+    DSMML_RC_INVALID_PARAM  = 2,
+    DSMML_RC_RESOURCE_ERROR = 3,
+    DSMML_RC_NO_MEMORY      = 4,
+    DSMML_RC_UNKNOWN_FAIL   = 5,
+    DSMML_RC_NOOP           = 6,
+    DSMML_RC_MEM_OVERLAP    = 7,
+    DSMML_RC_MEM_CORRUPT    = 8
+} dsmml_return_t;
+
+typedef enum { DSMML_MODE_DEFAULT = 0, DSMML_MODE_PREFERRED, DSMML_MODE_BIND,
+               DSMML_MODE_INTERLEAVE } dsmml_mode_t;
+typedef enum { DSMML_MEM_SYS_DEFAULT = 0, DSMML_MEM_NORMAL = 1,
+               DSMML_MEM_FAST = 2, DSMML_MEM_CUSTOM = 3 } dsmml_type_t;
+typedef enum {
+    DSMML_HPSIZE_DEFAULT = 1,   /* THP */
+    DSMML_HPSIZE_4K      = 2,
+    DSMML_HPSIZE_2M      = 3,
+    DSMML_HPSIZE_4M      = 4,
+} dsmml_hpsize_t;
+typedef enum { DSMML_NNODE_INDEX1 = 0x01 } dsmml_nnode_t;
+
+typedef struct {
+    int            mype;
+    int            smp_mype;
+    int            smp_npes;
+    int            smp_set;
+} dsmml_init_info_t;
+
+typedef struct {
+    int            id;
+    void          *act_addr;
+    void          *base_addr;
+    size_t         length;
+    dsmml_type_t   type;
+    dsmml_hpsize_t pagesize;
+    dsmml_mode_t   mode;
+    int            smp_mype;
+    int            smp_npes;
+    int            smp_set;
+    dsmml_nnode_t  nnode;
+} dsmml_sheap_seg_info_t;
+
+static void  *dsmml_handle             = NULL;
+static dsmml_return_t (*dsmml_init_fn)(dsmml_init_info_t *)              = NULL;
+static dsmml_return_t (*dsmml_finalize_fn)(void)                         = NULL;
+static dsmml_return_t (*dsmml_create_sheap_seg_fn)(dsmml_sheap_seg_info_t *) = NULL;
+
+static void *dsmml_alloc(void *requested_base, size_t bytes)
+{
+    const char *libname = "libdsmml.so";
+
+    dsmml_handle = dlopen(libname, RTLD_NOW | RTLD_GLOBAL);
+    if (!dsmml_handle) {
+        RAISE_WARN_MSG("SHMEM_SYMMETRIC_HEAP_USE_DSMML=1 but dlopen(%s) failed: %s\n",
+                       libname, dlerror());
+        return NULL;
+    }
+
+    dsmml_init_fn             = dlsym(dsmml_handle, "dsmml_init");
+    dsmml_finalize_fn         = dlsym(dsmml_handle, "dsmml_finalize");
+    dsmml_create_sheap_seg_fn = dlsym(dsmml_handle, "dsmml_create_sheap_seg");
+
+    if (!dsmml_init_fn || !dsmml_finalize_fn || !dsmml_create_sheap_seg_fn) {
+        RAISE_WARN_MSG("DSMML: required symbols not found in %s: %s\n", libname, dlerror());
+        dlclose(dsmml_handle);
+        dsmml_handle = NULL;
+        return NULL;
+    }
+
+    dsmml_init_info_t init_info = {
+        .mype     = shmem_internal_my_pe,
+        .smp_mype = shmem_internal_my_pe % shmem_internal_num_pes,
+        .smp_npes = shmem_internal_num_pes,
+        .smp_set  = 0,
+    };
+    if (dsmml_init_fn(&init_info) != DSMML_RC_SUCCESS) {
+        RAISE_WARN_STR("DSMML: dsmml_init failed");
+        dlclose(dsmml_handle);
+        dsmml_handle = NULL;
+        return NULL;
+    }
+
+    /* Try 2MB explicit huge pages first; fall back to THP on failure. */
+    dsmml_sheap_seg_info_t seg = {
+        .base_addr  = requested_base,
+        .length     = bytes,
+        .type       = DSMML_MEM_SYS_DEFAULT,
+        .mode       = DSMML_MODE_DEFAULT,
+        .pagesize   = DSMML_HPSIZE_2M,
+        .smp_mype   = init_info.smp_mype,
+        .smp_npes   = init_info.smp_npes,
+        .smp_set    = 0,
+    };
+
+    if (dsmml_create_sheap_seg_fn(&seg) != DSMML_RC_SUCCESS) {
+        DEBUG_STR("DSMML: 2MB huge pages unavailable, falling back to THP");
+        seg.act_addr = NULL;
+        seg.pagesize = DSMML_HPSIZE_DEFAULT;
+        if (dsmml_create_sheap_seg_fn(&seg) != DSMML_RC_SUCCESS) {
+            RAISE_WARN_STR("DSMML: dsmml_create_sheap_seg failed");
+            dsmml_finalize_fn();
+            dlclose(dsmml_handle);
+            dsmml_handle = NULL;
+            return NULL;
+        }
+    }
+
+    DEBUG_MSG("DSMML: heap at %p (requested %p), %zu bytes, pagesize %s\n",
+              seg.act_addr, requested_base, bytes,
+              seg.pagesize == DSMML_HPSIZE_2M ? "2MB" : "THP");
+
+    return seg.act_addr;
+}
+
 #endif /* __linux__ */
 
 /* shmalloc and friends are defined to not be thread safe, so this is
@@ -326,6 +451,15 @@ shmem_internal_symmetric_init(void)
         /* Use the actual mapped size for munmap and transport registration.
          * On the hugetlbfs path this may be rounded up to a huge-page boundary. */
         shmem_internal_heap_length = mapped_length;
+#ifdef __linux__
+    } else if (shmem_internal_params.SYMMETRIC_HEAP_USE_DSMML) {
+        void *requested_base =
+            (void*) (((unsigned long) shmem_internal_data_base +
+                      shmem_internal_data_length + 2 * ONEGIG) & ~(ONEGIG - 1));
+        shmem_internal_heap_base =
+            shmem_internal_heap_curr =
+            dsmml_alloc(requested_base, shmem_internal_heap_length);
+#endif
     } else {
         shmem_internal_heap_base =
             shmem_internal_heap_curr =

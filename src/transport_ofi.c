@@ -1932,16 +1932,23 @@ static void shmem_transport_ofi_prefault_atu(void)
     struct timeval start, end;
     gettimeofday(&start, NULL);
 
-    /* Allocate dummy target at a known location in symmetric heap.
-     * We'll use this for atomic operations to ensure NIC involvement. */
-    uint64_t *dummy_target = (uint64_t*) shmem_malloc(sizeof(uint64_t));
-    if (!dummy_target) {
+    /* Allocate a large buffer in symmetric heap to span multiple pages.
+     * We'll touch this buffer at page boundaries to pre-fault the ATU.
+     * Allocate enough to cover pages_per_pe pages at stride intervals.
+     * Use calloc to ensure pages are actually allocated. */
+    size_t buffer_size = pages_per_pe * page_size;
+    if (buffer_size > heap_len / 2) {
+        buffer_size = heap_len / 2;  /* Cap at half the heap */
+    }
+
+    uint8_t *prefault_buffer = (uint8_t*) shmem_calloc(buffer_size, 1);
+    if (!prefault_buffer) {
         if (shmem_internal_my_pe == 0) {
-            fprintf(stderr, "SOS: WARNING - ATU pre-fault failed to allocate dummy target\n");
+            fprintf(stderr, "SOS: WARNING - ATU pre-fault failed to allocate %zu MB buffer\n",
+                    buffer_size / (1024*1024));
         }
         return;
     }
-    *dummy_target = 0;
 
     /* Barrier to ensure all PEs start pre-faulting at the same time.
      * This prevents some PEs from receiving pre-fault operations before
@@ -1949,28 +1956,20 @@ static void shmem_transport_ofi_prefault_atu(void)
     shmem_barrier_all();
 
     /* Touch pages on all remote PEs.
+     * Strategy: Touch the buffer at page-stride intervals on every remote PE.
+     * This forces the NIC to perform ATU translations for those pages.
      * Use atomic_fetch because:
      * 1. Guarantees NIC involvement (not optimized away)
-     * 2. Small operation (8 bytes)
-     * 3. Touches the address we want to pre-fault
+     * 2. Forces ATU translation of the target address
+     * 3. Small operation (8 bytes)
      */
     for (int pe = 0; pe < shmem_internal_num_pes; pe++) {
         if (pe == shmem_internal_my_pe) continue;
 
-        /* Touch pages at stride intervals across the symmetric heap */
-        for (size_t page = 0; page < num_pages; page += stride) {
-            /* Calculate address at page boundary */
-            void *page_addr = (uint8_t*)shmem_internal_heap_base + (page * page_size);
-
-            /* Clamp to heap bounds */
-            if ((uint8_t*)page_addr >= (uint8_t*)shmem_internal_heap_base + heap_len) {
-                break;
-            }
-
-            /* Touch this page with an atomic operation.
-             * The operation doesn't matter - we just need the NIC to translate
-             * the address, which populates the ATU cache. */
-            (void) shmem_uint64_atomic_fetch((uint64_t*)page_addr, pe);
+        /* Touch at page boundaries within the buffer */
+        for (size_t offset = 0; offset < buffer_size; offset += page_size * stride) {
+            uint64_t *touch_addr = (uint64_t*)(prefault_buffer + offset);
+            (void) shmem_uint64_atomic_fetch(touch_addr, pe);
         }
 
         /* Progress indicator for large jobs */
@@ -1987,7 +1986,7 @@ static void shmem_transport_ofi_prefault_atu(void)
     shmem_quiet();
 
     /* Clean up */
-    shmem_free(dummy_target);
+    shmem_free(prefault_buffer);
 
     gettimeofday(&end, NULL);
     double elapsed = (end.tv_sec - start.tv_sec) +
