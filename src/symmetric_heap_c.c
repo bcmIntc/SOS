@@ -443,7 +443,21 @@ shmem_internal_symmetric_init(void)
                                  SHMEM_INTERNAL_HEAP_OVERHEAD +
 				 SHMEM_MAX_BOUNCE_BUFFER_OVERHEAD;
 
-    if (!shmem_internal_params.SYMMETRIC_HEAP_USE_MALLOC) {
+#ifdef __linux__
+    if (shmem_internal_params.SYMMETRIC_HEAP_USE_DSMML) {
+        void *requested_base =
+            (void*) (((unsigned long) shmem_internal_data_base +
+                      shmem_internal_data_length + 2 * ONEGIG) & ~(ONEGIG - 1));
+        shmem_internal_heap_base =
+            shmem_internal_heap_curr =
+            dsmml_alloc(requested_base, shmem_internal_heap_length);
+    } else
+#endif
+    if (shmem_internal_params.SYMMETRIC_HEAP_USE_MALLOC) {
+        shmem_internal_heap_base =
+            shmem_internal_heap_curr =
+            malloc(shmem_internal_heap_length);
+    } else {
         size_t mapped_length = shmem_internal_heap_length;
         shmem_internal_heap_base =
             shmem_internal_heap_curr =
@@ -451,19 +465,6 @@ shmem_internal_symmetric_init(void)
         /* Use the actual mapped size for munmap and transport registration.
          * On the hugetlbfs path this may be rounded up to a huge-page boundary. */
         shmem_internal_heap_length = mapped_length;
-#ifdef __linux__
-    } else if (shmem_internal_params.SYMMETRIC_HEAP_USE_DSMML) {
-        void *requested_base =
-            (void*) (((unsigned long) shmem_internal_data_base +
-                      shmem_internal_data_length + 2 * ONEGIG) & ~(ONEGIG - 1));
-        shmem_internal_heap_base =
-            shmem_internal_heap_curr =
-            dsmml_alloc(requested_base, shmem_internal_heap_length);
-#endif
-    } else {
-        shmem_internal_heap_base =
-            shmem_internal_heap_curr =
-            malloc(shmem_internal_heap_length);
     }
 
     return (NULL == shmem_internal_heap_base) ? -1 : 0;
