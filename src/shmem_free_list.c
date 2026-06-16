@@ -23,6 +23,7 @@
 #include "shmem_free_list.h"
 
 #define NUM_ELEMENTS	128
+#define TWOMB (2UL * 1024UL * 1024UL)
 
 shmem_free_list_t*
 shmem_free_list_init(size_t element_size,
@@ -41,10 +42,10 @@ shmem_free_list_init(size_t element_size,
     fl->pool_ofs = 0;
     fl->pool = NULL;
     if (max_pool_cnt) {
-        /* preallocate pool with shmem malloc */
+        /* preallocate pool with shmem malloc, 2MB-aligned to minimize ATU base registrations */
         /* memory must be reserved as a memory pool to prevent address conflicts between PEs */
         fl->pool_size = fl->alloc_size * max_pool_cnt;
-        fl->pool = shmem_internal_shmalloc(fl->pool_size);
+        fl->pool = shmem_internal_shmemalign(TWOMB, fl->pool_size);
     }
     /* if pool count is zero allocate with bounce buffers with malloc */
 
