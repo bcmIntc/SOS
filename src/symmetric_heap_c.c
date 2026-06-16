@@ -186,7 +186,7 @@ static dsmml_return_t (*dsmml_create_sheap_seg_fn)(dsmml_sheap_seg_info_t *) = N
 
 static void *dsmml_alloc(void *requested_base, size_t bytes)
 {
-    const char *libname = "libdsmml.so.0";
+    const char *libname = "libdsmml.so";
 
     dsmml_handle = dlopen(libname, RTLD_NOW | RTLD_GLOBAL);
     if (!dsmml_handle) {
