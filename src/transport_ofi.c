@@ -1356,6 +1356,10 @@ int allocate_fabric_resources(struct fabric_info *info)
      * fi_open_ops call and do not produce spurious startup warnings. */
     if (shmem_transport_ofi_check_provider("cxi")) {
         if (shmem_internal_params.OFI_CXI_HYBRID_MR_DESC) {
+            if (shmem_internal_my_pe == 0) {
+                fprintf(stderr, "SOS: SHMEM_OFI_CXI_HYBRID_MR_DESC=1 (attempting to enable)\n");
+                fflush(stderr);
+            }
             struct cxi_dom_ops_v3_local {
                 int (*cntr_read)(struct fid *, unsigned int, uint64_t *, struct timespec *);
                 int (*topology)(struct fid *, unsigned int *, unsigned int *, unsigned int *);
@@ -1370,13 +1374,17 @@ int allocate_fabric_resources(struct fabric_info *info)
                         fprintf(stderr, "SOS: CXI hybrid local MR descriptor mode ENABLED\n");
                     else
                         fprintf(stderr, "SOS: CXI enable_hybrid_mr_desc FAILED (%s)\n", fi_strerror(-hret));
+                    fflush(stderr);
                 }
             } else if (shmem_internal_my_pe == 0) {
-                DEBUG_MSG("CXI hybrid MR desc not available (fi_open_ops returned %d / %s)\n",
-                          hret, hret ? fi_strerror(-hret) : "no ops struct");
+                fprintf(stderr, "SOS: CXI hybrid MR desc not available (fi_open_ops returned %d)\n", hret);
+                fflush(stderr);
             }
-        } else if (shmem_internal_my_pe == 0) {
-            DEBUG_MSG("CXI hybrid local MR descriptor mode DISABLED (SHMEM_OFI_CXI_HYBRID_MR_DESC=0)\n");
+        } else {
+            if (shmem_internal_my_pe == 0) {
+                fprintf(stderr, "SOS: SHMEM_OFI_CXI_HYBRID_MR_DESC=0 (DISABLED by env var)\n");
+                fflush(stderr);
+            }
         }
     }
 
