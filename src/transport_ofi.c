@@ -1538,9 +1538,9 @@ int query_for_fabric(struct fabric_info *info)
     domain_attr.resource_mgmt = FI_RM_ENABLED;
 #ifdef ENABLE_MR_SCALABLE
                                 /* Scalable, offset-based addressing, formerly FI_MR_SCALABLE */
-    domain_attr.mr_mode       = 0;
+    domain_attr.mr_mode       = FI_MR_ALLOCATED;
 #  if !defined(ENABLE_HARD_POLLING) && defined(ENABLE_MR_RMA_EVENT)
-    domain_attr.mr_mode       = FI_MR_RMA_EVENT; /* can support RMA_EVENT on MR */
+    domain_attr.mr_mode      |= FI_MR_RMA_EVENT; /* can support RMA_EVENT on MR */
 #  endif
 #else
                                 /* Portable, absolute addressing, formerly FI_MR_BASIC */
