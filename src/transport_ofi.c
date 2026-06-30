@@ -1373,12 +1373,12 @@ int allocate_fabric_resources(struct fabric_info *info)
                           hret, hret ? fi_strerror(-hret) : "no ops struct");
             }
 #else
-            DEBUG_STR("CXI hybrid MR desc requested (SHMEM_OFI_CXI_HYBRID_MR_DESC=1) "
+            DEBUG_STR("CXI hybrid MR desc requested (SHMEM_OFI_CXI_HYBRID_MR_DESC set) "
                       "but SOS was built without CXI extension support "
                       "(missing rdma/fi_cxi_ext.h or enable_hybrid_mr_desc); ignoring");
 #endif
         } else {
-            DEBUG_STR("CXI: hybrid local MR descriptor mode disabled (SHMEM_OFI_CXI_HYBRID_MR_DESC=0)");
+            DEBUG_STR("CXI: hybrid local MR descriptor mode disabled (SHMEM_OFI_CXI_HYBRID_MR_DESC unset)");
         }
     }
 
