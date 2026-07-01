@@ -36,7 +36,11 @@ struct shmem_internal_hier_cache_t {
     int  *tree_child_shr;   /* shr_ranks of my intranode tree children */
     int   tree_nchildren;
     int   my_root_idx;      /* my index in root_pes, or -1 if not a root */
-    int   num_rounds;       /* phase-2 dissemination rounds (log2(root_count)) */
+    /* Internode reduce/broadcast tree (over the root set, indexed 0..root_count-1,
+     * radix SHMEM_HIER_BARRIER_RADIX).  Populated only for root PEs. */
+    int   internode_parent_pe;   /* parent root's global PE, -1 if global root */
+    int   internode_nchildren;
+    int  *internode_child_pe;    /* global PEs of my internode tree children */
 };
 typedef struct shmem_internal_hier_cache_t shmem_internal_hier_cache_t;
 #endif

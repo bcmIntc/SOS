@@ -102,6 +102,11 @@ static int *full_tree_children;
 static int full_tree_num_children;
 static int full_tree_parent;
 static long tree_radix = -1;
+#ifdef USE_HIERARCHICAL_BARRIER
+/* Radix of the internode reduce/broadcast tree in the hierarchical barrier.
+ * Resolved from SHMEM_HIER_BARRIER_RADIX (0 => SHMEM_COLL_RADIX) at init. */
+static long hier_internode_radix = -1;
+#endif
 
 
 static int
@@ -177,6 +182,12 @@ shmem_internal_collectives_init(void)
     char *type;
 
     tree_radix = shmem_internal_params.COLL_RADIX;
+#ifdef USE_HIERARCHICAL_BARRIER
+    hier_internode_radix = (shmem_internal_params.HIER_BARRIER_RADIX > 0)
+                           ? shmem_internal_params.HIER_BARRIER_RADIX
+                           : tree_radix;
+    if (hier_internode_radix < 2) hier_internode_radix = 2;
+#endif
 
     /* initialize barrier_all psync array */
     shmem_internal_barrier_all_psync =
@@ -636,17 +647,20 @@ shmem_internal_cpu_atomic_store_long(long *target, int noderank, long val)
 /* Compute the full hierarchical-barrier topology for an active set into a
  * cache struct.  The PE/root lists are written into the caller-supplied
  * buffers (local_buf >= on-node active count, root_buf >= node count,
- * child_buf >= tree_radix); the cache's pointers are set to reference them.
- * Every field here is invariant for a fixed (PE_start, PE_stride, PE_size) and
- * node layout, so a team can compute this once and reuse it. */
+ * child_buf and inchild_pe_buf >= respective radix); the cache's pointers are
+ * set to reference them.  Every field here is invariant for a fixed (PE_start,
+ * PE_stride, PE_size) and node layout, so a team can compute this once and
+ * reuse it. */
 static void
 shmem_internal_hier_compute(int PE_start, int PE_stride, int PE_size,
                             int *local_buf, int *root_buf, int *child_buf,
+                            int *inchild_pe_buf,
                             shmem_internal_hier_cache_t *c)
 {
-    c->local_pes      = local_buf;
-    c->root_pes       = root_buf;
-    c->tree_child_shr = child_buf;
+    c->local_pes         = local_buf;
+    c->root_pes          = root_buf;
+    c->tree_child_shr    = child_buf;
+    c->internode_child_pe = inchild_pe_buf;
 
     shmem_internal_build_local_set(PE_start, PE_stride, PE_size,
                                    c->local_pes, &c->local_count);
@@ -680,8 +694,22 @@ shmem_internal_hier_compute(int PE_start, int PE_stride, int PE_size,
         if (c->root_pes[i] == shmem_internal_my_pe) { c->my_root_idx = i; break; }
     }
 
-    c->num_rounds = 0;
-    { int n = c->root_count - 1; while (n > 0) { n >>= 1; c->num_rounds++; } }
+    /* Internode reduce/broadcast tree over the root set (indices
+     * 0..root_count-1), radix hier_internode_radix, root index 0 is the global
+     * root.  Only meaningful for root PEs (my_root_idx >= 0). */
+    c->internode_parent_pe = -1;
+    c->internode_nchildren = 0;
+    if (c->my_root_idx >= 0) {
+        int k  = (int) hier_internode_radix;
+        int me = c->my_root_idx;
+        if (me > 0)
+            c->internode_parent_pe = c->root_pes[(me - 1) / k];
+        for (int j = 1; j <= k; j++) {
+            int ci = me * k + j;
+            if (ci < c->root_count)
+                c->internode_child_pe[c->internode_nchildren++] = c->root_pes[ci];
+        }
+    }
 }
 
 /* Free the malloc'd arrays held by a persisted topology cache. */
@@ -692,7 +720,8 @@ shmem_internal_hier_cache_free(shmem_internal_hier_cache_t *c)
     free(c->local_pes);
     free(c->root_pes);
     free(c->tree_child_shr);
-    c->local_pes = c->root_pes = c->tree_child_shr = NULL;
+    free(c->internode_child_pe);
+    c->local_pes = c->root_pes = c->tree_child_shr = c->internode_child_pe = NULL;
     c->valid = 0;
 }
 
@@ -735,6 +764,7 @@ shmem_internal_sync_hierarchical(int PE_start, int PE_stride, int PE_size,
         shmem_internal_hier_compute(PE_start, PE_stride, PE_size,
                                     hier_local_pes, hier_root_pes,
                                     alloca(sizeof(int) * tree_radix),
+                                    alloca(sizeof(int) * hier_internode_radix),
                                     &scratch_cache);
         if (hier_cache != NULL) {
             /* Persist exact-size copies in the team cache for reuse.  If any
@@ -743,21 +773,26 @@ shmem_internal_sync_hierarchical(int PE_start, int PE_stride, int PE_size,
              * correctly, just without the caching optimization. */
             int lc = scratch_cache.local_count, rc = scratch_cache.root_count;
             int nc = scratch_cache.tree_nchildren;
+            int inc = scratch_cache.internode_nchildren;
             int *cl = malloc(sizeof(int) * (lc > 0 ? lc : 1));
             int *cr = malloc(sizeof(int) * (rc > 0 ? rc : 1));
             int *cc = malloc(sizeof(int) * (nc > 0 ? nc : 1));
-            if (cl == NULL || cr == NULL || cc == NULL) {
+            int *ci = malloc(sizeof(int) * (inc > 0 ? inc : 1));
+            if (cl == NULL || cr == NULL || cc == NULL || ci == NULL) {
                 free(cl);
                 free(cr);
                 free(cc);
+                free(ci);
                 topo = &scratch_cache;
             } else {
                 memcpy(cl, scratch_cache.local_pes, sizeof(int) * lc);
                 memcpy(cr, scratch_cache.root_pes,  sizeof(int) * rc);
                 memcpy(cc, scratch_cache.tree_child_shr, sizeof(int) * nc);
+                memcpy(ci, scratch_cache.internode_child_pe, sizeof(int) * inc);
                 hier_cache->local_pes      = cl;
                 hier_cache->root_pes       = cr;
                 hier_cache->tree_child_shr = cc;
+                hier_cache->internode_child_pe = ci;
                 hier_cache->local_count    = lc;
                 hier_cache->root_count     = rc;
                 hier_cache->tree_nchildren = nc;
@@ -765,7 +800,8 @@ shmem_internal_sync_hierarchical(int PE_start, int PE_stride, int PE_size,
                 hier_cache->active_root_pe = scratch_cache.active_root_pe;
                 hier_cache->is_root        = scratch_cache.is_root;
                 hier_cache->my_root_idx    = scratch_cache.my_root_idx;
-                hier_cache->num_rounds     = scratch_cache.num_rounds;
+                hier_cache->internode_parent_pe = scratch_cache.internode_parent_pe;
+                hier_cache->internode_nchildren = scratch_cache.internode_nchildren;
                 hier_cache->valid          = 1;
                 topo = hier_cache;
             }
@@ -775,12 +811,14 @@ shmem_internal_sync_hierarchical(int PE_start, int PE_stride, int PE_size,
     }
 
     int  local_count    = topo->local_count;
-    int *root_pes       = topo->root_pes;
-    int  root_count     = topo->root_count;
-    int  my_vidx        = topo->my_vidx;
     int  is_root        = topo->is_root;
     int *tree_child_shr = topo->tree_child_shr;
     int  tree_nchildren = topo->tree_nchildren;
+    int  root_count     = topo->root_count;
+    int  my_vidx        = topo->my_vidx;
+    int  in_parent_pe   = topo->internode_parent_pe;
+    int  in_nchildren   = topo->internode_nchildren;
+    int *in_child_pe    = topo->internode_child_pe;
 
     /* Sense-alternating signal — monotonically increasing, no slot resets needed.
      * up-slot   for PE r: local_pSync[r * HIER_SLOT_STRIDE]
@@ -882,20 +920,58 @@ shmem_internal_sync_hierarchical(int PE_start, int PE_stride, int PE_size,
     double mn_t1 = shmem_internal_params.HIER_BARRIER_DEBUG ? hier_now_us() : 0.0;
 
     if (is_root) {
-        /* ---- Phase 2: internode barrier (NIC puts, root PEs only) ---- */
+        /* ---- Phase 2: internode barrier (NIC atomics, root PEs only) ----
+         *
+         * Radix-k reduce + broadcast over the root set, mirroring
+         * shmem_internal_sync_tree but indexed through the internode tree cached
+         * above (parent/children already resolved to global PEs).  A single
+         * pSync counter slot accumulates children call-ins on the way up and the
+         * parent's ack on the way down; the clear-and-wait dance resets it for
+         * the next barrier.  Depth is 2*ceil(log_k(root_count)) and total
+         * message count is O(root_count) — strictly less internode work than the
+         * plain global tree, which additionally pays 2*log_k(PPN) levels. */
         if (root_count > 1) {
-            int my_root_idx = topo->my_root_idx;
-            int num_rounds  = topo->num_rounds;
-            shmem_internal_assert(my_root_idx >= 0);
-            shmem_internal_assert(num_rounds <= SHMEM_BARRIER_SYNC_SIZE);
+            long zero = 0;
+            long *ps  = &pSync[0];
 
-            for (int r = 0; r < num_rounds; r++) {
-                int partner_idx = (my_root_idx + (1 << r)) % root_count;
-                int partner_pe  = root_pes[partner_idx];
-                shmem_internal_put_scalar(SHMEM_CTX_DEFAULT, &pSync[r], &one,
-                                         sizeof(one), partner_pe);
-                SHMEM_WAIT(&pSync[r], SHMEM_SYNC_VALUE);
-                __atomic_store_n(&pSync[r], SHMEM_SYNC_VALUE, __ATOMIC_RELEASE);
+            if (in_nchildren != 0) {
+                /* Interior of the internode tree: wait for children call-ins. */
+                SHMEM_WAIT_UNTIL(ps, SHMEM_CMP_EQ, in_nchildren);
+
+                if (in_parent_pe == -1) {
+                    /* Global root: clear, then release children. */
+                    shmem_internal_put_scalar(SHMEM_CTX_DEFAULT, ps, &zero,
+                                              sizeof(zero), shmem_internal_my_pe);
+                    SHMEM_WAIT_UNTIL(ps, SHMEM_CMP_EQ, 0);
+                    for (int c = 0; c < in_nchildren; c++) {
+                        shmem_internal_atomic(SHMEM_CTX_DEFAULT, ps, &one,
+                                              sizeof(one), in_child_pe[c],
+                                              SHM_INTERNAL_SUM, SHM_INTERNAL_LONG);
+                    }
+                } else {
+                    /* Middle: ack parent, wait for parent's ack, clear, release. */
+                    shmem_internal_atomic(SHMEM_CTX_DEFAULT, ps, &one, sizeof(one),
+                                          in_parent_pe, SHM_INTERNAL_SUM,
+                                          SHM_INTERNAL_LONG);
+                    SHMEM_WAIT_UNTIL(ps, SHMEM_CMP_EQ, in_nchildren + 1);
+                    shmem_internal_put_scalar(SHMEM_CTX_DEFAULT, ps, &zero,
+                                              sizeof(zero), shmem_internal_my_pe);
+                    SHMEM_WAIT_UNTIL(ps, SHMEM_CMP_EQ, 0);
+                    for (int c = 0; c < in_nchildren; c++) {
+                        shmem_internal_atomic(SHMEM_CTX_DEFAULT, ps, &one,
+                                              sizeof(one), in_child_pe[c],
+                                              SHM_INTERNAL_SUM, SHM_INTERNAL_LONG);
+                    }
+                }
+            } else {
+                /* Leaf root: signal parent, wait for ack, clear. */
+                shmem_internal_atomic(SHMEM_CTX_DEFAULT, ps, &one, sizeof(one),
+                                      in_parent_pe, SHM_INTERNAL_SUM,
+                                      SHM_INTERNAL_LONG);
+                SHMEM_WAIT(ps, 0);
+                shmem_internal_put_scalar(SHMEM_CTX_DEFAULT, ps, &zero,
+                                          sizeof(zero), shmem_internal_my_pe);
+                SHMEM_WAIT_UNTIL(ps, SHMEM_CMP_EQ, 0);
             }
         }
 

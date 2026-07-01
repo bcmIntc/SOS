@@ -63,6 +63,9 @@ SHMEM_INTERNAL_ENV_DEF(HIER_BARRIER_THRESHOLD, long, 2, SHMEM_INTERNAL_ENV_CAT_C
                        "Minimum local PE count per node to auto-select the hierarchical barrier")
 SHMEM_INTERNAL_ENV_DEF(HIER_BARRIER_DEBUG, bool, 0, SHMEM_INTERNAL_ENV_CAT_COLLECTIVES,
                        "Print per-phase hierarchical barrier timing at finalize")
+SHMEM_INTERNAL_ENV_DEF(HIER_BARRIER_RADIX, long, 0, SHMEM_INTERNAL_ENV_CAT_COLLECTIVES,
+                       "Radix for the hierarchical barrier internode reduce/broadcast tree "
+                       "(0 = use SHMEM_COLL_RADIX)")
 SHMEM_INTERNAL_ENV_DEF(BCAST_ALGORITHM, string, "auto", SHMEM_INTERNAL_ENV_CAT_COLLECTIVES,
                        "Algorithm for broadcast.  Options are auto, linear, tree")
 SHMEM_INTERNAL_ENV_DEF(REDUCE_ALGORITHM, string, "auto", SHMEM_INTERNAL_ENV_CAT_COLLECTIVES,
