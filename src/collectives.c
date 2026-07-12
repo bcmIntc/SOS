@@ -36,6 +36,19 @@ long *shmem_internal_barrier_all_local_psync;
 long *shmem_internal_sync_all_local_psync;
 long *shmem_internal_hierarchical_local_psync;
 
+/* Persistent scratch for the per-call lists built on every hierarchical
+ * barrier.  Allocated once at init and reused across calls.  Safe to share:
+ * barriers are serialized — a PE cannot enter a new barrier until it has
+ * exited the previous one (the same invariant the shared
+ * hierarchical_local_psync relies on).
+ *   hier_local_pes / hier_root_pes : sized to num_pes (the maximum any active
+ *                                    set can hold).
+ *   hier_tree_child_shr            : sized to tree_radix (the max children of
+ *                                    any node in the intranode k-ary tree). */
+static int *hier_local_pes     = NULL;
+static int *hier_root_pes      = NULL;
+static int *hier_tree_child_shr = NULL;
+
 /* Layout of local_pSync — two cache-line-padded arrays, one slot per PE:
  *
  *   up-slot   for PE r: local_pSync[r * HIER_SLOT_STRIDE]
@@ -211,6 +224,15 @@ shmem_internal_collectives_init(void)
     for (i = 0; i < local_psync_len; i++) {
         shmem_internal_hierarchical_local_psync[i] = SHMEM_SYNC_VALUE;
     }
+
+    /* Persistent per-barrier scratch (see declarations above).  local/root
+     * sized to num_pes so they fit the largest possible active set;
+     * tree_child_shr sized to tree_radix (max children of any tree node). */
+    hier_local_pes      = malloc(sizeof(int) * shmem_internal_num_pes);
+    hier_root_pes       = malloc(sizeof(int) * shmem_internal_num_pes);
+    hier_tree_child_shr = malloc(sizeof(int) * tree_radix);
+    if (NULL == hier_local_pes || NULL == hier_root_pes ||
+        NULL == hier_tree_child_shr) return -1;
 #endif
 
     /* initialize the binomial tree for collective operations over
@@ -598,13 +620,14 @@ shmem_internal_sync_hierarchical(int PE_start, int PE_stride, int PE_size,
 
     if (PE_size == 1) return;
 
-    /* Collect local and root PE sets for this active set */
-    int *local_pes = alloca(sizeof(int) * PE_size);
+    /* Collect local and root PE sets for this active set.  Reuse the
+     * init-time persistent scratch instead of an alloca-per-call. */
+    int *local_pes = hier_local_pes;
     int local_count = 0;
     shmem_internal_build_local_set(PE_start, PE_stride, PE_size,
                                    local_pes, &local_count);
 
-    int *root_pes = alloca(sizeof(int) * PE_size);
+    int *root_pes = hier_root_pes;
     int root_count = 0;
     shmem_internal_build_root_active_set(PE_start, PE_stride, PE_size,
                                          root_pes, &root_count);
@@ -622,7 +645,7 @@ shmem_internal_sync_hierarchical(int PE_start, int PE_stride, int PE_size,
                   : -1;
 
     int  tree_nchildren  = 0;
-    int *tree_child_shr  = alloca(sizeof(int) * tree_radix);
+    int *tree_child_shr  = hier_tree_child_shr;
     if (my_vidx >= 0) {
         for (int j = 1; j <= tree_radix; j++) {
             int cv = my_vidx * tree_radix + j;
