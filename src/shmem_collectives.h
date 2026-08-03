@@ -101,9 +101,13 @@ shmem_internal_sync(int PE_start, int PE_stride, int PE_size, long *pSync)
         case DISSEM: algo = "DISSEM"; break;
         case RING: algo = "RING"; break;
         case RECDBL: algo = "RECDBL"; break;
+        case HIERARCHICAL:
 #ifdef USE_HIERARCHICAL_BARRIER
-        case HIERARCHICAL: algo = "HIERARCHICAL"; break;
+            algo = "HIERARCHICAL";
+#else
+            algo = (PE_size < shmem_internal_params.COLL_CROSSOVER) ? "AUTO(LINEAR)" : "AUTO(TREE)";
 #endif
+            break;
         }
         DEBUG_MSG("Barrier algorithm: %s (type=%d, PE_size=%d, CROSSOVER=%ld, hier_auto=%d)\n",
                   algo, shmem_internal_barrier_type, PE_size,
@@ -149,14 +153,15 @@ shmem_internal_sync(int PE_start, int PE_stride, int PE_size, long *pSync)
     case DISSEM:
         shmem_internal_sync_dissem(PE_start, PE_stride, PE_size, pSync);
         break;
-#ifdef USE_HIERARCHICAL_BARRIER
     case HIERARCHICAL:
+#ifdef USE_HIERARCHICAL_BARRIER
         shmem_internal_sync_hierarchical(PE_start, PE_stride, PE_size,
                                          pSync,
                                          shmem_internal_hierarchical_local_psync,
                                          NULL, NULL);
         break;
 #endif
+        /* fall through to tree/linear if hierarchical barrier not compiled in */
     default:
         RAISE_ERROR_MSG("Illegal barrier/sync type (%d)\n",
                         shmem_internal_barrier_type);
