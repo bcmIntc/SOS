@@ -97,8 +97,7 @@ AS_IF([test "$enable_completion_polling" = "yes" -o "$enable_manual_progress" = 
       [AC_DEFINE([DEFAULT_POLL_LIMIT], [-1], [Poll limit for local/remote completions])],
       [AC_DEFINE([DEFAULT_POLL_LIMIT], [0], [Poll limit for local/remote completions])])
 
-AS_IF([test "$enable_manual_progress" = "no"],
-      [AC_DEFINE([ENABLE_MANUAL_PROGRESS], [0], [Disable manual progress])],
+AS_IF([test "$enable_manual_progress" = "yes"],
       [AC_DEFINE([ENABLE_MANUAL_PROGRESS], [1], [Enable manual progress])])
 
 AC_ARG_ENABLE([total-data-ordering],
@@ -354,8 +353,7 @@ AS_IF([test "$enable_ofi_hmem" = "yes"],
 AC_ARG_ENABLE([ofi-cxi-pcie-amo],
 	      [AS_HELP_STRING([--disable-ofi-cxi-pcie-amo],
 			      [Disable PCIe AMO feature on CXI network interface cards (default: enabled)])])
-AS_IF([test "$enable_ofi_cxi_pcie_amo" = "no"],
-      [AC_DEFINE([ENABLE_OFI_CXI_PCIE_AMO], [0], [Disable PCIe AMO feature on CXI NIC])],
+AS_IF([test "$enable_ofi_cxi_pcie_amo" != "no"],
       [AC_DEFINE([ENABLE_OFI_CXI_PCIE_AMO], [1], [Enable PCIe AMO feature on CXI NIC])])
 
 PKG_INSTALLDIR()

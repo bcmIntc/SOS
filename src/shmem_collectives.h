@@ -17,9 +17,9 @@
 #define SHMEM_COLLECTIVES_H
 
 #include "shmem_synchronization.h"
-#ifdef USE_HIERARCHICAL_BARRIER
+/* Needed unconditionally: shmem_internal_{sync,barrier}_for_team take a
+ * shmem_internal_team_t* in both the hierarchical and non-hierarchical builds. */
 #include "shmem_team.h"
-#endif
 
 
 enum coll_type_t {
