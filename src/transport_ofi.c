@@ -116,6 +116,8 @@ pthread_mutex_t                 shmem_transport_ofi_progress_lock = PTHREAD_MUTE
 
 int shmem_transport_ofi_single_ep;
 
+static uint32_t shmem_transport_ofi_tclass;
+
 #ifdef ENABLE_OFI_CXI_PCIE_AMO
 bool shmem_transport_ofi_is_cxi;
 bool shmem_transport_ofi_pcie_cxi;
@@ -1466,6 +1468,54 @@ bool nic_already_used(struct fid_nic *nic, struct fi_info *fabrics, int num_nics
     return false;
 }
 
+/* Translate the SHMEM_OFI_TCLASS setting into an OFI traffic class value.
+ * Returns FI_TC_UNSPEC when unset or unrecognized, which leaves the endpoint on
+ * the provider's default traffic class. */
+static inline
+uint32_t parse_tclass(const char *name)
+{
+    if (0 == strcmp(name, "unspec"))           return FI_TC_UNSPEC;
+    if (0 == strcmp(name, "best_effort"))      return FI_TC_BEST_EFFORT;
+    if (0 == strcmp(name, "low_latency"))      return FI_TC_LOW_LATENCY;
+    if (0 == strcmp(name, "dedicated_access")) return FI_TC_DEDICATED_ACCESS;
+    if (0 == strcmp(name, "bulk_data"))        return FI_TC_BULK_DATA;
+    if (0 == strcmp(name, "scavenger"))        return FI_TC_SCAVENGER;
+    if (0 == strcmp(name, "network_ctrl"))     return FI_TC_NETWORK_CTRL;
+
+    if (0 == strncmp(name, "dscp:", 5)) {
+        char *end;
+        long dscp = strtol(name + 5, &end, 0);
+        if (*end == '\0' && dscp >= 0 && dscp <= 63)
+            return fi_tc_dscp_set((uint8_t) dscp);
+        RAISE_WARN_MSG("Ignoring bad DSCP traffic class '%s', DSCP must be 0-63\n", name);
+        return FI_TC_UNSPEC;
+    }
+
+    RAISE_WARN_MSG("Ignoring bad traffic class '%s', using provider default\n", name);
+    return FI_TC_UNSPEC;
+}
+
+/* Report the traffic class the provider actually assigned.  A provider may
+ * silently ignore the request, and on CXI the class must also be granted by the
+ * job's CXI service, so the granted value is logged rather than assumed. */
+static inline
+void report_tclass(struct fabric_info *info)
+{
+    if (shmem_internal_my_pe != 0)
+        return;
+
+    uint32_t granted = info->p_info->tx_attr->tclass;
+
+    if (shmem_transport_ofi_tclass == FI_TC_UNSPEC) {
+        DEBUG_MSG("Traffic class: provider default (0x%x)\n", granted);
+    } else if (granted != shmem_transport_ofi_tclass) {
+        RAISE_WARN_MSG("Requested traffic class '%s' (0x%x) not honored, provider using 0x%x\n",
+                       shmem_internal_params.OFI_TCLASS, shmem_transport_ofi_tclass, granted);
+    } else {
+        DEBUG_MSG("Traffic class: %s (0x%x)\n", shmem_internal_params.OFI_TCLASS, granted);
+    }
+}
+
 static inline
 int query_for_fabric(struct fabric_info *info)
 {
@@ -1542,7 +1592,8 @@ int query_for_fabric(struct fabric_info *info)
     hints.fabric_attr         = &fabric_attr;
     tx_attr.op_flags          = FI_DELIVERY_COMPLETE;
     tx_attr.inject_size       = shmem_transport_ofi_max_buffered_send; /* require provider to support this as a min */
-    hints.tx_attr             = &tx_attr; /* TODO: fill tx_attr */
+    tx_attr.tclass            = shmem_transport_ofi_tclass;
+    hints.tx_attr             = &tx_attr;
     hints.rx_attr             = NULL;
     hints.ep_attr             = &ep_attr;
 
@@ -1683,6 +1734,8 @@ int query_for_fabric(struct fabric_info *info)
               info->p_info->domain_attr->max_ep_stx_ctx == 0 ? "no" : "yes",
               shmem_transport_ofi_stx_max,
               num_nics);
+
+    report_tclass(info);
 
     return ret;
 }
@@ -1887,6 +1940,10 @@ int shmem_transport_init(void)
         shmem_transport_ofi_stx_max = shmem_internal_params.OFI_STX_MAX;
     }
     shmem_transport_ofi_stx_threshold = shmem_internal_params.OFI_STX_THRESHOLD;
+
+    /* Resolved before the fabric query, since the traffic class is requested
+     * through the fi_getinfo hints */
+    shmem_transport_ofi_tclass = parse_tclass(shmem_internal_params.OFI_TCLASS);
 
     ret = query_for_fabric(&shmem_transport_ofi_info);
     if (ret != 0) return ret;

@@ -115,6 +115,10 @@ SHMEM_INTERNAL_ENV_DEF(OFI_DISABLE_MULTIRAIL, bool, false, SHMEM_INTERNAL_ENV_CA
                        "Disable usage of multirail functionality")
 SHMEM_INTERNAL_ENV_DEF(OFI_DISABLE_SINGLE_EP, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Disable single endpoint resource optimization (enable separate Tx and Rx EPs)")
+SHMEM_INTERNAL_ENV_DEF(OFI_TCLASS, string, "unspec", SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Traffic class requested for transmit operations.  Options are unspec, "
+                       "best_effort, low_latency, dedicated_access, bulk_data, scavenger, "
+                       "network_ctrl, or dscp:N (N = 0-63)")
 #endif
 
 #ifdef USE_UCX
