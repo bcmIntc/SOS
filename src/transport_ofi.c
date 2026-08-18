@@ -1495,24 +1495,99 @@ uint32_t parse_tclass(const char *name)
     return FI_TC_UNSPEC;
 }
 
-/* Report the traffic class the provider actually assigned.  A provider may
- * silently ignore the request, and on CXI the class must also be granted by the
- * job's CXI service, so the granted value is logged rather than assumed. */
+/* Render a traffic class as the label SHMEM_OFI_TCLASS would use for it, so the
+ * requested and granted values can be compared without decoding hex. */
+static inline
+const char *tclass_str(uint32_t tclass, char *buf, size_t len)
+{
+    switch (tclass) {
+        case FI_TC_UNSPEC:           return "unspec";
+        case FI_TC_BEST_EFFORT:      return "best_effort";
+        case FI_TC_LOW_LATENCY:      return "low_latency";
+        case FI_TC_DEDICATED_ACCESS: return "dedicated_access";
+        case FI_TC_BULK_DATA:        return "bulk_data";
+        case FI_TC_SCAVENGER:        return "scavenger";
+        case FI_TC_NETWORK_CTRL:     return "network_ctrl";
+        default:
+            if (tclass & FI_TC_DSCP)
+                snprintf(buf, len, "dscp:%u", fi_tc_dscp_get(tclass));
+            else
+                snprintf(buf, len, "unknown(0x%x)", tclass);
+            return buf;
+    }
+}
+
+/* Survey the traffic class granted on every candidate domain, not just the one
+ * this PE ends up using.  The class is requested through the fi_getinfo hints,
+ * so each returned fi_info carries the class its own domain would honor.  This
+ * matters on CXI, where the class must be granted by the job's CXI service and
+ * the service is configured per device: a class granted on one NIC may be absent
+ * on another, and an ungranted class is silently ignored rather than refused.
+ * Walk the list before the multirail selection below splices its next pointers. */
+static inline
+void survey_tclass(struct fi_info *fabrics)
+{
+    if (shmem_transport_ofi_tclass == FI_TC_UNSPEC || shmem_internal_my_pe != 0)
+        return;
+
+    char req_buf[32], got_buf[32];
+    const char *requested = tclass_str(shmem_transport_ofi_tclass, req_buf, sizeof(req_buf));
+    char ungranted[SHMEM_INTERNAL_DIAG_STRLEN / 2];
+    size_t off = 0;
+    int num_ungranted = 0;
+
+    ungranted[0] = '\0';
+
+    for (struct fi_info *cur = fabrics; cur; cur = cur->next) {
+        const char *domain = cur->domain_attr->name;
+        uint32_t granted = cur->tx_attr->tclass;
+
+        DEBUG_MSG("Traffic class on domain %s: %s (0x%x), requested %s (0x%x)\n",
+                  domain, tclass_str(granted, got_buf, sizeof(got_buf)), granted,
+                  requested, shmem_transport_ofi_tclass);
+
+        if (granted != shmem_transport_ofi_tclass && off < sizeof(ungranted) - 1) {
+            num_ungranted++;
+            off += snprintf(ungranted + off, sizeof(ungranted) - off, "%s%s",
+                            num_ungranted > 1 ? ", " : "", domain);
+        }
+    }
+
+    if (num_ungranted > 0)
+        RAISE_WARN_MSG("Traffic class '%s' not granted on %d domain(s): %s.  Traffic on "
+                       "those NICs falls back to the provider default, so a measurement "
+                       "taken now mixes classes.  On CXI, check the job's CXI service "
+                       "grants this class on every device (cxi_service list -v).\n",
+                       requested, num_ungranted, ungranted);
+}
+
+/* Report the traffic class the provider actually assigned to the domain this PE
+ * selected.  Checked on every PE, not just PE 0: with multiple NICs per node the
+ * PE-to-domain mapping varies, so a partially granted class would otherwise look
+ * clean on PE 0 while some PEs silently transmit on the default class.  The
+ * mismatch path is a real configuration error, so it warns from each affected PE
+ * even though that is verbose at high PPN; survey_tclass() above names the
+ * offending domains once. */
 static inline
 void report_tclass(struct fabric_info *info)
 {
-    if (shmem_internal_my_pe != 0)
-        return;
-
     uint32_t granted = info->p_info->tx_attr->tclass;
+    char got_buf[32], req_buf[32];
 
     if (shmem_transport_ofi_tclass == FI_TC_UNSPEC) {
-        DEBUG_MSG("Traffic class: provider default (0x%x)\n", granted);
+        if (shmem_internal_my_pe == 0)
+            DEBUG_MSG("Traffic class: provider default, %s (0x%x)\n",
+                      tclass_str(granted, got_buf, sizeof(got_buf)), granted);
     } else if (granted != shmem_transport_ofi_tclass) {
-        RAISE_WARN_MSG("Requested traffic class '%s' (0x%x) not honored, provider using 0x%x\n",
-                       shmem_internal_params.OFI_TCLASS, shmem_transport_ofi_tclass, granted);
+        RAISE_WARN_MSG("Requested traffic class '%s' (0x%x) not honored on domain %s, "
+                       "provider using '%s' (0x%x)\n",
+                       tclass_str(shmem_transport_ofi_tclass, req_buf, sizeof(req_buf)),
+                       shmem_transport_ofi_tclass, info->p_info->domain_attr->name,
+                       tclass_str(granted, got_buf, sizeof(got_buf)), granted);
     } else {
-        DEBUG_MSG("Traffic class: %s (0x%x)\n", shmem_internal_params.OFI_TCLASS, granted);
+        DEBUG_MSG("Traffic class: %s (0x%x) on domain %s\n",
+                  tclass_str(granted, got_buf, sizeof(got_buf)), granted,
+                  info->p_info->domain_attr->name);
     }
 }
 
@@ -1604,6 +1679,8 @@ int query_for_fabric(struct fabric_info *info)
     OFI_CHECK_RETURN_MSG(ret, "OFI transport did not find any valid fabric services "
                               "(provider=%s)\n",
                               info->prov_name != NULL ? info->prov_name : "<auto>");
+
+    survey_tclass(info->fabrics);
 
     /* If the user supplied a fabric or domain name, use it to select the
      * fabrics that may be chosen. Otherwise, consider all available
