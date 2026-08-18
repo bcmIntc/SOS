@@ -1517,12 +1517,18 @@ const char *tclass_str(uint32_t tclass, char *buf, size_t len)
     }
 }
 
-/* Survey the traffic class granted on every candidate domain, not just the one
- * this PE ends up using.  The class is requested through the fi_getinfo hints,
- * so each returned fi_info carries the class its own domain would honor.  This
- * matters on CXI, where the class must be granted by the job's CXI service and
- * the service is configured per device: a class granted on one NIC may be absent
- * on another, and an ungranted class is silently ignored rather than refused.
+/* Survey the traffic class each candidate domain reports, not just the one this
+ * PE ends up using.  The class is requested through the fi_getinfo hints, so a
+ * provider that echoes the class it will honor does so per returned fi_info.
+ * That matters where the class is granted per device and a class available on one
+ * NIC may be absent on another.
+ *
+ * A returned FI_TC_UNSPEC means the provider does not report the class, NOT that
+ * the request was refused: CXI leaves the field zero yet applies the requested
+ * class when the endpoint is created, failing fi_endpoint() outright on a class
+ * it cannot support.  So only a different, non-UNSPEC class is evidence of a
+ * downgrade; treating UNSPEC as a refusal warns on every domain of a healthy run.
+ *
  * Walk the list before the multirail selection below splices its next pointers. */
 static inline
 void survey_tclass(struct fi_info *fabrics)
@@ -1532,61 +1538,79 @@ void survey_tclass(struct fi_info *fabrics)
 
     char req_buf[32], got_buf[32];
     const char *requested = tclass_str(shmem_transport_ofi_tclass, req_buf, sizeof(req_buf));
-    char ungranted[SHMEM_INTERNAL_DIAG_STRLEN / 2];
+    char downgraded[SHMEM_INTERNAL_DIAG_STRLEN / 2];
     size_t off = 0;
-    int num_ungranted = 0;
+    int num_downgraded = 0, num_silent = 0, num_domains = 0;
 
-    ungranted[0] = '\0';
+    downgraded[0] = '\0';
 
     for (struct fi_info *cur = fabrics; cur; cur = cur->next) {
         const char *domain = cur->domain_attr->name;
-        uint32_t granted = cur->tx_attr->tclass;
+        uint32_t reported = cur->tx_attr->tclass;
 
-        DEBUG_MSG("Traffic class on domain %s: %s (0x%x), requested %s (0x%x)\n",
-                  domain, tclass_str(granted, got_buf, sizeof(got_buf)), granted,
+        num_domains++;
+
+        DEBUG_MSG("Traffic class on domain %s: reported %s (0x%x), requested %s (0x%x)\n",
+                  domain, tclass_str(reported, got_buf, sizeof(got_buf)), reported,
                   requested, shmem_transport_ofi_tclass);
 
-        if (granted != shmem_transport_ofi_tclass && off < sizeof(ungranted) - 1) {
-            num_ungranted++;
-            off += snprintf(ungranted + off, sizeof(ungranted) - off, "%s%s",
-                            num_ungranted > 1 ? ", " : "", domain);
+        if (reported == FI_TC_UNSPEC) {
+            num_silent++;
+        } else if (reported != shmem_transport_ofi_tclass && off < sizeof(downgraded) - 1) {
+            num_downgraded++;
+            off += snprintf(downgraded + off, sizeof(downgraded) - off, "%s%s",
+                            num_downgraded > 1 ? ", " : "", domain);
         }
     }
 
-    if (num_ungranted > 0)
-        RAISE_WARN_MSG("Traffic class '%s' not granted on %d domain(s): %s.  Traffic on "
-                       "those NICs falls back to the provider default, so a measurement "
-                       "taken now mixes classes.  On CXI, check the job's CXI service "
-                       "grants this class on every device (cxi_service list -v).\n",
-                       requested, num_ungranted, ungranted);
+    if (num_downgraded > 0)
+        RAISE_WARN_MSG("Traffic class '%s' downgraded on %d domain(s): %s.  Traffic on "
+                       "those NICs uses a different class, so a measurement taken now "
+                       "mixes classes.\n",
+                       requested, num_downgraded, downgraded);
+
+    if (num_silent == num_domains)
+        DEBUG_MSG("Traffic class '%s' requested; provider reports no class per domain, so "
+                  "the request cannot be confirmed here.  Endpoint creation would fail on "
+                  "an unsupported class, so treat startup success as acceptance and "
+                  "confirm the class carried traffic from the fabric counters.\n",
+                  requested);
 }
 
-/* Report the traffic class the provider actually assigned to the domain this PE
- * selected.  Checked on every PE, not just PE 0: with multiple NICs per node the
- * PE-to-domain mapping varies, so a partially granted class would otherwise look
- * clean on PE 0 while some PEs silently transmit on the default class.  The
- * mismatch path is a real configuration error, so it warns from each affected PE
- * even though that is verbose at high PPN; survey_tclass() above names the
- * offending domains once. */
+/* Report the traffic class the domain this PE selected reports back.  Checked on
+ * every PE, not just PE 0: with multiple NICs per node the PE-to-domain mapping
+ * varies, so a class downgraded on one device would otherwise look clean on PE 0
+ * while some PEs silently transmit on another class.  A downgrade is a real
+ * configuration error, so it warns from each affected PE even though that is
+ * verbose at high PPN; survey_tclass() above names the domains once.
+ *
+ * As in survey_tclass(), a reported FI_TC_UNSPEC means the provider does not fill
+ * the field in and says nothing about whether the request took effect. */
 static inline
 void report_tclass(struct fabric_info *info)
 {
-    uint32_t granted = info->p_info->tx_attr->tclass;
+    uint32_t reported = info->p_info->tx_attr->tclass;
     char got_buf[32], req_buf[32];
 
     if (shmem_transport_ofi_tclass == FI_TC_UNSPEC) {
         if (shmem_internal_my_pe == 0)
             DEBUG_MSG("Traffic class: provider default, %s (0x%x)\n",
-                      tclass_str(granted, got_buf, sizeof(got_buf)), granted);
-    } else if (granted != shmem_transport_ofi_tclass) {
-        RAISE_WARN_MSG("Requested traffic class '%s' (0x%x) not honored on domain %s, "
+                      tclass_str(reported, got_buf, sizeof(got_buf)), reported);
+    } else if (reported == FI_TC_UNSPEC) {
+        if (shmem_internal_my_pe == 0)
+            DEBUG_MSG("Traffic class: requested %s (0x%x) on domain %s, not reported back "
+                      "by the provider\n",
+                      tclass_str(shmem_transport_ofi_tclass, req_buf, sizeof(req_buf)),
+                      shmem_transport_ofi_tclass, info->p_info->domain_attr->name);
+    } else if (reported != shmem_transport_ofi_tclass) {
+        RAISE_WARN_MSG("Requested traffic class '%s' (0x%x) downgraded on domain %s, "
                        "provider using '%s' (0x%x)\n",
                        tclass_str(shmem_transport_ofi_tclass, req_buf, sizeof(req_buf)),
                        shmem_transport_ofi_tclass, info->p_info->domain_attr->name,
-                       tclass_str(granted, got_buf, sizeof(got_buf)), granted);
+                       tclass_str(reported, got_buf, sizeof(got_buf)), reported);
     } else {
         DEBUG_MSG("Traffic class: %s (0x%x) on domain %s\n",
-                  tclass_str(granted, got_buf, sizeof(got_buf)), granted,
+                  tclass_str(reported, got_buf, sizeof(got_buf)), reported,
                   info->p_info->domain_attr->name);
     }
 }
