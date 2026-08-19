@@ -1860,6 +1860,11 @@ static int shmem_transport_ofi_target_ep_init(void)
     info->p_info->rx_attr->mode = 0;
     info->p_info->tx_attr->caps = FI_RMA | FI_ATOMIC;
     info->p_info->rx_attr->caps = info->p_info->caps;
+    /* The class is read from this struct when the endpoint is created, not from
+     * the hints, and a provider may return the field as FI_TC_UNSPEC whether or
+     * not it honors the request -- CXI always does.  Reasserting it here is what
+     * carries the request from fi_getinfo through to fi_endpoint. */
+    info->p_info->tx_attr->tclass = shmem_transport_ofi_tclass;
 
     ret = fi_endpoint(shmem_transport_ofi_domainfd,
                       info->p_info, &shmem_transport_ofi_target_ep, NULL);
@@ -1929,6 +1934,9 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
     info->p_info->rx_attr->mode = 0;
     info->p_info->tx_attr->caps = info->p_info->caps;
     info->p_info->rx_attr->caps = FI_RECV; /* to drive progress on the CQ */;
+    /* See the target endpoint: the class has to be reasserted on the returned
+     * fi_info, since fi_endpoint() reads it from there rather than the hints. */
+    info->p_info->tx_attr->tclass = shmem_transport_ofi_tclass;
 
     ctx->id = id;
 #ifdef USE_CTX_LOCK
