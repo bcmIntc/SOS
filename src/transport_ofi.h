@@ -110,6 +110,33 @@ extern bool shmem_transport_ofi_pcie_cxi;
         }                                                                       \
     } while (0)
 
+/* A failing wait on a completion counter reports the error on that counter rather
+ * than on the CQ: fi_cntr_wait returns -FI_EAVAIL and the count is retrieved with
+ * fi_cntr_readerr.  The CQ is still worth reading, since an error entry queued
+ * there carries the only human-readable description of the failure, but an empty
+ * CQ is not itself the error and must not be reported as one. */
+#define OFI_CHECK_CNTR_ERROR(cq, cntr, /* ssize_t */ err)                       \
+    do {                                                                        \
+        if ((err) == -FI_EAVAIL) {                                              \
+            struct fi_cq_err_entry e = {0};                                     \
+            uint64_t nerr = fi_cntr_readerr(cntr);                              \
+            struct fid_cq *err_cq = (cq);                                       \
+            ssize_t cq_ret = err_cq ? fi_cq_readerr(err_cq, (void *)&e, 0) : 0; \
+            if (cq_ret == 1) {                                                  \
+                const char *errmsg = fi_cq_strerror(err_cq, e.prov_errno,       \
+                                                    e.err_data, NULL, 0);       \
+                RAISE_ERROR_MSG("Error in operation: %s (counter reported %"    \
+                                PRIu64 " error(s))\n", errmsg, nerr);           \
+            } else {                                                            \
+                RAISE_ERROR_MSG("Counter reported %" PRIu64 " error(s), no CQ " \
+                                "entry to describe them (%zd)\n",               \
+                                nerr, cq_ret);                                  \
+            }                                                                   \
+        } else if (err) {                                                       \
+            RAISE_ERROR_MSG("OFI error %zd: %s\n", err, fi_strerror(err));      \
+        }                                                                       \
+    } while (0)
+
 #define OFI_CHECK_ERROR_MSG(ret, ...)                                           \
     do {                                                                        \
         if (ret) {                                                              \
@@ -522,7 +549,7 @@ void shmem_transport_put_quiet(shmem_transport_ctx_t* ctx)
         cnt = cnt_new;
         ssize_t ret = fi_cntr_wait(ctx->put_cntr, cnt, -1);
         cnt_new = SHMEM_TRANSPORT_OFI_CNTR_READ(&ctx->pending_put_cntr);
-        OFI_CTX_CHECK_ERROR(ctx, ret);
+        OFI_CHECK_CNTR_ERROR(ctx->cq, ctx->put_cntr, ret);
     } while (cnt < cnt_new);
     shmem_internal_assert(cnt == cnt_new);
 
@@ -965,7 +992,7 @@ void shmem_transport_get_wait(shmem_transport_ctx_t* ctx)
         cnt = cnt_new;
         ssize_t ret = fi_cntr_wait(ctx->get_cntr, cnt, -1);
         cnt_new = SHMEM_TRANSPORT_OFI_CNTR_READ(&ctx->pending_get_cntr);
-        OFI_CTX_CHECK_ERROR(ctx, ret);
+        OFI_CHECK_CNTR_ERROR(ctx->cq, ctx->get_cntr, ret);
     } while (cnt < cnt_new);
     shmem_internal_assert(cnt == cnt_new);
 
@@ -1502,7 +1529,15 @@ void shmem_transport_received_cntr_wait(uint64_t ge_val)
      * we would need a mutex to support FI_THREAD_COMPLETION builds. */
     int ret = fi_cntr_wait(shmem_transport_ofi_target_cntrfd, ge_val, -1);
 
-    OFI_CHECK_ERROR(ret);
+    /* The target CQ only exists in manual-progress builds; without one the counter
+     * error count is all there is to report. */
+#if ENABLE_MANUAL_PROGRESS
+    struct fid_cq *target_cq = shmem_transport_ofi_target_cq;
+#else
+    struct fid_cq *target_cq = NULL;
+#endif
+    OFI_CHECK_CNTR_ERROR(target_cq, shmem_transport_ofi_target_cntrfd,
+                         (ssize_t) ret);
 #else
     RAISE_ERROR_STR("OFI transport configured for hard polling");
 #endif
