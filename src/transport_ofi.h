@@ -306,6 +306,31 @@ struct shmem_transport_ofi_bounce_buffer_t {
 
 typedef struct shmem_transport_ofi_bounce_buffer_t shmem_transport_ofi_bounce_buffer_t;
 
+/* How much symmetric heap one context's bounce-buffer pool will take.
+ *
+ * The pool is shmalloc'ed by shmem_free_list_init() during context creation, so
+ * the heap has to be sized for it in shmem_internal_symmetric_init(), which runs
+ * earlier -- hence a macro readable from outside this transport.  Both env
+ * parameters are already parsed by then, and BOUNCE_SIZE has already been forced
+ * to 0 if the thread level demands it, so the reserve tracks the value the
+ * transport will actually use.
+ *
+ * With BOUNCE_SHEAP unset the pool comes from malloc instead and needs no
+ * reserve.  Reserving is harmless when the provider later turns bounce buffering
+ * off for requiring FI_CONTEXT, since that is decided after the heap exists.
+ *
+ * One context's worth is all that can be reserved here: every context created
+ * later gets its own pool, and how many there will be is not known when the heap
+ * is sized.  So an application that creates contexts still takes those pools out
+ * of its SYMMETRIC_SIZE. */
+#define SHMEM_TRANSPORT_BOUNCE_POOL_SIZE                                      \
+    ((shmem_internal_params.BOUNCE_SHEAP &&                                   \
+      shmem_internal_params.BOUNCE_SIZE > 0 &&                                \
+      shmem_internal_params.MAX_BOUNCE_BUFFERS > 0) ?                         \
+     SHMEM_FREE_LIST_POOL_SIZE(sizeof(shmem_transport_ofi_bounce_buffer_t) +  \
+                               shmem_internal_params.BOUNCE_SIZE,             \
+                               shmem_internal_params.MAX_BOUNCE_BUFFERS) : 0)
+
 typedef int shmem_transport_ct_t;
 
 enum shmem_internal_tid_t { tid_is_pid_t, tid_is_uint64_t };

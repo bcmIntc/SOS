@@ -22,8 +22,6 @@
 #include "shmem.h"
 #include "shmem_free_list.h"
 
-#define NUM_ELEMENTS	2
-
 shmem_free_list_t*
 shmem_free_list_init(size_t element_size,
                      shmem_free_list_item_init_fn_t init_fn,
@@ -36,14 +34,14 @@ shmem_free_list_init(size_t element_size,
     fl->element_size = element_size;
     fl->init_fn = init_fn;
     fl->nalloc = 0;
-    fl->alloc_size = sizeof(shmem_free_list_alloc_t) + NUM_ELEMENTS * fl->element_size;
+    fl->alloc_size = sizeof(shmem_free_list_alloc_t) + SHMEM_FREE_LIST_NUM_ELEMENTS * fl->element_size;
     fl->pool_size = 0;
     fl->pool_ofs = 0;
     fl->pool = NULL;
     if (max_pool_cnt) {
         /* preallocate pool with shmem malloc */
         /* memory must be reserved as a memory pool to prevent address conflicts between PEs */
-        fl->pool_size = fl->alloc_size * max_pool_cnt;
+        fl->pool_size = SHMEM_FREE_LIST_POOL_SIZE(fl->element_size, max_pool_cnt);
         fl->pool = shmem_internal_shmalloc(fl->pool_size);
     }
     /* if pool count is zero allocate with bounce buffers with malloc */
@@ -100,20 +98,20 @@ shmem_free_list_more(shmem_free_list_t *fl)
        fl->pool_ofs += fl->alloc_size;
 
        if (shmem_internal_params.BOUNCE_MLOCK) {
-           mlock(buf, sizeof(shmem_free_list_alloc_t) + NUM_ELEMENTS * fl->element_size);
+           mlock(buf, sizeof(shmem_free_list_alloc_t) + SHMEM_FREE_LIST_NUM_ELEMENTS * fl->element_size);
        }
     } else {
         buf = malloc(sizeof(shmem_free_list_alloc_t) +
-                     NUM_ELEMENTS * fl->element_size);
+                     SHMEM_FREE_LIST_NUM_ELEMENTS * fl->element_size);
         if (NULL == buf) return 1;
     }
 
     header = (shmem_free_list_alloc_t*) buf;
     first = item = (shmem_free_list_item_t*) (header + 1);
-    for (i = 0 ; i < NUM_ELEMENTS ; ++i) {
+    for (i = 0 ; i < SHMEM_FREE_LIST_NUM_ELEMENTS ; ++i) {
         fl->init_fn(item);
         next = (shmem_free_list_item_t*)((char*)item + fl->element_size);
-        if (i == NUM_ELEMENTS - 1) {
+        if (i == SHMEM_FREE_LIST_NUM_ELEMENTS - 1) {
             item->next = NULL;
             last = item;
         } else {

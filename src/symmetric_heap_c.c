@@ -299,10 +299,14 @@ static void *mmap_alloc(size_t bytes, size_t *mapped_bytes)
 int
 shmem_internal_symmetric_init(void)
 {
-    /* add library overhead such that the max can be shmalloc()'ed */
+    /* add library overhead such that the max can be shmalloc()'ed.  The
+     * bounce-buffer reserve is computed from the same expression the pool
+     * allocation uses rather than being a fixed size, so that raising
+     * SHMEM_BOUNCE_SIZE or SHMEM_MAX_BOUNCE_BUFFERS cannot leave the pool
+     * spilling into the SYMMETRIC_SIZE the user asked for. */
     shmem_internal_heap_length = shmem_internal_params.SYMMETRIC_SIZE +
                                  SHMEM_INTERNAL_HEAP_OVERHEAD +
-				 SHMEM_MAX_BOUNCE_BUFFER_OVERHEAD;
+				 SHMEM_TRANSPORT_BOUNCE_POOL_SIZE;
 
     if (!shmem_internal_params.SYMMETRIC_HEAP_USE_MALLOC) {
         size_t mapped_length = shmem_internal_heap_length;

@@ -64,4 +64,12 @@ typedef enum shm_internal_datatype_t shm_internal_datatype_t;
 
 #endif /* Transport selection */
 
+/* Only the OFI transport preallocates its bounce-buffer pool out of the symmetric
+ * heap.  Portals4 passes max_pool_cnt 0 to shmem_free_list_init and mallocs its
+ * chunks on demand, and the others have no bounce buffering at all, so they
+ * reserve nothing. */
+#ifndef SHMEM_TRANSPORT_BOUNCE_POOL_SIZE
+#define SHMEM_TRANSPORT_BOUNCE_POOL_SIZE 0
+#endif
+
 #endif /* TRANSPORT_H */

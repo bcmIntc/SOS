@@ -49,6 +49,21 @@ struct shmem_free_list_t {
 };
 typedef struct shmem_free_list_t shmem_free_list_t;
 
+/* Elements are handed out in chunks: one chunk header followed by
+ * SHMEM_FREE_LIST_NUM_ELEMENTS elements.  A preallocated pool therefore holds
+ * whole chunks, and max_pool_cnt -- an element count, which is what every caller
+ * has -- rounds up to the chunk count that supplies it.
+ *
+ * A caller that must reserve the pool's memory before creating the list sizes the
+ * reserve with SHMEM_FREE_LIST_POOL_SIZE, which is what shmem_free_list_init
+ * itself uses, so the reserve cannot drift away from the allocation. */
+#define SHMEM_FREE_LIST_NUM_ELEMENTS 2
+#define SHMEM_FREE_LIST_POOL_SIZE(element_size, max_pool_cnt)               \
+    ((sizeof(shmem_free_list_alloc_t) +                                     \
+      SHMEM_FREE_LIST_NUM_ELEMENTS * (size_t) (element_size)) *             \
+     (((size_t) (max_pool_cnt) + SHMEM_FREE_LIST_NUM_ELEMENTS - 1) /        \
+      SHMEM_FREE_LIST_NUM_ELEMENTS))
+
 shmem_free_list_t* shmem_free_list_init(size_t element_size,
                                         shmem_free_list_item_init_fn_t init_fn,
 					size_t max_pool_cnt);
