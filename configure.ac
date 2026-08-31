@@ -333,9 +333,8 @@ AC_ARG_ENABLE([hierarchical-barrier],
     [AS_HELP_STRING([--disable-hierarchical-barrier],
                     [Disable the hierarchical barrier: intranode phase uses CPU atomics,
                      internode phase uses NIC puts. Requires XPMEM (the intranode
-                     phase does CPU atomics on peers slots via mapped pointers, which
-                     only XPMEM provides) and a network transport (OFI, Portals4, or
-                     UCX). (default: enabled)])])
+                     phase does CPU atomics on peers' slots via mapped pointers, which
+                     only XPMEM provides). (default: enabled)])])
 
 AC_ARG_ENABLE([manpages],
     [AS_HELP_STRING([--enable-manpages],
@@ -560,29 +559,41 @@ if test "$enable_shr_atomics" = "yes"; then
 else
     transport_shr_atomics="no"
 fi
+shr_atomics_note=""
 
 if test "$enable_shr_atomics" != "no" -a "$transport_xpmem" = "yes" -a "$transport" = "none"; then
     transport_shr_atomics="yes"
     AC_DEFINE([USE_SHR_ATOMICS], [1], [If defined, the shared memory layer will perform processor atomics.])
 fi
 
-dnl Hierarchical barrier: only when explicitly requested.  Validate that XPMEM
-dnl and a network transport are both present; error if dependencies are missing.
+dnl Hierarchical barrier: enabled by default, and requires XPMEM plus shared
+dnl memory atomics.  A missing dependency is an error only when the barrier was
+dnl asked for explicitly; a default build reports the reason and continues
+dnl without it.
 dnl XPMEM (not CMA) is required because the intranode phase performs CPU atomics
 dnl on peers' pSync slots through directly mapped pointers (shmem_shr_transport_ptr),
-dnl which only XPMEM can provide; CMA's copy-based path cannot.
+dnl which only XPMEM can provide; CMA's copy-based path cannot.  Those same CPU
+dnl atomics are the shared memory atomics that --disable-shr-atomics turns off,
+dnl so the two cannot be selected together.
+dnl A network transport is not required: only the internode phase puts, and
+dnl without a network every job is single node, where the intranode-only path
+dnl runs instead.
 transport_hierarchical_barrier="no"
+hier_barrier_missing=""
 if test "$enable_hierarchical_barrier" = "no"; then
-    AC_MSG_WARN([Hierachical Barrier disabled])
+    AC_MSG_NOTICE([hierarchical barrier disabled])
+elif test "$transport_xpmem" != "yes"; then
+    hier_barrier_missing="XPMEM; configure with --with-xpmem"
+elif test "$enable_shr_atomics" = "no"; then
+    hier_barrier_missing="shared memory atomics for its intranode phase, which performs CPU atomics on peers' pSync slots; drop --disable-shr-atomics"
 else
-    dnl Check on-node transport dependency
-    if test "$transport_xpmem" != "yes"; then
-        AC_MSG_ERROR([--enable-hierarchical-barrier requires XPMEM; configure with --with-xpmem])
-    dnl Check network transport dependency
-    elif test "$transport_ofi" != "yes" -a "$transport_portals4" != "yes" -a "$transport_ucx" != "yes"; then
-        AC_MSG_ERROR([--enable-hierarchical-barrier requires a network transport; configure with --with-ofi, --with-portals4, or --with-ucx])
+    transport_hierarchical_barrier="yes"
+fi
+if test -n "$hier_barrier_missing"; then
+    if test "$enable_hierarchical_barrier" = "yes"; then
+        AC_MSG_ERROR([--enable-hierarchical-barrier requires $hier_barrier_missing])
     else
-        transport_hierarchical_barrier="yes"
+        AC_MSG_WARN([hierarchical barrier disabled: it requires $hier_barrier_missing])
     fi
 fi
 if test "$transport_hierarchical_barrier" = "yes"; then
@@ -597,6 +608,10 @@ if test "$transport_hierarchical_barrier" = "yes"; then
     dnl always use the NIC, preserving the single-coherency-domain invariant.
     AC_DEFINE([USE_SHR_ATOMICS], [1],
               [If defined, the shared memory layer will perform processor atomics.])
+    if test "$transport_shr_atomics" != "yes"; then
+        AC_MSG_NOTICE([shared memory atomics enabled by the hierarchical barrier])
+        shr_atomics_note=" (implied by hier. barrier)"
+    fi
     transport_shr_atomics="yes"
 fi
 
@@ -1098,7 +1113,7 @@ echo "On Node Communication:"
 echo "  XPMEM:          $transport_xpmem"
 echo "  CMA:            $transport_cma"
 echo "  memcpy (self):  $transport_memcpy"
-echo "  Shr. atomics:   $transport_shr_atomics"
+echo "  Shr. atomics:   $transport_shr_atomics$shr_atomics_note"
 echo "  Hier. barrier:  $transport_hierarchical_barrier"
 echo ""
 echo "Global Options:"
