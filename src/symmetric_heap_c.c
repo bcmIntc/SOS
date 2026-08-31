@@ -250,7 +250,7 @@ static void *mmap_alloc(size_t bytes, size_t *mapped_bytes)
              * Explicitly request 2MB pages via MAP_HUGE_SHIFT (21 << MAP_HUGE_SHIFT = 2^21 = 2MB). */
             ret = mmap(requested_base, bytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | MAP_HUGETLB | (21 << MAP_HUGE_SHIFT), -1, 0);
             if (ret == MAP_FAILED) {
-                RAISE_WARN_MSG("mmap(MAP_HUGETLB) failed (%s), falling back to regular pages", strerror(errno));
+                DEBUG_MSG("mmap(MAP_HUGETLB) failed (%s), falling back to regular pages", strerror(errno));
             } else {
                 DEBUG_MSG("Allocated symmetric heap via anonymous MAP_HUGETLB (2MB pages): %zu bytes", bytes);
             }
