@@ -36,6 +36,18 @@ long *shmem_internal_barrier_all_local_psync;
 long *shmem_internal_sync_all_local_psync;
 long *shmem_internal_hierarchical_local_psync;
 
+/* Internode (phase 2) pSync arrays for active-set barriers, which arrive with
+ * no team context.  Phase 2 stamps its slots with the monotonic sense value and
+ * never clears them, so an array must be written by exactly one sense counter:
+ * a stale stamp from a counter that has run further ahead would satisfy a
+ * smaller signal and let a barrier pass without synchronizing.  There are two
+ * because the active-set path uses two counters, TEAM_WORLD's for a whole-job
+ * set and a static fallback for any other, so each gets its own array.  Using
+ * these rather than the caller's pSync also leaves a user-supplied pSync
+ * untouched, as phases 1 and 3 already do with hierarchical_local_psync. */
+static long *hier_root_psync_world;
+static long *hier_root_psync_local;
+
 /* Persistent scratch for the active-set PE lists built on every hierarchical
  * barrier.  Allocated once at init, sized to num_pes (the maximum any active
  * set can hold), and reused across calls.  Safe to share: barriers are
@@ -242,6 +254,22 @@ shmem_internal_collectives_init(void)
     for (i = 0; i < local_psync_len; i++) {
         shmem_internal_hierarchical_local_psync[i] = SHMEM_SYNC_VALUE;
     }
+
+    /* Internode pSync arrays for the active-set barrier paths, one per sense
+     * counter (see declaration above).  One slot per phase-2 round. */
+    hier_root_psync_world =
+        shmem_internal_shmalloc(sizeof(long) * SHMEM_BARRIER_SYNC_SIZE);
+    if (NULL == hier_root_psync_world) return -1;
+
+    for (i = 0; i < SHMEM_BARRIER_SYNC_SIZE; i++)
+        hier_root_psync_world[i] = SHMEM_SYNC_VALUE;
+
+    hier_root_psync_local =
+        shmem_internal_shmalloc(sizeof(long) * SHMEM_BARRIER_SYNC_SIZE);
+    if (NULL == hier_root_psync_local) return -1;
+
+    for (i = 0; i < SHMEM_BARRIER_SYNC_SIZE; i++)
+        hier_root_psync_local[i] = SHMEM_SYNC_VALUE;
 
     /* Persistent per-barrier scratch (see declaration above).  Sized to
      * num_pes so it fits the largest possible active set. */
@@ -586,9 +614,16 @@ shmem_internal_sync_dissem(int PE_start, int PE_stride, int PE_size, long *pSync
  *
  * Phase 2 (internode, NIC puts, root PEs only):
  *   Root PEs run a dissemination barrier among themselves using NIC puts
- *   across per-round pSync slots (ceil(log2(N)) rounds). A shmem_quiet
- *   after the last round ensures all outbound puts are retired before
- *   phase 3.
+ *   across per-round pSync slots (ceil(log2(N)) rounds).  Each round puts the
+ *   same monotonic signal phases 1 and 3 use and waits for the slot to reach
+ *   it, so a slot is never cleared and holds one barrier's stamp until the next
+ *   overwrites it.  The wait compares GE where phases 1 and 3 compare EQ: in a
+ *   tree a child cannot stamp the next barrier until the release for this one
+ *   has reached it, but a dissemination round's writer is gated on nobody
+ *   downstream, so it can be a whole barrier ahead and its later stamp must
+ *   satisfy this round's wait.  A shmem_quiet after the last round retires all
+ *   outbound puts before phase 3, which also keeps a writer's successive puts
+ *   to one slot in order and so keeps that slot monotone.
  *
  * Phase 3 (intranode fanout, CPU stores/loads via XPMEM):
  *   Same dissemination algorithm as phase 1, run in reverse sense so that the
@@ -723,23 +758,36 @@ shmem_internal_sync_hierarchical(int PE_start, int PE_stride, int PE_size,
                                   shmem_internal_hier_cache_t *hier_cache)
 {
     int my_shr_rank  = shmem_runtime_get_node_rank(shmem_internal_my_pe);
-    long one = 1;
 
     if (PE_size == 1) return;
 
-    /* Determine sense state.  Caller may supply a per-team sense pointer
-     * (hier_sense_ptr != NULL); this ensures each team maintains an independent
-     * sense counter and prevents deadlocks when overlapping teams are synced in
-     * different sequences.  NULL falls back to the internal selection: TEAM_WORLD
-     * uses its own counter; all other active sets share a static fallback. */
+    /* Determine sense state and the internode pSync that goes with it.  Caller
+     * may supply a per-team sense pointer (hier_sense_ptr != NULL); this ensures
+     * each team maintains an independent sense counter and prevents deadlocks
+     * when overlapping teams are synced in different sequences.  NULL falls back
+     * to the internal selection: TEAM_WORLD uses its own counter; all other
+     * active sets share a static fallback.
+     *
+     * The counter and the array are chosen together because phase 2 stamps its
+     * slots with the sense value and never clears them: one array may be fed by
+     * several counters only if none of them can run ahead of another, which is
+     * not true here, so each counter gets an array of its own.  A caller that
+     * supplies a sense pointer also supplies a pSync dedicated to that counter
+     * (each team's SYNC chunk, barrier_all's and sync_all's own arrays).  The
+     * active-set paths pass a pSync that is the caller's to keep, so they use
+     * the internal arrays instead and leave it alone. */
     long *sense_ptr;
+    long *root_pSync;
     if (hier_sense_ptr != NULL) {
-        sense_ptr = hier_sense_ptr;
+        sense_ptr  = hier_sense_ptr;
+        root_pSync = pSync;
     } else if (PE_start == 0 && PE_stride == 1 && PE_size == shmem_internal_num_pes) {
-        sense_ptr = &shmem_internal_team_world.hier_sense;
+        sense_ptr  = &shmem_internal_team_world.hier_sense;
+        root_pSync = hier_root_psync_world;
     } else {
         static long fallback_sense = 0;
-        sense_ptr = &fallback_sense;
+        sense_ptr  = &fallback_sense;
+        root_pSync = hier_root_psync_local;
     }
 
     /* Resolve the active-set topology.  A team supplies a cache (hier_cache):
@@ -912,13 +960,21 @@ shmem_internal_sync_hierarchical(int PE_start, int PE_stride, int PE_size,
             for (int r = 0; r < num_rounds; r++) {
                 int partner_idx = (my_root_idx + (1 << r)) % root_count;
                 int partner_pe  = root_pes[partner_idx];
-                shmem_internal_put_scalar(SHMEM_CTX_DEFAULT, &pSync[r], &one,
-                                         sizeof(one), partner_pe);
-                SHMEM_WAIT(&pSync[r], SHMEM_SYNC_VALUE);
-                __atomic_store_n(&pSync[r], SHMEM_SYNC_VALUE, __ATOMIC_RELEASE);
+                shmem_internal_put_scalar(SHMEM_CTX_DEFAULT, &root_pSync[r], &signal,
+                                         sizeof(signal), partner_pe);
+                /* Compare GE, not EQ: a dissemination round's writer is not
+                 * gated on this PE consuming the previous one, so the slot can
+                 * already hold a later barrier's stamp.  A later stamp implies
+                 * this round's arrival happened, since every root runs every
+                 * round of every barrier. */
+                SHMEM_WAIT_UNTIL(&root_pSync[r], SHMEM_CMP_GE, signal);
             }
         }
 
+        /* Retires this PE's outbound stamps.  Load-bearing beyond draining the
+         * context: it keeps one writer's successive puts to the same slot in
+         * order, which is what makes a slot monotone and the GE waits above
+         * sound. */
         shmem_internal_quiet(SHMEM_CTX_DEFAULT);
 
         double mn_t2 = shmem_internal_params.COLLECTIVES_DEBUG ? hier_now_us() : 0.0;

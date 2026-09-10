@@ -413,6 +413,20 @@ int shmem_internal_team_split_strided(shmem_internal_team_t *parent_team, int PE
             *new_team = myteam;
 
             shmem_internal_team_pool[myteam->psync_idx] = *new_team;
+
+#ifdef USE_HIERARCHICAL_BARRIER
+            /* The hierarchical barrier stamps this team's SYNC chunk with its
+             * sense value and never clears a slot, while a team taken from a
+             * recycled psync_idx starts its sense at 0.  Clear the chunk so the
+             * new team cannot mistake a previous owner's larger stamp for its
+             * own first barrier.  The parent-team barrier below is what makes
+             * this safe: no member can barrier on the new team until every
+             * member has cleared its chunk. */
+            long *new_team_sync_psync =
+                &shmem_internal_psync_barrier_pool[myteam->psync_idx * SHMEM_SYNC_SIZE];
+            for (size_t i = 0; i < SHMEM_BARRIER_SYNC_SIZE; i++)
+                new_team_sync_psync[i] = SHMEM_SYNC_VALUE;
+#endif
         }
     }
 
