@@ -950,7 +950,25 @@ shmem_internal_sync_hierarchical(int PE_start, int PE_stride, int PE_size,
     double mn_t1 = shmem_internal_params.COLLECTIVES_DEBUG ? hier_now_us() : 0.0;
 
     if (is_root) {
-        /* ---- Phase 2: internode barrier (NIC puts, root PEs only) ---- */
+        /* ---- Phase 2: internode barrier (NIC puts, root PEs only) ----
+         *
+         * Phases 1 and 3 never reach the NIC, so these stamps are the whole of
+         * this barrier's network traffic and the only traffic that
+         * SHMEM_OFI_COLL_TCLASS moves onto a separate traffic class.  Splitting
+         * flows across classes gives up ordering between them, and two properties
+         * of this function are what make that sound here.  shmem_barrier* opens
+         * with shmem_internal_quiet(SHMEM_CTX_DEFAULT), so nothing of the
+         * caller's is in flight by the time these puts are issued and there is no
+         * ordering left to preserve.  shmem_sync* skips that quiet, but it also
+         * promises the caller nothing about data, so again nothing is relying on
+         * an order.
+         *
+         * Both calls use the same context, and choosing per call would not be
+         * safe: an active set with no team cache shares one root_pSync array and
+         * one fallback sense counter between barrier and sync, so a barrier stamp
+         * and a sync stamp can be written to the same slot.  Across two classes
+         * those two puts have no order, which is exactly the monotone invariant
+         * the GE wait below rests on. */
         if (root_count > 1) {
             int my_root_idx = topo->my_root_idx;
             int num_rounds  = topo->num_rounds;
@@ -960,7 +978,7 @@ shmem_internal_sync_hierarchical(int PE_start, int PE_stride, int PE_size,
             for (int r = 0; r < num_rounds; r++) {
                 int partner_idx = (my_root_idx + (1 << r)) % root_count;
                 int partner_pe  = root_pes[partner_idx];
-                shmem_internal_put_scalar(SHMEM_CTX_DEFAULT, &root_pSync[r], &signal,
+                shmem_internal_put_scalar(shmem_internal_coll_ctx, &root_pSync[r], &signal,
                                          sizeof(signal), partner_pe);
                 /* Compare GE, not EQ: a dissemination round's writer is not
                  * gated on this PE consuming the previous one, so the slot can
@@ -974,8 +992,8 @@ shmem_internal_sync_hierarchical(int PE_start, int PE_stride, int PE_size,
         /* Retires this PE's outbound stamps.  Load-bearing beyond draining the
          * context: it keeps one writer's successive puts to the same slot in
          * order, which is what makes a slot monotone and the GE waits above
-         * sound. */
-        shmem_internal_quiet(SHMEM_CTX_DEFAULT);
+         * sound.  Must quiet the same context the puts went out on. */
+        shmem_internal_quiet(shmem_internal_coll_ctx);
 
         double mn_t2 = shmem_internal_params.COLLECTIVES_DEBUG ? hier_now_us() : 0.0;
 

@@ -177,6 +177,8 @@ static size_t shmem_transport_portals4_grow_size = 128;
 #define SHMEM_TRANSPORT_CTX_DEFAULT_ID -1
 shmem_transport_ctx_t shmem_transport_ctx_default;
 shmem_ctx_t SHMEM_CTX_DEFAULT = (shmem_ctx_t) &shmem_transport_ctx_default;
+/* No separate collective traffic class on this transport; always the default. */
+shmem_ctx_t shmem_internal_coll_ctx = (shmem_ctx_t) &shmem_transport_ctx_default;
 
 static int
 shmem_transport_ctx_init(shmem_transport_ctx_t *ctx, long options, int id)

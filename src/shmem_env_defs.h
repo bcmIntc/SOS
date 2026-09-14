@@ -119,6 +119,13 @@ SHMEM_INTERNAL_ENV_DEF(OFI_TCLASS, string, "unspec", SHMEM_INTERNAL_ENV_CAT_TRAN
                        "Traffic class requested for transmit operations.  Options are unspec, "
                        "best_effort, low_latency, dedicated_access, bulk_data, scavenger, "
                        "network_ctrl, or dscp:N (N = 0-63)")
+SHMEM_INTERNAL_ENV_DEF(OFI_COLL_TCLASS, string, "unspec", SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Traffic class for a dedicated internal context that carries the "
+                       "hierarchical barrier's internode pSync puts, separate from the class "
+                       "SHMEM_OFI_TCLASS gives user data.  Same options as SHMEM_OFI_TCLASS.  "
+                       "When unspec (default) no separate context is created and the barrier "
+                       "uses the default context, so the build is unchanged.  Setting it (e.g. "
+                       "low_latency) opens one extra transmit endpoint per PE for that traffic.")
 #endif
 
 #ifdef USE_UCX

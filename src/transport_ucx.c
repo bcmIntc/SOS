@@ -30,6 +30,8 @@
 
 shmem_transport_ctx_t shmem_transport_ctx_default;
 shmem_ctx_t SHMEM_CTX_DEFAULT = (shmem_ctx_t) &shmem_transport_ctx_default;
+/* No separate collective traffic class on this transport; always the default. */
+shmem_ctx_t shmem_internal_coll_ctx = (shmem_ctx_t) &shmem_transport_ctx_default;
 
 ucp_context_h shmem_transport_ucp_ctx;
 ucp_worker_h  shmem_transport_ucp_worker;

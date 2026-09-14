@@ -30,6 +30,13 @@
 #include "transport.h"
 #include "shr_transport.h"
 
+/* Transport-neutral handle for the collective transmit context.  Each transport
+ * defines it aliased to its default context; the OFI transport reassigns it to a
+ * dedicated context on its own traffic class when SHMEM_OFI_COLL_TCLASS is set.
+ * The hierarchical barrier routes its internode pSync puts through this so the
+ * decision lives in one place with no per-call branch. */
+extern shmem_ctx_t shmem_internal_coll_ctx;
+
 static inline
 void
 shmem_internal_put_nb(shmem_ctx_t ctx, void *target, const void *source, size_t len, int pe,

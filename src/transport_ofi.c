@@ -118,6 +118,12 @@ int shmem_transport_ofi_single_ep;
 
 static uint32_t shmem_transport_ofi_tclass;
 
+/* Traffic class for the optional dedicated collective context, and whether that
+ * context was created.  Enabled iff SHMEM_OFI_COLL_TCLASS resolves to a class
+ * other than FI_TC_UNSPEC. */
+static uint32_t shmem_transport_ofi_coll_tclass;
+static int      shmem_transport_ofi_coll_ctx_enabled;
+
 #ifdef ENABLE_OFI_CXI_PCIE_AMO
 bool shmem_transport_ofi_is_cxi;
 bool shmem_transport_ofi_pcie_cxi;
@@ -224,6 +230,15 @@ static size_t shmem_transport_ofi_grow_size = 128;
 #define SHMEM_TRANSPORT_CTX_DEFAULT_ID -1
 shmem_transport_ctx_t shmem_transport_ctx_default;
 shmem_ctx_t SHMEM_CTX_DEFAULT = (shmem_ctx_t) &shmem_transport_ctx_default;
+
+/* Dedicated collective context.  Its id is a distinct negative sentinel so it
+ * is handled like the default context (never a team-array slot, never freed) but
+ * is still recognized as its own resource in ctx_init and ctx_destroy.
+ * shmem_internal_coll_ctx aliases the default context until startup enables the
+ * dedicated one, so collective code can route through it with no branch. */
+#define SHMEM_TRANSPORT_CTX_COLL_ID -2
+shmem_transport_ctx_t shmem_transport_ctx_coll;
+shmem_ctx_t shmem_internal_coll_ctx = (shmem_ctx_t) &shmem_transport_ctx_default;
 
 size_t SHMEM_Dtsize[FI_DATATYPE_LAST];
 
@@ -1935,8 +1950,10 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
     info->p_info->tx_attr->caps = info->p_info->caps;
     info->p_info->rx_attr->caps = FI_RECV; /* to drive progress on the CQ */;
     /* See the target endpoint: the class has to be reasserted on the returned
-     * fi_info, since fi_endpoint() reads it from there rather than the hints. */
-    info->p_info->tx_attr->tclass = shmem_transport_ofi_tclass;
+     * fi_info, since fi_endpoint() reads it from there rather than the hints.
+     * Read it from the context, not the global, so a dedicated context (the
+     * collective one) can carry a different class than the default. */
+    info->p_info->tx_attr->tclass = ctx->tclass;
 
     ctx->id = id;
 #ifdef USE_CTX_LOCK
@@ -2053,6 +2070,12 @@ int shmem_transport_init(void)
     /* Resolved before the fabric query, since the traffic class is requested
      * through the fi_getinfo hints */
     shmem_transport_ofi_tclass = parse_tclass(shmem_internal_params.OFI_TCLASS);
+
+    /* The dedicated collective context is created only when its class is set to
+     * something other than the provider default. */
+    shmem_transport_ofi_coll_tclass = parse_tclass(shmem_internal_params.OFI_COLL_TCLASS);
+    shmem_transport_ofi_coll_ctx_enabled =
+        (shmem_transport_ofi_coll_tclass != FI_TC_UNSPEC);
 
     ret = query_for_fabric(&shmem_transport_ofi_info);
     if (ret != 0) return ret;
@@ -2187,9 +2210,68 @@ int shmem_transport_startup(void)
     }
 
     shmem_transport_ctx_default.team = &shmem_internal_team_world;
+    shmem_transport_ctx_default.tclass = shmem_transport_ofi_tclass;
 
     ret = shmem_transport_ofi_ctx_init(&shmem_transport_ctx_default, SHMEM_TRANSPORT_CTX_DEFAULT_ID);
     if (ret != 0) return ret;
+
+    /* Optional dedicated collective context on its own traffic class.  Its
+     * non-default id makes ctx_init take the own-endpoint branch even under
+     * single-endpoint mode, so it gets a transmit endpoint of its own, and the
+     * endpoint is what carries the class: fi_endpoint() reads tx_attr->tclass, so
+     * holding two classes at once takes two endpoints.  No bounce buffers: the
+     * barrier only sends scalar pSync words.
+     *
+     * On CXI the class can only be per endpoint, because that provider offers no
+     * shared transmit context to bind it to instead: cxip reports
+     * max_ep_stx_ctx == 0 and implements stx_ctx as fi_no_stx_context, so
+     * query_for_fabric() above zeroes stx_max and every context here gets
+     * stx_idx -1.  A provider that does hand out STXs shares them by refcount and
+     * this context lands on the default context's, so say so: if such a provider
+     * binds the class to the STX rather than to the endpoint, both contexts
+     * transmit on one class and the split is inert without failing.
+     *
+     * Tripwire for whoever widens this.  The split is BY CONTEXT, and separate
+     * endpoints are separate ordering domains that OpenSHMEM promises nothing
+     * across, so shmem_put_signal's fence cannot order anything against this
+     * context's traffic.  Reclassifying some operations *within* one context
+     * would be a different matter, and two configure flags decide whether that is
+     * even expressible: a fence is path-local, so it orders within a class and not
+     * across one.  USE_FI_FENCE emits a real FI_FENCE and never qualifies;
+     * shmem_transport_fence collapses to put_quiet plus get_wait, which does, only
+     * while WANT_TOTAL_DATA_ORDERING is 0.  Check both before moving any traffic
+     * that a fence rather than a wait is what orders. */
+    if (shmem_transport_ofi_coll_ctx_enabled) {
+        char buf[32];
+
+        shmem_transport_ctx_coll.team    = &shmem_internal_team_world;
+        shmem_transport_ctx_coll.options = 0;
+        shmem_transport_ctx_coll.stx_idx = -1;
+        shmem_transport_ctx_coll.tclass  = shmem_transport_ofi_coll_tclass;
+
+        ret = shmem_transport_ofi_ctx_init(&shmem_transport_ctx_coll, SHMEM_TRANSPORT_CTX_COLL_ID);
+        if (ret != 0) return ret;
+
+        shmem_internal_coll_ctx = (shmem_ctx_t) &shmem_transport_ctx_coll;
+
+        if (shmem_internal_my_pe == 0) {
+            DEBUG_MSG("Dedicated collective context enabled on traffic class %s (0x%x)\n",
+                      tclass_str(shmem_transport_ofi_coll_tclass, buf, sizeof(buf)),
+                      shmem_transport_ofi_coll_tclass);
+        }
+
+        if (shmem_internal_my_pe == 0 &&
+            shmem_transport_ctx_coll.stx_idx >= 0 &&
+            shmem_transport_ctx_coll.stx_idx == shmem_transport_ctx_default.stx_idx) {
+            RAISE_WARN_MSG("Collective traffic class '%s' requested, but this provider shares "
+                           "one transmit context (STX %d) between the collective and default "
+                           "contexts.  If it binds the class to the STX rather than the "
+                           "endpoint, both carry a single class; confirm the split from the "
+                           "fabric counters before reading a result\n",
+                           tclass_str(shmem_transport_ofi_coll_tclass, buf, sizeof(buf)),
+                           shmem_transport_ctx_coll.stx_idx);
+        }
+    }
 
     ret = atomic_limitations_check();
     if (ret != 0) return ret;
@@ -2263,6 +2345,9 @@ int shmem_transport_ctx_create(struct shmem_internal_team_t *team, long options,
 
     ctxp->stx_idx = -1;
     ctxp->options = options;
+    /* User contexts stay on the default transmit class; only the internal
+     * collective context differs. */
+    ctxp->tclass = shmem_transport_ofi_tclass;
 
     ctxp->team = team;
 
@@ -2376,7 +2461,8 @@ void shmem_transport_ctx_destroy(shmem_transport_ctx_t *ctx)
         SHMEM_MUTEX_UNLOCK(shmem_transport_ofi_lock);
         free(ctx);
     }
-    else if (ctx->id != SHMEM_TRANSPORT_CTX_DEFAULT_ID) {
+    else if (ctx->id != SHMEM_TRANSPORT_CTX_DEFAULT_ID &&
+             ctx->id != SHMEM_TRANSPORT_CTX_COLL_ID) {
         RAISE_ERROR_MSG("Attempted to destroy an invalid context (%d)\n", ctx->id);
     }
 }
@@ -2386,6 +2472,15 @@ int shmem_transport_fini(void)
     int ret;
     shmem_transport_ofi_stx_kvs_t* e;
     int stx_len = 0;
+
+    /* The dedicated collective context, like the default, is not in any team's
+     * contexts array, so it is torn down here.  It owns its own endpoint, CQ and
+     * counters (its id is not the default id), so ctx_destroy closes them all in
+     * place; nothing about it is deferred to the target-endpoint teardown below. */
+    if (shmem_transport_ofi_coll_ctx_enabled) {
+        shmem_transport_quiet(&shmem_transport_ctx_coll);
+        shmem_transport_ctx_destroy(&shmem_transport_ctx_coll);
+    }
 
     /* The default context is not inserted into the list of contexts on
      * SHMEM_TEAM_WORLD, so it must be destroyed here */
