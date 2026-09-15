@@ -376,8 +376,9 @@ typedef struct shmem_transport_ctx_t shmem_transport_ctx_t;
 extern shmem_transport_ctx_t shmem_transport_ctx_default;
 
 /* Optional dedicated internal context for the hierarchical barrier's internode
- * pSync puts, created only when SHMEM_OFI_COLL_TCLASS is set so it can live on a
- * different CXI traffic class than user data.  The transport-neutral handle used
+ * pSync puts, created when SHMEM_OFI_COLL_CONTEXT or SHMEM_OFI_COLL_TCLASS is
+ * set, so the barrier can queue separately from user data and, with the class
+ * knob, live on a different CXI traffic class.  The transport-neutral handle used
  * by the collective code, shmem_internal_coll_ctx, is declared in shmem_comm.h;
  * it points here when enabled and at the default context otherwise. */
 extern shmem_transport_ctx_t shmem_transport_ctx_coll;

@@ -954,6 +954,7 @@ shmem_internal_sync_hierarchical(int PE_start, int PE_stride, int PE_size,
          *
          * Phases 1 and 3 never reach the NIC, so these stamps are the whole of
          * this barrier's network traffic and the only traffic that
+         * SHMEM_OFI_COLL_CONTEXT moves onto a separate endpoint and that
          * SHMEM_OFI_COLL_TCLASS moves onto a separate traffic class.  Splitting
          * flows across classes gives up ordering between them, and two properties
          * of this function are what make that sound here.  shmem_barrier* opens

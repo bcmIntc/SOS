@@ -119,13 +119,19 @@ SHMEM_INTERNAL_ENV_DEF(OFI_TCLASS, string, "unspec", SHMEM_INTERNAL_ENV_CAT_TRAN
                        "Traffic class requested for transmit operations.  Options are unspec, "
                        "best_effort, low_latency, dedicated_access, bulk_data, scavenger, "
                        "network_ctrl, or dscp:N (N = 0-63)")
+SHMEM_INTERNAL_ENV_DEF(OFI_COLL_CONTEXT, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Give the hierarchical barrier's internode pSync puts a dedicated "
+                       "internal context, one extra transmit endpoint per PE, on the same "
+                       "traffic class as user data.  Separates the barrier's queueing from the "
+                       "class it runs on: this knob alone changes no class, and "
+                       "SHMEM_OFI_COLL_TCLASS also implies it")
 SHMEM_INTERNAL_ENV_DEF(OFI_COLL_TCLASS, string, "unspec", SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
-                       "Traffic class for a dedicated internal context that carries the "
-                       "hierarchical barrier's internode pSync puts, separate from the class "
-                       "SHMEM_OFI_TCLASS gives user data.  Same options as SHMEM_OFI_TCLASS.  "
-                       "When unspec (default) no separate context is created and the barrier "
-                       "uses the default context, so the build is unchanged.  Setting it (e.g. "
-                       "low_latency) opens one extra transmit endpoint per PE for that traffic.")
+                       "Traffic class for the dedicated collective context, separate from the "
+                       "class SHMEM_OFI_TCLASS gives user data.  Same options as "
+                       "SHMEM_OFI_TCLASS.  Setting it to anything but unspec creates the "
+                       "context whether or not SHMEM_OFI_COLL_CONTEXT is set.  When unspec "
+                       "(default) the context, if SHMEM_OFI_COLL_CONTEXT created one, requests "
+                       "no class of its own and inherits SHMEM_OFI_TCLASS")
 #endif
 
 #ifdef USE_UCX

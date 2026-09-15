@@ -119,8 +119,11 @@ int shmem_transport_ofi_single_ep;
 static uint32_t shmem_transport_ofi_tclass;
 
 /* Traffic class for the optional dedicated collective context, and whether that
- * context was created.  Enabled iff SHMEM_OFI_COLL_TCLASS resolves to a class
- * other than FI_TC_UNSPEC. */
+ * context was created.  Enabled by SHMEM_OFI_COLL_CONTEXT, and by
+ * SHMEM_OFI_COLL_TCLASS resolving to a class other than FI_TC_UNSPEC, since a
+ * class for the context is not expressible without the context.  The class is
+ * FI_TC_UNSPEC when only the context was asked for, and then the collective
+ * endpoint requests no class and carries whatever SHMEM_OFI_TCLASS carries. */
 static uint32_t shmem_transport_ofi_coll_tclass;
 static int      shmem_transport_ofi_coll_ctx_enabled;
 
@@ -2071,11 +2074,12 @@ int shmem_transport_init(void)
      * through the fi_getinfo hints */
     shmem_transport_ofi_tclass = parse_tclass(shmem_internal_params.OFI_TCLASS);
 
-    /* The dedicated collective context is created only when its class is set to
-     * something other than the provider default. */
+    /* Either knob creates the dedicated collective context; only the class knob
+     * gives it a class of its own. */
     shmem_transport_ofi_coll_tclass = parse_tclass(shmem_internal_params.OFI_COLL_TCLASS);
     shmem_transport_ofi_coll_ctx_enabled =
-        (shmem_transport_ofi_coll_tclass != FI_TC_UNSPEC);
+        (shmem_internal_params.OFI_COLL_CONTEXT ||
+         shmem_transport_ofi_coll_tclass != FI_TC_UNSPEC);
 
     ret = query_for_fabric(&shmem_transport_ofi_info);
     if (ret != 0) return ret;
@@ -2243,11 +2247,17 @@ int shmem_transport_startup(void)
      * that a fence rather than a wait is what orders. */
     if (shmem_transport_ofi_coll_ctx_enabled) {
         char buf[32];
+        /* No class of its own means request the default context's, so the two
+         * endpoints differ in nothing but being two endpoints.  Asking for
+         * FI_TC_UNSPEC here instead would leave the provider free to pick, which
+         * is a second variable in the arm that exists to have only one. */
+        int own_class = (shmem_transport_ofi_coll_tclass != FI_TC_UNSPEC);
 
         shmem_transport_ctx_coll.team    = &shmem_internal_team_world;
         shmem_transport_ctx_coll.options = 0;
         shmem_transport_ctx_coll.stx_idx = -1;
-        shmem_transport_ctx_coll.tclass  = shmem_transport_ofi_coll_tclass;
+        shmem_transport_ctx_coll.tclass  = own_class ? shmem_transport_ofi_coll_tclass
+                                                     : shmem_transport_ofi_tclass;
 
         ret = shmem_transport_ofi_ctx_init(&shmem_transport_ctx_coll, SHMEM_TRANSPORT_CTX_COLL_ID);
         if (ret != 0) return ret;
@@ -2255,12 +2265,13 @@ int shmem_transport_startup(void)
         shmem_internal_coll_ctx = (shmem_ctx_t) &shmem_transport_ctx_coll;
 
         if (shmem_internal_my_pe == 0) {
-            DEBUG_MSG("Dedicated collective context enabled on traffic class %s (0x%x)\n",
-                      tclass_str(shmem_transport_ofi_coll_tclass, buf, sizeof(buf)),
-                      shmem_transport_ofi_coll_tclass);
+            DEBUG_MSG("Dedicated collective context enabled on traffic class %s (0x%x), %s\n",
+                      tclass_str(shmem_transport_ctx_coll.tclass, buf, sizeof(buf)),
+                      shmem_transport_ctx_coll.tclass,
+                      own_class ? "its own class" : "the same class as user data");
         }
 
-        if (shmem_internal_my_pe == 0 &&
+        if (shmem_internal_my_pe == 0 && own_class &&
             shmem_transport_ctx_coll.stx_idx >= 0 &&
             shmem_transport_ctx_coll.stx_idx == shmem_transport_ctx_default.stx_idx) {
             RAISE_WARN_MSG("Collective traffic class '%s' requested, but this provider shares "

@@ -32,7 +32,7 @@
 
 /* Transport-neutral handle for the collective transmit context.  Each transport
  * defines it aliased to its default context; the OFI transport reassigns it to a
- * dedicated context on its own traffic class when SHMEM_OFI_COLL_TCLASS is set.
+ * dedicated context when SHMEM_OFI_COLL_CONTEXT or SHMEM_OFI_COLL_TCLASS is set.
  * The hierarchical barrier routes its internode pSync puts through this so the
  * decision lives in one place with no per-call branch. */
 extern shmem_ctx_t shmem_internal_coll_ctx;
