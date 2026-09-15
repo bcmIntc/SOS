@@ -115,7 +115,14 @@ static int find_hugepage_dir(size_t page_size, char **directory)
 
         path = mntent->mnt_dir;
         if (statfs(path, &pg_size) == 0) {
-            if ((size_t) pg_size.f_bsize == page_size) {
+            /* Several hugetlbfs mounts can serve one page size while only some of
+             * them accept a file from an ordinary user, so the size match alone
+             * does not make a mount usable.  Requiring write access here keeps the
+             * scan going instead of settling on the first match: /dev/hugepages
+             * serves 2 MB and is typically root-owned, and the libhugetlbfs mount
+             * for the same size is writable but appears later in /proc/mounts. */
+            if ((size_t) pg_size.f_bsize == page_size &&
+                access(path, W_OK) == 0) {
                 *directory = strdup(path);
                 ret = 0;
                 break;
