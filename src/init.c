@@ -255,7 +255,7 @@ shmem_internal_heap_preinit(int tl_requested, int *tl_provided)
 #ifdef SOS_GIT_VERSION
             printf("%-23s %s\n", "  Git Version", SOS_GIT_VERSION);
 #else
-	    printf("%-23s %d\.%d\n", "Build Version", SHMEM_MAJOR_VERSION, SHMEM_MINOR_VERSION);
+            printf("%-23s %d.%d\n", "  Build Version", SHMEM_MAJOR_VERSION, SHMEM_MINOR_VERSION);
 #endif
         }
 
