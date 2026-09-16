@@ -2044,12 +2044,9 @@ int shmem_transport_init(void)
     else
         shmem_transport_ofi_info.domain_name = NULL;
 
-    /* Unless SHMEM_OFI_DISABLE_SINGLE_EP env var is set, each PE opens a single libfabric endpoint
+    /* Unless SHMEM_OFI_DISABLE_SINGLE_EP is true, each PE opens a single libfabric endpoint
      * for both transmission (on the default context) and as the target of communication */
-    if (shmem_internal_params.OFI_DISABLE_SINGLE_EP_provided)
-        shmem_transport_ofi_single_ep = 0;
-    else
-        shmem_transport_ofi_single_ep = 1;
+    shmem_transport_ofi_single_ep = !shmem_internal_params.OFI_DISABLE_SINGLE_EP;
 
     /* Check STX resource settings */
     if ((shmem_internal_thread_level == SHMEM_THREAD_SINGLE ||
