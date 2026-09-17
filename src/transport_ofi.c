@@ -1958,6 +1958,32 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
      * collective one) can carry a different class than the default. */
     info->p_info->tx_attr->tclass = ctx->tclass;
 
+    /* Diagnostic, on the collective context only.  A restricted communication
+     * profile is what CXI refuses: every refusal reads TC: LOW_LATENCY TYPE:
+     * RESTRICTED, and it lands on every endpoint except the target one, in
+     * either creation order.  So the tc_type is chosen from the endpoint's
+     * attributes, and the two that differ between this context and
+     * shmem_transport_ofi_target_ep_init() are the two below.  One bit each, so
+     * the pair can be bisected in one allocation.
+     *
+     * Bit 0 clears FI_DELIVERY_COMPLETE, which weakens what a put on this
+     * context promises, so a run with it set answers whether the class is
+     * granted and says nothing about the barrier's numbers. */
+    if (id == SHMEM_TRANSPORT_CTX_COLL_ID && shmem_internal_params.OFI_COLL_CTX_EP_PROBE) {
+        long probe = shmem_internal_params.OFI_COLL_CTX_EP_PROBE;
+
+        if (probe & 1) info->p_info->tx_attr->op_flags = 0;
+        if (probe & 2) info->p_info->tx_attr->caps = FI_RMA | FI_ATOMIC;
+
+        if (shmem_internal_my_pe == 0) {
+            RAISE_WARN_MSG("SHMEM_OFI_COLL_CTX_EP_PROBE=%ld: the collective context's transmit "
+                           "attributes are altered to find which one makes the provider ask for "
+                           "a restricted traffic class%s.  Diagnostic only; read the fabric "
+                           "counters, not the barrier timings\n", probe,
+                           (probe & 1) ? ", and its puts are no longer delivery-complete" : "");
+        }
+    }
+
     ctx->id = id;
 #ifdef USE_CTX_LOCK
     SHMEM_MUTEX_INIT(ctx->lock);
@@ -2057,18 +2083,18 @@ static int shmem_transport_ofi_stx_pool_init(void)
  * holding two classes at once takes two endpoints.  No bounce buffers: the
  * barrier only sends scalar pSync words.
  *
- * WHERE THIS IS CALLED FROM DECIDES WHETHER THE CLASS IS GRANTED.  A CXI PE is
- * granted one communication profile, allocated for whichever endpoint asks
- * first, and every later endpoint that asks for a restricted class is refused
- * with -22 and remapped to best_effort.  Measured on Perlmutter 2026-09-17 in
- * one allocation, so under one per-job grant: the whole-PE class split was
- * granted with the class on the PE's first endpoint, and refused on every row
- * where an earlier endpoint existed, including a row that asked for the class
- * the first endpoint already held.  So in the default order, where the target
- * endpoint is opened first with SHMEM_OFI_TCLASS, this context is always
- * refused.  SHMEM_OFI_COLL_CTX_FIRST calls this before the target endpoint
- * instead, which makes the collective class the one the PE gets and leaves user
- * data on the best_effort remap.
+ * WHETHER THE CLASS IS GRANTED IS DECIDED BY THE ENDPOINT, NOT BY THE ORDER.
+ * On CXI this context's class is refused with -22 and remapped to best_effort,
+ * and the refusal always reads TYPE: RESTRICTED.  Measured on Perlmutter
+ * 2026-09-17, two runs in one allocation and so under one per-job grant: with
+ * SHMEM_OFI_COLL_CTX_FIRST this context is opened ahead of the target endpoint
+ * and is refused exactly as it is when opened after it, 8 refusals on 8 PEs
+ * either way, while the same job's service grants LOW_LATENCY and the same job
+ * carried packets on it through the target endpoint.  So a restricted profile
+ * is refused on every endpoint but the target one, whatever its ordinal, and
+ * the deciding factor is the attributes the endpoint is created with.  The two
+ * that differ from the target endpoint's are the two
+ * SHMEM_OFI_COLL_CTX_EP_PROBE varies in shmem_transport_ofi_ctx_init.
  *
  * Called before the target endpoint, this must not touch it.  It does not:
  * ctx_init reuses that endpoint only for the default context, and
@@ -2240,9 +2266,10 @@ int shmem_transport_init(void)
     shmem_transport_ctx_default.options = SHMEMX_CTX_BOUNCE_BUFFER;
 
     /* Ahead of the target endpoint, so the collective class is the first one
-     * this PE asks for.  A CXI PE is granted one communication profile and
-     * gives it to the first asker, so the endpoint opened first is the only one
-     * that can hold a class; see shmem_transport_ofi_coll_ctx_init. */
+     * this PE asks for.  Measured on CXI this changes nothing, since the class
+     * is refused on any endpoint but the target one in either order; the knob
+     * is what isolates the ordinal from the endpoint's attributes.  See
+     * shmem_transport_ofi_coll_ctx_init. */
     if (shmem_transport_ofi_coll_ctx_enabled && shmem_internal_params.OFI_COLL_CTX_FIRST) {
         /* Only where the provider has no STXs, which is where the knob is for:
          * the pool is sized in shmem_transport_startup, after SHMEM_OFI_STX_AUTO
@@ -2336,9 +2363,8 @@ int shmem_transport_startup(void)
     if (ret != 0) return ret;
 
     /* In the default order, after the target endpoint and the default context.
-     * The class it asks for is refused on CXI from here, since the PE's one
-     * communication profile is already spoken for; SHMEM_OFI_COLL_CTX_FIRST
-     * opens it above instead.  Skipped when that already ran: the context is
+     * SHMEM_OFI_COLL_CTX_FIRST opens it above instead.  Skipped when that
+     * already ran: the context is
      * created once, and shmem_internal_coll_ctx still aliasing the default
      * context is what says it has not been. */
     if (shmem_transport_ofi_coll_ctx_enabled &&

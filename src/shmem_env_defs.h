@@ -134,12 +134,19 @@ SHMEM_INTERNAL_ENV_DEF(OFI_COLL_TCLASS, string, "unspec", SHMEM_INTERNAL_ENV_CAT
                        "no class of its own and inherits SHMEM_OFI_TCLASS")
 SHMEM_INTERNAL_ENV_DEF(OFI_COLL_CTX_FIRST, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Open the dedicated collective context before the target endpoint, so its "
-                       "traffic class is the first one this PE asks for.  On CXI a PE is granted "
-                       "one communication profile and later endpoints are remapped to "
-                       "best_effort, which is what refuses SHMEM_OFI_COLL_TCLASS in the default "
-                       "order.  With this set the collective class is the one that survives and "
-                       "user data takes the best_effort remap, so SHMEM_OFI_TCLASS cannot hold a "
-                       "class at the same time")
+                       "traffic class is the first one this PE asks for.  Measured on CXI this "
+                       "changes nothing: SHMEM_OFI_COLL_TCLASS is refused on any endpoint but "
+                       "the target one in either order.  Kept because it separates creation "
+                       "order from the endpoint attributes that do decide it, which "
+                       "SHMEM_OFI_COLL_CTX_EP_PROBE varies")
+SHMEM_INTERNAL_ENV_DEF(OFI_COLL_CTX_EP_PROBE, long, 0, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Diagnostic bitmask.  CXI refuses a traffic class on every endpoint but "
+                       "the target one, always as TYPE: RESTRICTED, so the provider picks the "
+                       "profile type from the endpoint's attributes.  This alters the collective "
+                       "context's transmit attributes to match the target endpoint's, one at a "
+                       "time: 1 clears FI_DELIVERY_COMPLETE, 2 narrows tx_attr->caps to "
+                       "FI_RMA|FI_ATOMIC, 3 does both.  Bit 0 weakens what a put on that context "
+                       "promises, so read the fabric counters and not the barrier's timings")
 #endif
 
 #ifdef USE_UCX
