@@ -1958,13 +1958,16 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
      * collective one) can carry a different class than the default. */
     info->p_info->tx_attr->tclass = ctx->tclass;
 
-    /* Diagnostic, on the collective context only.  A restricted communication
-     * profile is what CXI refuses: every refusal reads TC: LOW_LATENCY TYPE:
-     * RESTRICTED, and it lands on every endpoint except the target one, in
-     * either creation order.  So the tc_type is chosen from the endpoint's
-     * attributes, and the two that differ between this context and
-     * shmem_transport_ofi_target_ep_init() are the two below.  One bit each, so
-     * the pair can be bisected in one allocation.
+    /* Diagnostic, on the collective context only.  Neither attribute below
+     * changes the traffic-class type CXI refuses.  Measured on Perlmutter
+     * 2026-09-17, one allocation, all three settings of the bitmask: the class
+     * is refused as TC: LOW_LATENCY TYPE: RESTRICTED exactly as it is with the
+     * bitmask unset, 8 refusals on 8 PEs every time.  The type is not an
+     * endpoint property at all: cxip_rma_common() picks it per operation and
+     * passes it through cxip_txc_emit_*() and cxip_cmdq_cp_set() to
+     * cxip_cp_get(), where the profile is allocated.  Kept as the record of
+     * that, and because it is the only way in this tree to vary the two
+     * transmit attributes that differ from shmem_transport_ofi_target_ep_init().
      *
      * Bit 0 clears FI_DELIVERY_COMPLETE, which weakens what a put on this
      * context promises, so a run with it set answers whether the class is
@@ -1977,9 +1980,9 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
 
         if (shmem_internal_my_pe == 0) {
             RAISE_WARN_MSG("SHMEM_OFI_COLL_CTX_EP_PROBE=%ld: the collective context's transmit "
-                           "attributes are altered to find which one makes the provider ask for "
-                           "a restricted traffic class%s.  Diagnostic only; read the fabric "
-                           "counters, not the barrier timings\n", probe,
+                           "attributes are altered from the ones this build would otherwise "
+                           "use%s.  Diagnostic only; read the fabric counters, not the barrier "
+                           "timings\n", probe,
                            (probe & 1) ? ", and its puts are no longer delivery-complete" : "");
         }
     }
@@ -2083,18 +2086,21 @@ static int shmem_transport_ofi_stx_pool_init(void)
  * holding two classes at once takes two endpoints.  No bounce buffers: the
  * barrier only sends scalar pSync words.
  *
- * WHETHER THE CLASS IS GRANTED IS DECIDED BY THE ENDPOINT, NOT BY THE ORDER.
- * On CXI this context's class is refused with -22 and remapped to best_effort,
- * and the refusal always reads TYPE: RESTRICTED.  Measured on Perlmutter
- * 2026-09-17, two runs in one allocation and so under one per-job grant: with
- * SHMEM_OFI_COLL_CTX_FIRST this context is opened ahead of the target endpoint
- * and is refused exactly as it is when opened after it, 8 refusals on 8 PEs
- * either way, while the same job's service grants LOW_LATENCY and the same job
- * carried packets on it through the target endpoint.  So a restricted profile
- * is refused on every endpoint but the target one, whatever its ordinal, and
- * the deciding factor is the attributes the endpoint is created with.  The two
- * that differ from the target endpoint's are the two
- * SHMEM_OFI_COLL_CTX_EP_PROBE varies in shmem_transport_ofi_ctx_init.
+ * ON CXI THE CLASS IS REFUSED HERE, AS A (CLASS, TYPE) PAIR.  The refusal is
+ * -22 with TYPE: RESTRICTED, then a remap to best_effort.  Measured on
+ * Perlmutter 2026-09-17, inside single allocations so under one per-job grant:
+ * it is refused whether this context is opened before or after the target
+ * endpoint (SHMEM_OFI_COLL_CTX_FIRST) and whether or not its transmit
+ * attributes are made to match the target endpoint's
+ * (SHMEM_OFI_COLL_CTX_EP_PROBE), 8 refusals on 8 PEs in every arm, while the
+ * same job's service grants LOW_LATENCY and the same job carries tens of
+ * millions of packets on it from the default context.  The provider does not
+ * take the type from the endpoint: cxip_rma_common() derives it per operation
+ * and passes it to cxip_cp_get() by way of cxip_cmdq_cp_set(), whose other
+ * callers, the control-message and domain command-queue paths, pass
+ * CXI_TC_TYPE_DEFAULT.  So what the job grants is (LOW_LATENCY, DEFAULT), and
+ * what an RMA put on a non-default class needs here is (LOW_LATENCY,
+ * RESTRICTED).
  *
  * Called before the target endpoint, this must not touch it.  It does not:
  * ctx_init reuses that endpoint only for the default context, and

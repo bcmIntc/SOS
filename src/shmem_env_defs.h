@@ -135,18 +135,17 @@ SHMEM_INTERNAL_ENV_DEF(OFI_COLL_TCLASS, string, "unspec", SHMEM_INTERNAL_ENV_CAT
 SHMEM_INTERNAL_ENV_DEF(OFI_COLL_CTX_FIRST, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Open the dedicated collective context before the target endpoint, so its "
                        "traffic class is the first one this PE asks for.  Measured on CXI this "
-                       "changes nothing: SHMEM_OFI_COLL_TCLASS is refused on any endpoint but "
-                       "the target one in either order.  Kept because it separates creation "
-                       "order from the endpoint attributes that do decide it, which "
-                       "SHMEM_OFI_COLL_CTX_EP_PROBE varies")
+                       "changes nothing: SHMEM_OFI_COLL_TCLASS is refused in either order.  "
+                       "Kept because it rules creation order out, and because the refusal is "
+                       "the same one SHMEM_OFI_COLL_CTX_EP_PROBE leaves in place")
 SHMEM_INTERNAL_ENV_DEF(OFI_COLL_CTX_EP_PROBE, long, 0, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
-                       "Diagnostic bitmask.  CXI refuses a traffic class on every endpoint but "
-                       "the target one, always as TYPE: RESTRICTED, so the provider picks the "
-                       "profile type from the endpoint's attributes.  This alters the collective "
-                       "context's transmit attributes to match the target endpoint's, one at a "
-                       "time: 1 clears FI_DELIVERY_COMPLETE, 2 narrows tx_attr->caps to "
-                       "FI_RMA|FI_ATOMIC, 3 does both.  Bit 0 weakens what a put on that context "
-                       "promises, so read the fabric counters and not the barrier's timings")
+                       "Diagnostic bitmask.  Alters the collective context's transmit attributes "
+                       "to match the target endpoint's, one at a time: 1 clears "
+                       "FI_DELIVERY_COMPLETE, 2 narrows tx_attr->caps to FI_RMA|FI_ATOMIC, 3 "
+                       "does both.  Measured on CXI none of the three changes the refusal, "
+                       "because the provider derives the profile type per operation and not from "
+                       "the endpoint.  Bit 0 weakens what a put on that context promises, so "
+                       "read the fabric counters and not the barrier's timings")
 #endif
 
 #ifdef USE_UCX
