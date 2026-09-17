@@ -132,6 +132,14 @@ SHMEM_INTERNAL_ENV_DEF(OFI_COLL_TCLASS, string, "unspec", SHMEM_INTERNAL_ENV_CAT
                        "context whether or not SHMEM_OFI_COLL_CONTEXT is set.  When unspec "
                        "(default) the context, if SHMEM_OFI_COLL_CONTEXT created one, requests "
                        "no class of its own and inherits SHMEM_OFI_TCLASS")
+SHMEM_INTERNAL_ENV_DEF(OFI_COLL_CTX_FIRST, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Open the dedicated collective context before the target endpoint, so its "
+                       "traffic class is the first one this PE asks for.  On CXI a PE is granted "
+                       "one communication profile and later endpoints are remapped to "
+                       "best_effort, which is what refuses SHMEM_OFI_COLL_TCLASS in the default "
+                       "order.  With this set the collective class is the one that survives and "
+                       "user data takes the best_effort remap, so SHMEM_OFI_TCLASS cannot hold a "
+                       "class at the same time")
 #endif
 
 #ifdef USE_UCX

@@ -2021,6 +2021,118 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
 }
 
 
+/* The STX pool has two call sites because the collective context can be opened
+ * before the target endpoint, and it allocates an STX like any other context.
+ * Idempotent, so whichever call comes second finds the pool built and returns.
+ * A provider with no STXs leaves the pool NULL and every call is a no-op. */
+static int shmem_transport_ofi_stx_pool_init(void)
+{
+    int i, ret;
+
+    if (shmem_transport_ofi_stx_max <= 0 || shmem_transport_ofi_stx_pool != NULL)
+        return 0;
+
+    shmem_transport_ofi_stx_pool = malloc(shmem_transport_ofi_stx_max *
+                                          sizeof(shmem_transport_ofi_stx_t));
+    if (shmem_transport_ofi_stx_pool == NULL) {
+        RAISE_ERROR_STR("Out of memory when allocating OFI STX pool");
+    }
+
+    for (i = 0; i < shmem_transport_ofi_stx_max; i++) {
+        ret = fi_stx_context(shmem_transport_ofi_domainfd, NULL,
+                             &shmem_transport_ofi_stx_pool[i].stx, NULL);
+        OFI_CHECK_RETURN_MSG(ret, "STX context creation failed (%s)\n", fi_strerror(ret));
+        shmem_transport_ofi_stx_pool[i].ref_cnt = 0;
+        shmem_transport_ofi_stx_pool[i].is_private = 0;
+    }
+
+    return 0;
+}
+
+
+/* Optional dedicated collective context on its own traffic class.  Its
+ * non-default id makes ctx_init take the own-endpoint branch even under
+ * single-endpoint mode, so it gets a transmit endpoint of its own, and the
+ * endpoint is what carries the class: fi_endpoint() reads tx_attr->tclass, so
+ * holding two classes at once takes two endpoints.  No bounce buffers: the
+ * barrier only sends scalar pSync words.
+ *
+ * WHERE THIS IS CALLED FROM DECIDES WHETHER THE CLASS IS GRANTED.  A CXI PE is
+ * granted one communication profile, allocated for whichever endpoint asks
+ * first, and every later endpoint that asks for a restricted class is refused
+ * with -22 and remapped to best_effort.  Measured on Perlmutter 2026-09-17 in
+ * one allocation, so under one per-job grant: the whole-PE class split was
+ * granted with the class on the PE's first endpoint, and refused on every row
+ * where an earlier endpoint existed, including a row that asked for the class
+ * the first endpoint already held.  So in the default order, where the target
+ * endpoint is opened first with SHMEM_OFI_TCLASS, this context is always
+ * refused.  SHMEM_OFI_COLL_CTX_FIRST calls this before the target endpoint
+ * instead, which makes the collective class the one the PE gets and leaves user
+ * data on the best_effort remap.
+ *
+ * Called before the target endpoint, this must not touch it.  It does not:
+ * ctx_init reuses that endpoint only for the default context, and
+ * bind_enable_ep_resources compares against it, which reads as unequal while it
+ * is still NULL and so takes the own-endpoint branch this context needs anyway.
+ * The domain and the AV, which it does need, are both older than either
+ * endpoint.
+ *
+ * On CXI the class can only be per endpoint, because that provider offers no
+ * shared transmit context to bind it to instead: cxip reports
+ * max_ep_stx_ctx == 0 and implements stx_ctx as fi_no_stx_context, so
+ * query_for_fabric() zeroes stx_max and every context here gets stx_idx -1.  A
+ * provider that does hand out STXs shares them by refcount and this context
+ * lands on the default context's, so the caller warns when it does: if such a
+ * provider binds the class to the STX rather than to the endpoint, both
+ * contexts transmit on one class and the split is inert without failing.
+ *
+ * Tripwire for whoever widens this.  The split is BY CONTEXT, and separate
+ * endpoints are separate ordering domains that OpenSHMEM promises nothing
+ * across, so shmem_put_signal's fence cannot order anything against this
+ * context's traffic.  Reclassifying some operations *within* one context would
+ * be a different matter, and two configure flags decide whether that is even
+ * expressible: a fence is path-local, so it orders within a class and not
+ * across one.  USE_FI_FENCE emits a real FI_FENCE and never qualifies;
+ * shmem_transport_fence collapses to put_quiet plus get_wait, which does, only
+ * while WANT_TOTAL_DATA_ORDERING is 0.  Check both before moving any traffic
+ * that a fence rather than a wait is what orders. */
+static int shmem_transport_ofi_coll_ctx_init(void)
+{
+    int ret;
+    char buf[32];
+    /* No class of its own means request the default context's, so the two
+     * endpoints differ in nothing but being two endpoints.  Asking for
+     * FI_TC_UNSPEC here instead would leave the provider free to pick, which is
+     * a second variable in the arm that exists to have only one. */
+    int own_class = (shmem_transport_ofi_coll_tclass != FI_TC_UNSPEC);
+
+    ret = shmem_transport_ofi_stx_pool_init();
+    if (ret != 0) return ret;
+
+    shmem_transport_ctx_coll.team    = &shmem_internal_team_world;
+    shmem_transport_ctx_coll.options = 0;
+    shmem_transport_ctx_coll.stx_idx = -1;
+    shmem_transport_ctx_coll.tclass  = own_class ? shmem_transport_ofi_coll_tclass
+                                                 : shmem_transport_ofi_tclass;
+
+    ret = shmem_transport_ofi_ctx_init(&shmem_transport_ctx_coll, SHMEM_TRANSPORT_CTX_COLL_ID);
+    if (ret != 0) return ret;
+
+    shmem_internal_coll_ctx = (shmem_ctx_t) &shmem_transport_ctx_coll;
+
+    if (shmem_internal_my_pe == 0) {
+        DEBUG_MSG("Dedicated collective context enabled on traffic class %s (0x%x), %s, "
+                  "opened %s the target endpoint\n",
+                  tclass_str(shmem_transport_ctx_coll.tclass, buf, sizeof(buf)),
+                  shmem_transport_ctx_coll.tclass,
+                  own_class ? "its own class" : "the same class as user data",
+                  shmem_internal_params.OFI_COLL_CTX_FIRST ? "before" : "after");
+    }
+
+    return 0;
+}
+
+
 int shmem_transport_init(void)
 {
     int ret = 0;
@@ -2127,6 +2239,28 @@ int shmem_transport_init(void)
 
     shmem_transport_ctx_default.options = SHMEMX_CTX_BOUNCE_BUFFER;
 
+    /* Ahead of the target endpoint, so the collective class is the first one
+     * this PE asks for.  A CXI PE is granted one communication profile and
+     * gives it to the first asker, so the endpoint opened first is the only one
+     * that can hold a class; see shmem_transport_ofi_coll_ctx_init. */
+    if (shmem_transport_ofi_coll_ctx_enabled && shmem_internal_params.OFI_COLL_CTX_FIRST) {
+        /* Only where the provider has no STXs, which is where the knob is for:
+         * the pool is sized in shmem_transport_startup, after SHMEM_OFI_STX_AUTO
+         * has had its say, and this runs earlier.  Opening a context here on a
+         * provider with STXs would build the pool from the pre-AUTO count and
+         * silently give every context fewer STXs than the run asked for. */
+        if (shmem_transport_ofi_stx_max > 0) {
+            if (shmem_internal_my_pe == 0) {
+                RAISE_WARN_STR("Ignoring SHMEM_OFI_COLL_CTX_FIRST: this provider has shared "
+                               "transmit contexts, whose count is not final this early in "
+                               "startup.  The collective context is opened in the usual order");
+            }
+        } else {
+            ret = shmem_transport_ofi_coll_ctx_init();
+            if (ret != 0) return ret;
+        }
+    }
+
     ret = shmem_transport_ofi_target_ep_init();
     if (ret != 0) return ret;
 
@@ -2149,7 +2283,6 @@ int shmem_transport_init(void)
 int shmem_transport_startup(void)
 {
     int ret;
-    int i;
 
     if (shmem_internal_params.OFI_STX_AUTO && shmem_transport_ofi_stx_max == 0) {
         RAISE_WARN_STR("STXs disabled, ignoring request for automatic STX management");
@@ -2193,22 +2326,8 @@ int shmem_transport_startup(void)
         DEBUG_MSG("Auto-set STX max to %ld\n", shmem_transport_ofi_stx_max);
     }
 
-    /* Allocate STX array with max length */
-    if (shmem_transport_ofi_stx_max > 0) {
-        shmem_transport_ofi_stx_pool = malloc(shmem_transport_ofi_stx_max *
-                                              sizeof(shmem_transport_ofi_stx_t));
-        if (shmem_transport_ofi_stx_pool == NULL) {
-            RAISE_ERROR_STR("Out of memory when allocating OFI STX pool");
-        }
-    }
-
-    for (i = 0; i < shmem_transport_ofi_stx_max; i++) {
-        ret = fi_stx_context(shmem_transport_ofi_domainfd, NULL,
-                             &shmem_transport_ofi_stx_pool[i].stx, NULL);
-        OFI_CHECK_RETURN_MSG(ret, "STX context creation failed (%s)\n", fi_strerror(ret));
-        shmem_transport_ofi_stx_pool[i].ref_cnt = 0;
-        shmem_transport_ofi_stx_pool[i].is_private = 0;
-    }
+    ret = shmem_transport_ofi_stx_pool_init();
+    if (ret != 0) return ret;
 
     shmem_transport_ctx_default.team = &shmem_internal_team_world;
     shmem_transport_ctx_default.tclass = shmem_transport_ofi_tclass;
@@ -2216,69 +2335,33 @@ int shmem_transport_startup(void)
     ret = shmem_transport_ofi_ctx_init(&shmem_transport_ctx_default, SHMEM_TRANSPORT_CTX_DEFAULT_ID);
     if (ret != 0) return ret;
 
-    /* Optional dedicated collective context on its own traffic class.  Its
-     * non-default id makes ctx_init take the own-endpoint branch even under
-     * single-endpoint mode, so it gets a transmit endpoint of its own, and the
-     * endpoint is what carries the class: fi_endpoint() reads tx_attr->tclass, so
-     * holding two classes at once takes two endpoints.  No bounce buffers: the
-     * barrier only sends scalar pSync words.
-     *
-     * On CXI the class can only be per endpoint, because that provider offers no
-     * shared transmit context to bind it to instead: cxip reports
-     * max_ep_stx_ctx == 0 and implements stx_ctx as fi_no_stx_context, so
-     * query_for_fabric() above zeroes stx_max and every context here gets
-     * stx_idx -1.  A provider that does hand out STXs shares them by refcount and
-     * this context lands on the default context's, so say so: if such a provider
-     * binds the class to the STX rather than to the endpoint, both contexts
-     * transmit on one class and the split is inert without failing.
-     *
-     * Tripwire for whoever widens this.  The split is BY CONTEXT, and separate
-     * endpoints are separate ordering domains that OpenSHMEM promises nothing
-     * across, so shmem_put_signal's fence cannot order anything against this
-     * context's traffic.  Reclassifying some operations *within* one context
-     * would be a different matter, and two configure flags decide whether that is
-     * even expressible: a fence is path-local, so it orders within a class and not
-     * across one.  USE_FI_FENCE emits a real FI_FENCE and never qualifies;
-     * shmem_transport_fence collapses to put_quiet plus get_wait, which does, only
-     * while WANT_TOTAL_DATA_ORDERING is 0.  Check both before moving any traffic
-     * that a fence rather than a wait is what orders. */
-    if (shmem_transport_ofi_coll_ctx_enabled) {
-        char buf[32];
-        /* No class of its own means request the default context's, so the two
-         * endpoints differ in nothing but being two endpoints.  Asking for
-         * FI_TC_UNSPEC here instead would leave the provider free to pick, which
-         * is a second variable in the arm that exists to have only one. */
-        int own_class = (shmem_transport_ofi_coll_tclass != FI_TC_UNSPEC);
-
-        shmem_transport_ctx_coll.team    = &shmem_internal_team_world;
-        shmem_transport_ctx_coll.options = 0;
-        shmem_transport_ctx_coll.stx_idx = -1;
-        shmem_transport_ctx_coll.tclass  = own_class ? shmem_transport_ofi_coll_tclass
-                                                     : shmem_transport_ofi_tclass;
-
-        ret = shmem_transport_ofi_ctx_init(&shmem_transport_ctx_coll, SHMEM_TRANSPORT_CTX_COLL_ID);
+    /* In the default order, after the target endpoint and the default context.
+     * The class it asks for is refused on CXI from here, since the PE's one
+     * communication profile is already spoken for; SHMEM_OFI_COLL_CTX_FIRST
+     * opens it above instead.  Skipped when that already ran: the context is
+     * created once, and shmem_internal_coll_ctx still aliasing the default
+     * context is what says it has not been. */
+    if (shmem_transport_ofi_coll_ctx_enabled &&
+        shmem_internal_coll_ctx == (shmem_ctx_t) &shmem_transport_ctx_default) {
+        ret = shmem_transport_ofi_coll_ctx_init();
         if (ret != 0) return ret;
+    }
 
-        shmem_internal_coll_ctx = (shmem_ctx_t) &shmem_transport_ctx_coll;
-
-        if (shmem_internal_my_pe == 0) {
-            DEBUG_MSG("Dedicated collective context enabled on traffic class %s (0x%x), %s\n",
-                      tclass_str(shmem_transport_ctx_coll.tclass, buf, sizeof(buf)),
-                      shmem_transport_ctx_coll.tclass,
-                      own_class ? "its own class" : "the same class as user data");
-        }
-
-        if (shmem_internal_my_pe == 0 && own_class &&
-            shmem_transport_ctx_coll.stx_idx >= 0 &&
-            shmem_transport_ctx_coll.stx_idx == shmem_transport_ctx_default.stx_idx) {
-            RAISE_WARN_MSG("Collective traffic class '%s' requested, but this provider shares "
-                           "one transmit context (STX %d) between the collective and default "
-                           "contexts.  If it binds the class to the STX rather than the "
-                           "endpoint, both carry a single class; confirm the split from the "
-                           "fabric counters before reading a result\n",
-                           tclass_str(shmem_transport_ofi_coll_tclass, buf, sizeof(buf)),
-                           shmem_transport_ctx_coll.stx_idx);
-        }
+    /* Here rather than in coll_ctx_init, because it reads the default context's
+     * STX and that context does not exist yet when the collective one is opened
+     * first. */
+    if (shmem_transport_ofi_coll_ctx_enabled && shmem_internal_my_pe == 0 &&
+        shmem_transport_ofi_coll_tclass != FI_TC_UNSPEC &&
+        shmem_transport_ctx_coll.stx_idx >= 0 &&
+        shmem_transport_ctx_coll.stx_idx == shmem_transport_ctx_default.stx_idx) {
+        char buf[32];
+        RAISE_WARN_MSG("Collective traffic class '%s' requested, but this provider shares "
+                       "one transmit context (STX %d) between the collective and default "
+                       "contexts.  If it binds the class to the STX rather than the "
+                       "endpoint, both carry a single class; confirm the split from the "
+                       "fabric counters before reading a result\n",
+                       tclass_str(shmem_transport_ofi_coll_tclass, buf, sizeof(buf)),
+                       shmem_transport_ctx_coll.stx_idx);
     }
 
     ret = atomic_limitations_check();
