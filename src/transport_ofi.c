@@ -1962,12 +1962,12 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
      * changes the traffic-class type CXI refuses.  Measured on Perlmutter
      * 2026-09-17, one allocation, all three settings of the bitmask: the class
      * is refused as TC: LOW_LATENCY TYPE: RESTRICTED exactly as it is with the
-     * bitmask unset, 8 refusals on 8 PEs every time.  The type is not an
-     * endpoint property at all: cxip_rma_common() picks it per operation and
-     * passes it through cxip_txc_emit_*() and cxip_cmdq_cp_set() to
-     * cxip_cp_get(), where the profile is allocated.  Kept as the record of
-     * that, and because it is the only way in this tree to vary the two
-     * transmit attributes that differ from shmem_transport_ofi_target_ep_init().
+     * bitmask unset, 8 refusals on 8 PEs every time.  Neither bit reaches the
+     * test that decides the type: cxip_rma_is_unrestricted() reads the
+     * endpoint's caps and its msg_order, and msg_order is what the fi_endpoint()
+     * call below sets.  Kept as the record of that, and because it is the only
+     * way in this tree to vary the two transmit attributes that differ from
+     * shmem_transport_ofi_target_ep_init().
      *
      * Bit 0 clears FI_DELIVERY_COMPLETE, which weakens what a put on this
      * context promises, so a run with it set answers whether the class is
@@ -2010,8 +2010,33 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
         }
         OFI_CHECK_RETURN_MSG(ret, "cq_open failed (%s)\n", fi_strerror(errno));
 
+        /* CXI grants a traffic class as a (class, type) pair and refuses a
+         * non-default class with the restricted type, so a context asking for a
+         * class of its own has to ask for the unrestricted one.  The provider
+         * picks the type per operation, in cxip_rma_is_unrestricted(): a write
+         * takes the unrestricted path, and with it a CXI_TC_TYPE_DEFAULT
+         * profile, when the transmitting endpoint requests write-after-write
+         * ordering.  That request is the only input this transport controls
+         * which reaches the test on a write.  The target endpoint reaches the
+         * same path by the other input, FI_RMA_EVENT in its caps, and that is
+         * why it holds a class while a context endpoint asking for the same
+         * class is refused.
+         *
+         * Only where the context asks for a class: with FI_TC_UNSPEC the
+         * restricted type is granted already, and a restricted put is cheaper on
+         * the wire and has the larger inject-payload limit.  p_info is shared by
+         * every context, and this is the one attribute here not written on every
+         * call, so it is restored once the endpoint has read it. */
+        uint64_t msg_order = info->p_info->tx_attr->msg_order;
+
+        if (id == SHMEM_TRANSPORT_CTX_COLL_ID && ctx->tclass != FI_TC_UNSPEC &&
+            shmem_internal_params.OFI_COLL_CTX_UNRESTRICTED) {
+            info->p_info->tx_attr->msg_order = msg_order | FI_ORDER_RMA_WAW;
+        }
+
         ret = fi_endpoint(shmem_transport_ofi_domainfd,
                           info->p_info, &ctx->ep, NULL);
+        info->p_info->tx_attr->msg_order = msg_order;
         OFI_CHECK_RETURN_MSG(ret, "ep creation failed (%s)\n", fi_strerror(errno));
     }
 
@@ -2086,21 +2111,29 @@ static int shmem_transport_ofi_stx_pool_init(void)
  * holding two classes at once takes two endpoints.  No bounce buffers: the
  * barrier only sends scalar pSync words.
  *
- * ON CXI THE CLASS IS REFUSED HERE, AS A (CLASS, TYPE) PAIR.  The refusal is
- * -22 with TYPE: RESTRICTED, then a remap to best_effort.  Measured on
- * Perlmutter 2026-09-17, inside single allocations so under one per-job grant:
- * it is refused whether this context is opened before or after the target
- * endpoint (SHMEM_OFI_COLL_CTX_FIRST) and whether or not its transmit
- * attributes are made to match the target endpoint's
+ * ON CXI A CLASS IS GRANTED AS A (CLASS, TYPE) PAIR, and the pair this
+ * context's puts ask for by default is one the job refuses: -22 with
+ * TYPE: RESTRICTED, then a remap to best_effort.  Measured on Perlmutter
+ * 2026-09-17, inside single allocations so under one per-job grant: the refusal
+ * does not move with the order this context is opened in
+ * (SHMEM_OFI_COLL_CTX_FIRST) or with its transmit attributes
  * (SHMEM_OFI_COLL_CTX_EP_PROBE), 8 refusals on 8 PEs in every arm, while the
  * same job's service grants LOW_LATENCY and the same job carries tens of
- * millions of packets on it from the default context.  The provider does not
- * take the type from the endpoint: cxip_rma_common() derives it per operation
- * and passes it to cxip_cp_get() by way of cxip_cmdq_cp_set(), whose other
- * callers, the control-message and domain command-queue paths, pass
- * CXI_TC_TYPE_DEFAULT.  So what the job grants is (LOW_LATENCY, DEFAULT), and
- * what an RMA put on a non-default class needs here is (LOW_LATENCY,
- * RESTRICTED).
+ * millions of packets on it from the default context.  What the job grants is
+ * (LOW_LATENCY, DEFAULT).
+ *
+ * The type is chosen per operation, not held by the endpoint:
+ * cxip_rma_common() calls cxip_rma_is_unrestricted() and passes the result to
+ * cxip_cp_get() by way of cxip_cmdq_cp_set(), whose other callers, the
+ * control-message and domain command-queue paths, pass CXI_TC_TYPE_DEFAULT.  A
+ * write is unrestricted, and so DEFAULT-typed, when the transmitting endpoint's
+ * caps carry FI_RMA_EVENT or its tx_attr requests write-after-write ordering.
+ * The target endpoint has the first, from ENABLE_TARGET_CNTR, and a context
+ * endpoint has neither: that is the whole of the asymmetry, and it is why the
+ * class rides the merged endpoint and is refused on a separate one.  So
+ * ctx_init requests the ordering for this context, under
+ * SHMEM_OFI_COLL_CTX_UNRESTRICTED, which makes the pair it asks for the pair
+ * the job grants.
  *
  * Called before the target endpoint, this must not touch it.  It does not:
  * ctx_init reuses that endpoint only for the default context, and
@@ -2154,11 +2187,16 @@ static int shmem_transport_ofi_coll_ctx_init(void)
 
     if (shmem_internal_my_pe == 0) {
         DEBUG_MSG("Dedicated collective context enabled on traffic class %s (0x%x), %s, "
-                  "opened %s the target endpoint\n",
+                  "opened %s the target endpoint, %s\n",
                   tclass_str(shmem_transport_ctx_coll.tclass, buf, sizeof(buf)),
                   shmem_transport_ctx_coll.tclass,
                   own_class ? "its own class" : "the same class as user data",
-                  shmem_internal_params.OFI_COLL_CTX_FIRST ? "before" : "after");
+                  shmem_internal_params.OFI_COLL_CTX_FIRST ? "before" : "after",
+                  (shmem_transport_ctx_coll.tclass != FI_TC_UNSPEC &&
+                   shmem_internal_params.OFI_COLL_CTX_UNRESTRICTED)
+                      ? "requesting write-after-write ordering so the class is asked for "
+                        "unrestricted"
+                      : "with no ordering request, so on CXI the class is asked for restricted");
     }
 
     return 0;

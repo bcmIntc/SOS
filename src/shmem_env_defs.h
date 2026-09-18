@@ -143,9 +143,17 @@ SHMEM_INTERNAL_ENV_DEF(OFI_COLL_CTX_EP_PROBE, long, 0, SHMEM_INTERNAL_ENV_CAT_TR
                        "to match the target endpoint's, one at a time: 1 clears "
                        "FI_DELIVERY_COMPLETE, 2 narrows tx_attr->caps to FI_RMA|FI_ATOMIC, 3 "
                        "does both.  Measured on CXI none of the three changes the refusal, "
-                       "because the provider derives the profile type per operation and not from "
-                       "the endpoint.  Bit 0 weakens what a put on that context promises, so "
+                       "because neither attribute is one the provider's per-operation type test "
+                       "reads; SHMEM_OFI_COLL_CTX_UNRESTRICTED sets one that it does.  "
+                       "Bit 0 weakens what a put on that context promises, so "
                        "read the fabric counters and not the barrier's timings")
+SHMEM_INTERNAL_ENV_DEF(OFI_COLL_CTX_UNRESTRICTED, bool, true, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Request write-after-write ordering on the dedicated collective context "
+                       "when it carries a traffic class of its own.  On CXI that is what makes "
+                       "its puts take the unrestricted path, and so ask for the class as the "
+                       "(class, default type) pair the job grants, instead of the (class, "
+                       "restricted type) pair it refuses.  Set to 0 to restore the restricted "
+                       "path, which is faster per put but loses the class")
 #endif
 
 #ifdef USE_UCX
