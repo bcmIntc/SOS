@@ -435,6 +435,17 @@ void shmem_transport_probe(void)
                              !shmem_transport_ofi_single_ep);
         if (!shmem_transport_ofi_single_ep && ret == 1)
             RAISE_WARN_STR("Unexpected event");
+
+        /* The dedicated collective context has an endpoint and a completion
+         * queue of its own, so the read above does not progress it.  Under
+         * manual progress that matters: a PE waiting on a peer's phase-2 stamp
+         * spins on this function alone, and the operation it is waiting to have
+         * pushed was issued on that context, so without a read here the barrier
+         * can wait on progress nothing is driving.  Count 0 because no operation
+         * on this context asks for a completion; an error is reported by the
+         * issuing path, which reads the error queue. */
+        if (shmem_transport_ctx_coll.cq != NULL)
+            fi_cq_read(shmem_transport_ctx_coll.cq, (void *)&buf, 0);
 #  ifdef USE_THREAD_COMPLETION
         pthread_mutex_unlock(&shmem_transport_ofi_progress_lock);
     }
