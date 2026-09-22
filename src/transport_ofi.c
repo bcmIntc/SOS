@@ -2039,20 +2039,45 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
          * why it holds a class while a context endpoint asking for the same
          * class is refused.
          *
-         * Only where the context asks for a class: with FI_TC_UNSPEC the
-         * restricted type is granted already, and a restricted put is cheaper on
-         * the wire and has the larger inject-payload limit.  p_info is shared by
+         * Only where the context asks for a class OF ITS OWN: an inherited class
+         * is the default context's, which is granted restricted already, and a
+         * restricted put is cheaper on the wire and has the larger inject-payload
+         * limit.  That is why the test is the collective class knob and not
+         * ctx->tclass, which holds the inherited class too.  p_info is shared by
          * every context, and this is the one attribute here not written on every
-         * call, so it is restored once the endpoint has read it. */
+         * call, so it is restored once the endpoint has read it.
+         *
+         * The bit is added to the fi_info fi_getinfo returned, which asks for
+         * more ordering than the provider agreed to there, so a provider that
+         * re-validates transmit attributes in fi_endpoint() can refuse it:
+         * ofi_check_tx_attr rejects any bit outside what it reported, which is
+         * how verbs, tcp, udp, sockets and psm3 behave.  Retry once without the
+         * bit rather than aborting the job, since on a provider that refuses the
+         * ordering the class either needs no help or cannot be had at all. */
         uint64_t msg_order = info->p_info->tx_attr->msg_order;
+        int want_waw = (id == SHMEM_TRANSPORT_CTX_COLL_ID &&
+                        shmem_transport_ofi_coll_tclass != FI_TC_UNSPEC &&
+                        shmem_internal_params.OFI_COLL_CTX_UNRESTRICTED);
 
-        if (id == SHMEM_TRANSPORT_CTX_COLL_ID && ctx->tclass != FI_TC_UNSPEC &&
-            shmem_internal_params.OFI_COLL_CTX_UNRESTRICTED) {
+        if (want_waw)
             info->p_info->tx_attr->msg_order = msg_order | FI_ORDER_RMA_WAW;
-        }
 
         ret = fi_endpoint(shmem_transport_ofi_domainfd,
                           info->p_info, &ctx->ep, NULL);
+
+        if (ret && want_waw) {
+            info->p_info->tx_attr->msg_order = msg_order;
+            if (shmem_internal_my_pe == 0) {
+                RAISE_WARN_MSG("This provider refused write-after-write ordering on the "
+                               "collective context (%s); opening it without.  On CXI that "
+                               "ordering is what makes the traffic class ask for the pair the "
+                               "job grants, so confirm from the fabric counters that the "
+                               "collective class carried traffic\n", fi_strerror(-ret));
+            }
+            ret = fi_endpoint(shmem_transport_ofi_domainfd,
+                              info->p_info, &ctx->ep, NULL);
+        }
+
         info->p_info->tx_attr->msg_order = msg_order;
         OFI_CHECK_RETURN_MSG(ret, "ep creation failed (%s)\n", fi_strerror(errno));
     }
