@@ -293,6 +293,18 @@ options.
         SHMEM_OFI_COLL_CONTEXT is set; unspec leaves the context, if it was
         created, on the class user data uses.
 
+    SHMEM_OFI_COLL_CTX_THRESHOLD (default: 32)
+        The minimum number of PEs on a node for the dedicated collective context
+        to be created.  Below this count the context measured as a loss rather
+        than a gain, because the barrier's signaling is then most of what the
+        PE's endpoint carries and a second endpoint only divides it; the request
+        is therefore declined and reported on PE 0, and SHMEM_OFI_COLL_TCLASS has
+        nothing to apply to.  Measured at 4 nodes: an 18 percent loss at 8 PEs
+        per node, a 1.47x gain at 32 and 4.10x at 104.  The crossing between 8
+        and 32 is not located, so the default is the lowest count measured to
+        gain.  Set to 0 to create the context at any node size.  The count is
+        this node's, not the job's smallest node.
+
     SHMEM_OFI_COLL_CTX_UNRESTRICTED (default: on)
         Request write-after-write ordering on the dedicated collective context
         when it carries a traffic class of its own.  On CXI this is what makes the

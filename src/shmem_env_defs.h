@@ -131,6 +131,10 @@ SHMEM_INTERNAL_ENV_DEF(OFI_COLL_CTX_EP_PROBE, long, 0, SHMEM_INTERNAL_ENV_CAT_TR
                        "Diagnostic bitmask 0-3 altering the collective context's transmit "
                        "attributes: 1 clears FI_DELIVERY_COMPLETE, 2 narrows tx_attr->caps to "
                        "FI_RMA|FI_ATOMIC.  Clearing delivery-complete can hang the barrier")
+SHMEM_INTERNAL_ENV_DEF(OFI_COLL_CTX_THRESHOLD, long, 32, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Minimum PEs on a node for the dedicated collective context to be created. "
+                       "Below it the context measured as a loss, so it is declined and reported. "
+                       "0 creates it at any node size")
 SHMEM_INTERNAL_ENV_DEF(OFI_COLL_CTX_UNRESTRICTED, bool, true, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Request write-after-write ordering on the dedicated collective context "
                        "when it has a class of its own.  On CXI this is what makes the class it "

@@ -251,6 +251,27 @@ static inline int coll_ctx_requested(void)
             shmem_transport_ofi_coll_tclass != FI_TC_UNSPEC);
 }
 
+/* Is this node big enough for the dedicated collective context to be worth having.
+ * Measured on Perlmutter 2026-09-22, 4 nodes, 8 KB blocking puts from every other rank:
+ * the context is an 18% LOSS at 8 ranks per node with every repeat agreeing, a 1.47x
+ * gain at 32 and 4.10x at 104.  The crossing lies between 8 and 32 and is not located,
+ * so the default is the lowest count measured to gain rather than a guess inside the
+ * gap.  Zero disables the check, which is how an arm measures below the threshold on
+ * purpose.
+ *
+ * This node's rank count and not the job minimum, for two reasons: the job minimum is
+ * computed in shmem_internal_collectives_init, which runs after this, and nothing about
+ * the context needs the job to agree.  It is a transmit context private to one process,
+ * and a peer's phase-2 stamp is the same put whichever context issued it, so a
+ * heterogeneous job can have it on the large nodes and not on the small ones with no
+ * collective seeing an inconsistency. */
+static inline int coll_ctx_ppn_ok(void)
+{
+    long min_ppn = shmem_internal_params.OFI_COLL_CTX_THRESHOLD;
+
+    return min_ppn <= 0 || shmem_runtime_get_node_size() >= min_ppn;
+}
+
 /* Does the dedicated collective context exist.  Distinct from having been asked
  * for, and it is this that teardown and every post-creation check must test: a
  * startup that returned early leaves the context a zeroed global, whose stx_idx
@@ -2243,6 +2264,19 @@ static int shmem_transport_ofi_stx_pool_init(void)
  * provider binds the class to the STX rather than to the endpoint, both
  * contexts transmit on one class and the split is inert without failing.
  *
+ * THE RECEIVE SIDE IS NOT THE SYMMETRIC CASE, and was considered and rejected.  Giving
+ * the barrier an endpoint of its own to RECEIVE on costs what this one does not: a second
+ * address per PE in every peer's address vector, a registered region and key for the pSync
+ * alone, which means segregating collective metadata out of the symmetric heap, a second
+ * target counter against the blocking wait path, and destination selection per operation
+ * in the comms layer, since a sender would have to address the peer's barrier endpoint
+ * rather than its default one.  The measurement does not ask for it either: with this
+ * transmit split in place, the victims on ingress-saturated nodes are FASTER in the tail
+ * than those on egress-saturated ones, p99 19 us against 46 us at 416 PE, so the residual
+ * contention after splitting transmit is still transmit.  Nothing here isolates a receive
+ * endpoint, so if that changes, the experiment to run first is aggressors writing to the
+ * victims, which loads a victim's inbound path while its outbound stays quiet.
+ *
  * Tripwire for whoever widens this.  The split is BY CONTEXT, and separate
  * endpoints are separate ordering domains that OpenSHMEM promises nothing
  * across, so shmem_put_signal's fence cannot order anything against this
@@ -2469,9 +2503,18 @@ int shmem_transport_startup(void)
     /* After the target endpoint and the default context: this context shares
      * their domain, and its STX, where the provider has any, comes from the pool
      * sized above. */
-    if (coll_ctx_requested()) {
+    if (coll_ctx_requested() && coll_ctx_ppn_ok()) {
         ret = shmem_transport_ofi_coll_ctx_init();
         if (ret != 0) return ret;
+    } else if (coll_ctx_requested() && shmem_internal_my_pe == 0) {
+        RAISE_WARN_MSG("This node runs %d PEs, below SHMEM_OFI_COLL_CTX_THRESHOLD=%ld, so the "
+                       "dedicated collective context is NOT created and SHMEM_OFI_COLL_TCLASS, "
+                       "if set, has nothing to apply to.  The context is a measured loss at a "
+                       "low rank count per node, where the barrier's signaling is most of what "
+                       "the endpoint carries and a second endpoint only splits it.  Set the "
+                       "threshold to 0 to create it anyway\n",
+                       shmem_runtime_get_node_size(),
+                       shmem_internal_params.OFI_COLL_CTX_THRESHOLD);
     }
 
     /* Here rather than in coll_ctx_init, because it compares against the default
