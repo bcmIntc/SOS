@@ -120,34 +120,21 @@ SHMEM_INTERNAL_ENV_DEF(OFI_TCLASS, string, "unspec", SHMEM_INTERNAL_ENV_CAT_TRAN
                        "best_effort, low_latency, dedicated_access, bulk_data, scavenger, "
                        "network_ctrl, or dscp:N (N = 0-63)")
 SHMEM_INTERNAL_ENV_DEF(OFI_COLL_CONTEXT, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
-                       "Give the hierarchical barrier's internode pSync puts a dedicated "
-                       "internal context, one extra transmit endpoint per PE, on the same "
-                       "traffic class as user data.  Separates the barrier's queueing from the "
-                       "class it runs on: this knob alone changes no class, and "
-                       "SHMEM_OFI_COLL_TCLASS also implies it")
+                       "Queue the hierarchical barrier's internode signaling on a dedicated "
+                       "internal context, one more transmit endpoint per PE.  Changes no "
+                       "traffic class; SHMEM_OFI_COLL_TCLASS implies it")
 SHMEM_INTERNAL_ENV_DEF(OFI_COLL_TCLASS, string, "unspec", SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
-                       "Traffic class for the dedicated collective context, separate from the "
-                       "class SHMEM_OFI_TCLASS gives user data.  Same options as "
-                       "SHMEM_OFI_TCLASS.  Setting it to anything but unspec creates the "
-                       "context whether or not SHMEM_OFI_COLL_CONTEXT is set.  When unspec "
-                       "(default) the context, if SHMEM_OFI_COLL_CONTEXT created one, requests "
-                       "no class of its own and inherits SHMEM_OFI_TCLASS")
+                       "Traffic class for the dedicated collective context, values as "
+                       "SHMEM_OFI_TCLASS.  Any value but unspec creates that context; unspec "
+                       "leaves it on the class user data uses")
 SHMEM_INTERNAL_ENV_DEF(OFI_COLL_CTX_EP_PROBE, long, 0, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
-                       "Diagnostic bitmask.  Alters the collective context's transmit attributes "
-                       "to match the target endpoint's, one at a time: 1 clears "
-                       "FI_DELIVERY_COMPLETE, 2 narrows tx_attr->caps to FI_RMA|FI_ATOMIC, 3 "
-                       "does both.  Measured on CXI none of the three changes the refusal, "
-                       "because neither attribute is one the provider's per-operation type test "
-                       "reads; SHMEM_OFI_COLL_CTX_UNRESTRICTED sets one that it does.  "
-                       "Bit 0 weakens what a put on that context promises, so "
-                       "read the fabric counters and not the barrier's timings")
+                       "Diagnostic bitmask 0-3 altering the collective context's transmit "
+                       "attributes: 1 clears FI_DELIVERY_COMPLETE, 2 narrows tx_attr->caps to "
+                       "FI_RMA|FI_ATOMIC.  Clearing delivery-complete can hang the barrier")
 SHMEM_INTERNAL_ENV_DEF(OFI_COLL_CTX_UNRESTRICTED, bool, true, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Request write-after-write ordering on the dedicated collective context "
-                       "when it carries a traffic class of its own.  On CXI that is what makes "
-                       "its puts take the unrestricted path, and so ask for the class as the "
-                       "(class, default type) pair the job grants, instead of the (class, "
-                       "restricted type) pair it refuses.  Set to 0 to restore the restricted "
-                       "path, which is faster per put but loses the class")
+                       "when it has a class of its own.  On CXI this is what makes the class it "
+                       "asks for one the job grants.  Off restores the cheaper restricted path")
 #endif
 
 #ifdef USE_UCX

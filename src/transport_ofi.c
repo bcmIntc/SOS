@@ -1518,15 +1518,26 @@ uint32_t parse_tclass(const char *name)
     if (0 == strcmp(name, "network_ctrl"))     return FI_TC_NETWORK_CTRL;
 
     if (0 == strncmp(name, "dscp:", 5)) {
+        const char *digits = name + 5;
         char *end;
-        long dscp = strtol(name + 5, &end, 0);
-        if (*end == '\0' && dscp >= 0 && dscp <= 63)
+        /* Base 10, so dscp:010 is 10 and not octal 8.  The value has to start
+         * with a digit, which rejects both an empty suffix and the leading
+         * whitespace and sign strtol would otherwise accept: strtol("") returns 0
+         * with *end == '\0', so a missing value would read as a request for
+         * DSCP 0.  That is a real class, so it would be selected silently rather
+         * than falling back to unspec. */
+        long dscp = strtol(digits, &end, 10);
+        if (*digits >= '0' && *digits <= '9' && *end == '\0' && dscp >= 0 && dscp <= 63)
             return fi_tc_dscp_set((uint8_t) dscp);
-        RAISE_WARN_MSG("Ignoring bad DSCP traffic class '%s', DSCP must be 0-63\n", name);
+        /* PE 0 only: every PE parses the same setting, so the rest would add
+         * nothing but one stderr line each. */
+        if (shmem_internal_my_pe == 0)
+            RAISE_WARN_MSG("Ignoring bad DSCP traffic class '%s', DSCP must be 0-63\n", name);
         return FI_TC_UNSPEC;
     }
 
-    RAISE_WARN_MSG("Ignoring bad traffic class '%s', using provider default\n", name);
+    if (shmem_internal_my_pe == 0)
+        RAISE_WARN_MSG("Ignoring bad traffic class '%s', using provider default\n", name);
     return FI_TC_UNSPEC;
 }
 
@@ -1564,10 +1575,19 @@ const char *tclass_str(uint32_t tclass, char *buf, size_t len)
  * it cannot support.  So only a different, non-UNSPEC class is evidence of a
  * downgrade; treating UNSPEC as a refusal warns on every domain of a healthy run.
  *
+ * Only domains this job can select are surveyed.  SHMEM_OFI_FABRIC and
+ * SHMEM_OFI_DOMAIN restrict that set below, and a domain the filter excludes
+ * carries none of this job's traffic, so reporting it as a mixed class
+ * contradicts the configuration that excluded it.  Every traffic-class arm here
+ * pins one NIC, so the unfiltered survey warned on precisely the runs that were
+ * pinned correctly.
+ *
  * Walk the list before the multirail selection below splices its next pointers. */
 static inline
-void survey_tclass(struct fi_info *fabrics)
+void survey_tclass(struct fabric_info *info)
 {
+    struct fi_info *fabrics = info->fabrics;
+
     if (shmem_transport_ofi_tclass == FI_TC_UNSPEC || shmem_internal_my_pe != 0)
         return;
 
@@ -1583,6 +1603,14 @@ void survey_tclass(struct fi_info *fabrics)
         const char *domain = cur->domain_attr->name;
         uint32_t reported = cur->tx_attr->tclass;
 
+        /* The same filter the selection below applies. */
+        if (info->fabric_name != NULL &&
+            fnmatch(info->fabric_name, cur->fabric_attr->name, 0) != 0)
+            continue;
+        if (info->domain_name != NULL &&
+            fnmatch(info->domain_name, domain, 0) != 0)
+            continue;
+
         num_domains++;
 
         DEBUG_MSG("Traffic class on domain %s: reported %s (0x%x), requested %s (0x%x)\n",
@@ -1591,20 +1619,23 @@ void survey_tclass(struct fi_info *fabrics)
 
         if (reported == FI_TC_UNSPEC) {
             num_silent++;
-        } else if (reported != shmem_transport_ofi_tclass && off < sizeof(downgraded) - 1) {
+        } else if (reported != shmem_transport_ofi_tclass) {
+            /* Counted whether or not it fits: the count is the part of the
+             * message that has to be exact, and only the name list truncates. */
             num_downgraded++;
-            off += snprintf(downgraded + off, sizeof(downgraded) - off, "%s%s",
-                            num_downgraded > 1 ? ", " : "", domain);
+            if (off < sizeof(downgraded) - 1)
+                off += snprintf(downgraded + off, sizeof(downgraded) - off, "%s%s",
+                                num_downgraded > 1 ? ", " : "", domain);
         }
     }
 
     if (num_downgraded > 0)
-        RAISE_WARN_MSG("Traffic class '%s' downgraded on %d domain(s): %s.  Traffic on "
-                       "those NICs uses a different class, so a measurement taken now "
-                       "mixes classes.\n",
+        RAISE_WARN_MSG("Traffic class '%s' downgraded on %d selectable domain(s): %s.  The "
+                       "PEs assigned to those NICs transmit on a different class, so a "
+                       "measurement over the job mixes classes.\n",
                        requested, num_downgraded, downgraded);
 
-    if (num_silent == num_domains)
+    if (num_domains > 0 && num_silent == num_domains)
         DEBUG_MSG("Traffic class '%s' requested; provider reports no class per domain, so "
                   "the request cannot be confirmed here.  Endpoint creation would fail on "
                   "an unsupported class, so treat startup success as acceptance and "
@@ -1615,9 +1646,12 @@ void survey_tclass(struct fi_info *fabrics)
 /* Report the traffic class the domain this PE selected reports back.  Checked on
  * every PE, not just PE 0: with multiple NICs per node the PE-to-domain mapping
  * varies, so a class downgraded on one device would otherwise look clean on PE 0
- * while some PEs silently transmit on another class.  A downgrade is a real
- * configuration error, so it warns from each affected PE even though that is
- * verbose at high PPN; survey_tclass() above names the domains once.
+ * while some PEs silently transmit on another class.  Only PE 0 warns, because
+ * survey_tclass() above already names every selectable domain that reports a
+ * downgrade, so a per-PE warning repeats what the reader has and costs one
+ * stderr line per PE: at the PPN and node count this project targets that is
+ * about 10^5 serialized lines, enough to stall the job it is reporting on.  The
+ * other PEs record the same line for a debug run.
  *
  * As in survey_tclass(), a reported FI_TC_UNSPEC means the provider does not fill
  * the field in and says nothing about whether the request took effect. */
@@ -1638,11 +1672,19 @@ void report_tclass(struct fabric_info *info)
                       tclass_str(shmem_transport_ofi_tclass, req_buf, sizeof(req_buf)),
                       shmem_transport_ofi_tclass, info->p_info->domain_attr->name);
     } else if (reported != shmem_transport_ofi_tclass) {
-        RAISE_WARN_MSG("Requested traffic class '%s' (0x%x) downgraded on domain %s, "
-                       "provider using '%s' (0x%x)\n",
-                       tclass_str(shmem_transport_ofi_tclass, req_buf, sizeof(req_buf)),
-                       shmem_transport_ofi_tclass, info->p_info->domain_attr->name,
-                       tclass_str(reported, got_buf, sizeof(got_buf)), reported);
+        if (shmem_internal_my_pe == 0) {
+            RAISE_WARN_MSG("Requested traffic class '%s' (0x%x) downgraded on domain %s, "
+                           "provider using '%s' (0x%x)\n",
+                           tclass_str(shmem_transport_ofi_tclass, req_buf, sizeof(req_buf)),
+                           shmem_transport_ofi_tclass, info->p_info->domain_attr->name,
+                           tclass_str(reported, got_buf, sizeof(got_buf)), reported);
+        } else {
+            DEBUG_MSG("Requested traffic class '%s' (0x%x) downgraded on domain %s, "
+                      "provider using '%s' (0x%x)\n",
+                      tclass_str(shmem_transport_ofi_tclass, req_buf, sizeof(req_buf)),
+                      shmem_transport_ofi_tclass, info->p_info->domain_attr->name,
+                      tclass_str(reported, got_buf, sizeof(got_buf)), reported);
+        }
     } else {
         DEBUG_MSG("Traffic class: %s (0x%x) on domain %s\n",
                   tclass_str(reported, got_buf, sizeof(got_buf)), reported,
@@ -1739,7 +1781,7 @@ int query_for_fabric(struct fabric_info *info)
                               "(provider=%s)\n",
                               info->prov_name != NULL ? info->prov_name : "<auto>");
 
-    survey_tclass(info->fabrics);
+    survey_tclass(info);
 
     /* If the user supplied a fabric or domain name, use it to select the
      * fabrics that may be chosen. Otherwise, consider all available
@@ -1992,15 +2034,34 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
     if (id == SHMEM_TRANSPORT_CTX_COLL_ID && shmem_internal_params.OFI_COLL_CTX_EP_PROBE) {
         long probe = shmem_internal_params.OFI_COLL_CTX_EP_PROBE;
 
+        /* Range checked, because every value outside it alters nothing while the
+         * warning below still reports an altered endpoint, which would record an
+         * arm that never ran.  A negative value would also set bit 0 without the
+         * reader having asked for it. */
+        if (probe < 0 || probe > 3) {
+            if (shmem_internal_my_pe == 0) {
+                RAISE_WARN_MSG("Ignoring SHMEM_OFI_COLL_CTX_EP_PROBE=%ld, which is outside "
+                               "0-3.  The collective context's transmit attributes are "
+                               "unaltered\n", probe);
+            }
+            probe = 0;
+        }
+
         if (probe & 1) info->p_info->tx_attr->op_flags = 0;
         if (probe & 2) info->p_info->tx_attr->caps = FI_RMA | FI_ATOMIC;
 
-        if (shmem_internal_my_pe == 0) {
+        if (probe && shmem_internal_my_pe == 0) {
             RAISE_WARN_MSG("SHMEM_OFI_COLL_CTX_EP_PROBE=%ld: the collective context's transmit "
                            "attributes are altered from the ones this build would otherwise "
                            "use%s.  Diagnostic only; read the fabric counters, not the barrier "
                            "timings\n", probe,
-                           (probe & 1) ? ", and its puts are no longer delivery-complete" : "");
+                           (probe & 1)
+                               ? ", and bit 0 drops FI_DELIVERY_COMPLETE, which voids the "
+                                 "invariant the hierarchical barrier's phase 2 rests on: its "
+                                 "quiet then retires a stamp on local transmit rather than "
+                                 "remote delivery, so a slot can regress and a barrier can "
+                                 "hang or release on a stale stamp"
+                               : "");
         }
     }
 
@@ -2416,16 +2477,17 @@ int shmem_transport_startup(void)
     /* Here rather than in coll_ctx_init, because it compares against the default
      * context's STX. */
     if (coll_ctx_created() && shmem_internal_my_pe == 0 &&
-        shmem_transport_ofi_coll_tclass != FI_TC_UNSPEC &&
         shmem_transport_ctx_coll.stx_idx >= 0 &&
         shmem_transport_ctx_coll.stx_idx == shmem_transport_ctx_default.stx_idx) {
         char buf[32];
-        RAISE_WARN_MSG("Collective traffic class '%s' requested, but this provider shares "
-                       "one transmit context (STX %d) between the collective and default "
-                       "contexts.  If it binds the class to the STX rather than the "
-                       "endpoint, both carry a single class; confirm the split from the "
-                       "fabric counters before reading a result\n",
-                       tclass_str(shmem_transport_ofi_coll_tclass, buf, sizeof(buf)),
+        RAISE_WARN_MSG("The dedicated collective context (traffic class '%s') shares one "
+                       "transmit context (STX %d) with the default context on this "
+                       "provider, so both endpoints queue through the same transmit "
+                       "resource and the separate queueing this context is for does not "
+                       "happen.  If the provider also binds the traffic class to the STX "
+                       "rather than the endpoint, both carry a single class.  Confirm the "
+                       "split from the fabric counters before reading a result\n",
+                       tclass_str(shmem_transport_ctx_coll.tclass, buf, sizeof(buf)),
                        shmem_transport_ctx_coll.stx_idx);
     }
 

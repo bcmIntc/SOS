@@ -272,6 +272,43 @@ options.
         parameter, each PE consumes another endpoint for each OpenSHMEM user
         context that is created.
 
+    SHMEM_OFI_TCLASS (default: unspec)
+        The traffic class requested for transmit operations.  Accepted values are
+        unspec, best_effort, low_latency, dedicated_access, bulk_data, scavenger,
+        network_ctrl, and dscp:N for a DSCP value N of 0-63.  The class is
+        requested through the fi_getinfo hints and reasserted on the endpoint;
+        providers and fabrics differ in which classes they grant, and a class the
+        fabric withholds is reported at startup.
+
+    SHMEM_OFI_COLL_CONTEXT (default: off)
+        Give the hierarchical barrier's internode pSync puts a dedicated internal
+        context, which costs one additional transmit endpoint per PE, so that the
+        barrier's signaling queues separately from user data.  This parameter
+        changes no traffic class on its own.  SHMEM_OFI_COLL_TCLASS implies it.
+
+    SHMEM_OFI_COLL_TCLASS (default: unspec)
+        The traffic class for that dedicated collective context, separate from the
+        class SHMEM_OFI_TCLASS gives user data.  Accepts the same values as
+        SHMEM_OFI_TCLASS.  Any value but unspec creates the context whether or not
+        SHMEM_OFI_COLL_CONTEXT is set; unspec leaves the context, if it was
+        created, on the class user data uses.
+
+    SHMEM_OFI_COLL_CTX_UNRESTRICTED (default: on)
+        Request write-after-write ordering on the dedicated collective context
+        when it carries a traffic class of its own.  On CXI this is what makes the
+        context ask for the (class, type) pair the job grants rather than one it
+        refuses.  Disabling it restores the cheaper restricted path, which on that
+        fabric loses the class.  A provider that refuses the ordering outright is
+        reported at startup and the context is opened without it.
+
+    SHMEM_OFI_COLL_CTX_EP_PROBE (default: 0)
+        Diagnostic bitmask, 0-3, that alters the dedicated collective context's
+        transmit attributes: 1 clears FI_DELIVERY_COMPLETE, 2 narrows the transmit
+        capabilities to FI_RMA|FI_ATOMIC, 3 does both.  Clearing
+        FI_DELIVERY_COMPLETE, so values 1 and 3, voids the ordering the
+        hierarchical barrier depends on and such a run can hang; read the fabric
+        counters from it, never its barrier timings.
+
   Team Environment variables:
 
     SHMEM_TEAMS_MAX (default: 10)
