@@ -118,14 +118,13 @@ int shmem_transport_ofi_single_ep;
 
 static uint32_t shmem_transport_ofi_tclass;
 
-/* Traffic class for the optional dedicated collective context, and whether that
- * context was created.  Enabled by SHMEM_OFI_COLL_CONTEXT, and by
- * SHMEM_OFI_COLL_TCLASS resolving to a class other than FI_TC_UNSPEC, since a
- * class for the context is not expressible without the context.  The class is
- * FI_TC_UNSPEC when only the context was asked for, and then the collective
- * endpoint requests no class and carries whatever SHMEM_OFI_TCLASS carries. */
+/* Traffic class for the optional dedicated collective context.  The context is
+ * asked for by SHMEM_OFI_COLL_CONTEXT, and by SHMEM_OFI_COLL_TCLASS resolving to
+ * a class other than FI_TC_UNSPEC, since a class for the context is not
+ * expressible without the context.  The class is FI_TC_UNSPEC when only the
+ * context was asked for, and then the collective endpoint requests no class and
+ * carries whatever SHMEM_OFI_TCLASS carries. */
 static uint32_t shmem_transport_ofi_coll_tclass;
-static int      shmem_transport_ofi_coll_ctx_enabled;
 
 #ifdef ENABLE_OFI_CXI_PCIE_AMO
 bool shmem_transport_ofi_is_cxi;
@@ -242,6 +241,24 @@ shmem_ctx_t SHMEM_CTX_DEFAULT = (shmem_ctx_t) &shmem_transport_ctx_default;
 #define SHMEM_TRANSPORT_CTX_COLL_ID -2
 shmem_transport_ctx_t shmem_transport_ctx_coll;
 shmem_ctx_t shmem_internal_coll_ctx = (shmem_ctx_t) &shmem_transport_ctx_default;
+
+/* Was the dedicated collective context asked for.  Derived from the parameters
+ * rather than cached, so it cannot disagree with them.  Valid once
+ * shmem_transport_ofi_coll_tclass has been parsed in shmem_transport_init. */
+static inline int coll_ctx_requested(void)
+{
+    return (shmem_internal_params.OFI_COLL_CONTEXT ||
+            shmem_transport_ofi_coll_tclass != FI_TC_UNSPEC);
+}
+
+/* Does the dedicated collective context exist.  Distinct from having been asked
+ * for, and it is this that teardown and every post-creation check must test: a
+ * startup that returned early leaves the context a zeroed global, whose stx_idx
+ * of 0 reads as a valid pool index. */
+static inline int coll_ctx_created(void)
+{
+    return shmem_internal_coll_ctx != (shmem_ctx_t) &shmem_transport_ctx_default;
+}
 
 size_t SHMEM_Dtsize[FI_DATATYPE_LAST];
 
@@ -2112,15 +2129,11 @@ static int shmem_transport_ofi_stx_pool_init(void)
  * barrier only sends scalar pSync words.
  *
  * ON CXI A CLASS IS GRANTED AS A (CLASS, TYPE) PAIR, and the pair this
- * context's puts ask for by default is one the job refuses: -22 with
- * TYPE: RESTRICTED, then a remap to best_effort.  Measured on Perlmutter
- * 2026-09-17, inside single allocations so under one per-job grant: the refusal
- * does not move with the order this context is opened in
- * (SHMEM_OFI_COLL_CTX_FIRST) or with its transmit attributes
- * (SHMEM_OFI_COLL_CTX_EP_PROBE), 8 refusals on 8 PEs in every arm, while the
- * same job's service grants LOW_LATENCY and the same job carries tens of
- * millions of packets on it from the default context.  What the job grants is
- * (LOW_LATENCY, DEFAULT).
+ * context's puts would ask for without the ordering request below is one the job
+ * refuses: -22 with TYPE: RESTRICTED, then a remap to best_effort, while the
+ * same job's service grants LOW_LATENCY and carries tens of millions of packets
+ * on it from the default context.  What the job grants is (LOW_LATENCY,
+ * DEFAULT).
  *
  * The type is chosen per operation, not held by the endpoint:
  * cxip_rma_common() calls cxip_rma_is_unrestricted() and passes the result to
@@ -2134,13 +2147,6 @@ static int shmem_transport_ofi_stx_pool_init(void)
  * ctx_init requests the ordering for this context, under
  * SHMEM_OFI_COLL_CTX_UNRESTRICTED, which makes the pair it asks for the pair
  * the job grants.
- *
- * Called before the target endpoint, this must not touch it.  It does not:
- * ctx_init reuses that endpoint only for the default context, and
- * bind_enable_ep_resources compares against it, which reads as unequal while it
- * is still NULL and so takes the own-endpoint branch this context needs anyway.
- * The domain and the AV, which it does need, are both older than either
- * endpoint.
  *
  * On CXI the class can only be per endpoint, because that provider offers no
  * shared transmit context to bind it to instead: cxip reports
@@ -2171,9 +2177,6 @@ static int shmem_transport_ofi_coll_ctx_init(void)
      * a second variable in the arm that exists to have only one. */
     int own_class = (shmem_transport_ofi_coll_tclass != FI_TC_UNSPEC);
 
-    ret = shmem_transport_ofi_stx_pool_init();
-    if (ret != 0) return ret;
-
     shmem_transport_ctx_coll.team    = &shmem_internal_team_world;
     shmem_transport_ctx_coll.options = 0;
     shmem_transport_ctx_coll.stx_idx = -1;
@@ -2186,14 +2189,11 @@ static int shmem_transport_ofi_coll_ctx_init(void)
     shmem_internal_coll_ctx = (shmem_ctx_t) &shmem_transport_ctx_coll;
 
     if (shmem_internal_my_pe == 0) {
-        DEBUG_MSG("Dedicated collective context enabled on traffic class %s (0x%x), %s, "
-                  "opened %s the target endpoint, %s\n",
+        DEBUG_MSG("Dedicated collective context enabled on traffic class %s (0x%x), %s, %s\n",
                   tclass_str(shmem_transport_ctx_coll.tclass, buf, sizeof(buf)),
                   shmem_transport_ctx_coll.tclass,
                   own_class ? "its own class" : "the same class as user data",
-                  shmem_internal_params.OFI_COLL_CTX_FIRST ? "before" : "after",
-                  (shmem_transport_ctx_coll.tclass != FI_TC_UNSPEC &&
-                   shmem_internal_params.OFI_COLL_CTX_UNRESTRICTED)
+                  (own_class && shmem_internal_params.OFI_COLL_CTX_UNRESTRICTED)
                       ? "requesting write-after-write ordering so the class is asked for "
                         "unrestricted"
                       : "with no ordering request, so on CXI the class is asked for restricted");
@@ -2253,12 +2253,9 @@ int shmem_transport_init(void)
      * through the fi_getinfo hints */
     shmem_transport_ofi_tclass = parse_tclass(shmem_internal_params.OFI_TCLASS);
 
-    /* Either knob creates the dedicated collective context; only the class knob
-     * gives it a class of its own. */
+    /* Either knob creates the dedicated collective context (see
+     * coll_ctx_requested); only the class knob gives it a class of its own. */
     shmem_transport_ofi_coll_tclass = parse_tclass(shmem_internal_params.OFI_COLL_TCLASS);
-    shmem_transport_ofi_coll_ctx_enabled =
-        (shmem_internal_params.OFI_COLL_CONTEXT ||
-         shmem_transport_ofi_coll_tclass != FI_TC_UNSPEC);
 
     ret = query_for_fabric(&shmem_transport_ofi_info);
     if (ret != 0) return ret;
@@ -2308,29 +2305,6 @@ int shmem_transport_init(void)
 #endif
 
     shmem_transport_ctx_default.options = SHMEMX_CTX_BOUNCE_BUFFER;
-
-    /* Ahead of the target endpoint, so the collective class is the first one
-     * this PE asks for.  Measured on CXI this changes nothing, since the class
-     * is refused on any endpoint but the target one in either order; the knob
-     * is what isolates the ordinal from the endpoint's attributes.  See
-     * shmem_transport_ofi_coll_ctx_init. */
-    if (shmem_transport_ofi_coll_ctx_enabled && shmem_internal_params.OFI_COLL_CTX_FIRST) {
-        /* Only where the provider has no STXs, which is where the knob is for:
-         * the pool is sized in shmem_transport_startup, after SHMEM_OFI_STX_AUTO
-         * has had its say, and this runs earlier.  Opening a context here on a
-         * provider with STXs would build the pool from the pre-AUTO count and
-         * silently give every context fewer STXs than the run asked for. */
-        if (shmem_transport_ofi_stx_max > 0) {
-            if (shmem_internal_my_pe == 0) {
-                RAISE_WARN_STR("Ignoring SHMEM_OFI_COLL_CTX_FIRST: this provider has shared "
-                               "transmit contexts, whose count is not final this early in "
-                               "startup.  The collective context is opened in the usual order");
-            }
-        } else {
-            ret = shmem_transport_ofi_coll_ctx_init();
-            if (ret != 0) return ret;
-        }
-    }
 
     ret = shmem_transport_ofi_target_ep_init();
     if (ret != 0) return ret;
@@ -2406,21 +2380,17 @@ int shmem_transport_startup(void)
     ret = shmem_transport_ofi_ctx_init(&shmem_transport_ctx_default, SHMEM_TRANSPORT_CTX_DEFAULT_ID);
     if (ret != 0) return ret;
 
-    /* In the default order, after the target endpoint and the default context.
-     * SHMEM_OFI_COLL_CTX_FIRST opens it above instead.  Skipped when that
-     * already ran: the context is
-     * created once, and shmem_internal_coll_ctx still aliasing the default
-     * context is what says it has not been. */
-    if (shmem_transport_ofi_coll_ctx_enabled &&
-        shmem_internal_coll_ctx == (shmem_ctx_t) &shmem_transport_ctx_default) {
+    /* After the target endpoint and the default context: this context shares
+     * their domain, and its STX, where the provider has any, comes from the pool
+     * sized above. */
+    if (coll_ctx_requested()) {
         ret = shmem_transport_ofi_coll_ctx_init();
         if (ret != 0) return ret;
     }
 
-    /* Here rather than in coll_ctx_init, because it reads the default context's
-     * STX and that context does not exist yet when the collective one is opened
-     * first. */
-    if (shmem_transport_ofi_coll_ctx_enabled && shmem_internal_my_pe == 0 &&
+    /* Here rather than in coll_ctx_init, because it compares against the default
+     * context's STX. */
+    if (coll_ctx_created() && shmem_internal_my_pe == 0 &&
         shmem_transport_ofi_coll_tclass != FI_TC_UNSPEC &&
         shmem_transport_ctx_coll.stx_idx >= 0 &&
         shmem_transport_ctx_coll.stx_idx == shmem_transport_ctx_default.stx_idx) {
@@ -2638,7 +2608,7 @@ int shmem_transport_fini(void)
      * contexts array, so it is torn down here.  It owns its own endpoint, CQ and
      * counters (its id is not the default id), so ctx_destroy closes them all in
      * place; nothing about it is deferred to the target-endpoint teardown below. */
-    if (shmem_transport_ofi_coll_ctx_enabled) {
+    if (coll_ctx_created()) {
         shmem_transport_quiet(&shmem_transport_ctx_coll);
         shmem_transport_ctx_destroy(&shmem_transport_ctx_coll);
     }

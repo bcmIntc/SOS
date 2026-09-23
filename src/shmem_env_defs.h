@@ -132,12 +132,6 @@ SHMEM_INTERNAL_ENV_DEF(OFI_COLL_TCLASS, string, "unspec", SHMEM_INTERNAL_ENV_CAT
                        "context whether or not SHMEM_OFI_COLL_CONTEXT is set.  When unspec "
                        "(default) the context, if SHMEM_OFI_COLL_CONTEXT created one, requests "
                        "no class of its own and inherits SHMEM_OFI_TCLASS")
-SHMEM_INTERNAL_ENV_DEF(OFI_COLL_CTX_FIRST, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
-                       "Open the dedicated collective context before the target endpoint, so its "
-                       "traffic class is the first one this PE asks for.  Measured on CXI this "
-                       "changes nothing: SHMEM_OFI_COLL_TCLASS is refused in either order.  "
-                       "Kept because it rules creation order out, and because the refusal is "
-                       "the same one SHMEM_OFI_COLL_CTX_EP_PROBE leaves in place")
 SHMEM_INTERNAL_ENV_DEF(OFI_COLL_CTX_EP_PROBE, long, 0, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Diagnostic bitmask.  Alters the collective context's transmit attributes "
                        "to match the target endpoint's, one at a time: 1 clears "
