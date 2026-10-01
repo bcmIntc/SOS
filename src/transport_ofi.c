@@ -2517,6 +2517,39 @@ int shmem_transport_startup(void)
                        shmem_internal_params.OFI_COLL_CTX_THRESHOLD);
     }
 
+    /* A warning and not a refusal, and the asymmetry in the evidence is the reason.
+     *
+     * On Borealis this combination cancels the context: with SHMEM_OFI_DISABLE_SINGLE_EP
+     * set, the context is worth 1.00x to 1.01x against its own control in all five
+     * completed arms of sos/borealis/2026-09-29.bv_borealis, where the context alone is
+     * worth 1.28x to 13.72x depending on rail count and load shape.  On Perlmutter the
+     * opposite: every published arm of sos/perlmutter/2026-09-22.bv_final_conf sets this
+     * knob, and 4.10x at PPN 104 is measured WITH it.  Neither machine has run the
+     * other's cell, so a refusal would break a configuration that demonstrably works on
+     * one of the two machines, and silence would let the other lose the whole feature
+     * with both knobs reporting themselves enabled and nothing saying so.
+     *
+     * Mechanism unexplained.  Shared transmit contexts are ruled out: CXI reports
+     * max_ep_stx_ctx 0, stx_max is forced to 0 above, both contexts sit at stx_idx -1,
+     * and the STX warning below therefore cannot fire here.  So the two endpoints really
+     * are separate queues in both configurations.  A warning does not need the
+     * mechanism; it needs the reader to measure rather than assume. */
+    if (coll_ctx_created() && shmem_internal_params.OFI_DISABLE_SINGLE_EP &&
+        shmem_internal_my_pe == 0) {
+        RAISE_WARN_STR("SHMEM_OFI_COLL_CONTEXT and SHMEM_OFI_DISABLE_SINGLE_EP are both "
+                       "set, and what that combination is worth differs by machine.  "
+                       "Measured on Borealis it CANCELS the dedicated collective "
+                       "context: 1.00x to 1.01x against the same arm's control in five "
+                       "of five arms, where the context on its own is worth 1.28x to "
+                       "13.72x.  Measured on Perlmutter the published gain of 4.10x is "
+                       "WITH this knob set.  Neither machine has run the other's "
+                       "configuration, so neither is refused here.  Both knobs report "
+                       "themselves enabled either way, so confirm the context is "
+                       "actually buying something on YOUR machine before relying on it, "
+                       "and unset SHMEM_OFI_DISABLE_SINGLE_EP to measure the context "
+                       "alone");
+    }
+
     /* Here rather than in coll_ctx_init, because it compares against the default
      * context's STX. */
     if (coll_ctx_created() && shmem_internal_my_pe == 0 &&

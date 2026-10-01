@@ -286,6 +286,19 @@ options.
         barrier's signaling queues separately from user data.  This parameter
         changes no traffic class on its own.  SHMEM_OFI_COLL_TCLASS implies it.
 
+        What it is worth depends on the load, and it is worth nothing when there
+        is no competing load: measured against a saturating neighbour it recovers
+        a barrier from 13 percent of its unloaded rate to 58, while on an
+        application that owns its nodes it is worth nothing measurable and costs
+        about half a percent.  It is also a loss below SHMEM_OFI_COLL_CTX_THRESHOLD
+        PEs per node, which is why that threshold exists.
+
+        Setting this together with SHMEM_OFI_DISABLE_SINGLE_EP is measured to
+        behave differently on different fabrics: on one it cancels this context
+        entirely while on another the published gain was measured with both set.
+        Startup warns on PE 0 when both are set, since both parameters report
+        themselves enabled either way and the loss is otherwise silent.
+
     SHMEM_OFI_COLL_TCLASS (default: unspec)
         The traffic class for that dedicated collective context, separate from the
         class SHMEM_OFI_TCLASS gives user data.  Accepts the same values as
