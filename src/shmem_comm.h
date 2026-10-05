@@ -37,6 +37,26 @@
  * decision lives in one place with no per-call branch. */
 extern shmem_ctx_t shmem_internal_coll_ctx;
 
+static inline shmem_ctx_t
+shmem_internal_user_atomic_ctx(shmem_ctx_t ctx)
+{
+#ifdef USE_OFI
+    return (shmem_ctx_t) shmem_transport_user_atomic_ctx((shmem_transport_ctx_t *) ctx);
+#else
+    return ctx;
+#endif
+}
+
+static inline void
+shmem_internal_atomic_handoff(shmem_ctx_t ctx)
+{
+#ifdef USE_OFI
+    shmem_transport_atomic_handoff((shmem_transport_ctx_t *) ctx);
+#else
+    (void) ctx;
+#endif
+}
+
 static inline
 void
 shmem_internal_put_nb(shmem_ctx_t ctx, void *target, const void *source, size_t len, int pe,
@@ -45,6 +65,7 @@ shmem_internal_put_nb(shmem_ctx_t ctx, void *target, const void *source, size_t 
     if (len == 0)
         return;
 
+    shmem_internal_atomic_handoff(ctx);
     if (shmem_shr_transport_use_write(ctx, target, source, len, pe)) {
         shmem_shr_transport_put(ctx, target, source, len, pe);
     } else {
@@ -68,6 +89,7 @@ shmem_internal_put_scalar(shmem_ctx_t ctx, void *target, const void *source, siz
 {
     shmem_internal_assert(len > 0);
 
+    shmem_internal_atomic_handoff(ctx);
     if (shmem_shr_transport_use_write(ctx, target, source, len, pe)) {
         shmem_shr_transport_put_scalar(ctx, target, source, len, pe);
     } else {
@@ -86,6 +108,7 @@ void
 shmem_internal_put_signal_nbi(shmem_ctx_t ctx, void *target, const void *source, size_t len,
                               uint64_t *sig_addr, uint64_t signal, int sig_op, int pe)
 {
+    shmem_internal_atomic_handoff(ctx);
     if (len == 0) {
         /* Signal-only (no data): use shmem_shr_transport_use_atomic() to pick
          * the right plane.  In the multi-node case this always resolves to the
@@ -126,6 +149,7 @@ shmem_internal_put_nbi(shmem_ctx_t ctx, void *target, const void *source, size_t
 {
     if (len == 0) return;
 
+    shmem_internal_atomic_handoff(ctx);
     if (shmem_shr_transport_use_write(ctx, target, source, len, pe)) {
         shmem_shr_transport_put(ctx, target, source, len, pe);
     } else {
@@ -151,6 +175,7 @@ shmem_internal_get(shmem_ctx_t ctx, void *target, const void *source, size_t len
 {
     if (len == 0) return;
 
+    shmem_internal_atomic_handoff(ctx);
     if (shmem_shr_transport_use_read(ctx, target, source, len, pe)) {
         shmem_shr_transport_get(ctx, target, source, len, pe);
     } else {
@@ -184,6 +209,7 @@ shmem_internal_swap(shmem_ctx_t ctx, void *target, void *source, void *dest, siz
 {
     shmem_internal_assert(len > 0);
 
+    shmem_internal_atomic_handoff(ctx);
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
         shmem_shr_transport_swap(ctx, target, source, dest, len, pe, datatype);
     } else {
@@ -200,6 +226,7 @@ shmem_internal_swap_nbi(shmem_ctx_t ctx, void *target, void *source,
 {
     shmem_internal_assert(len > 0);
 
+    shmem_internal_atomic_handoff(ctx);
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
         shmem_shr_transport_swap(ctx, target, source, dest, len, pe, datatype);
     } else {
@@ -216,6 +243,7 @@ shmem_internal_cswap(shmem_ctx_t ctx, void *target, void *source, void *dest, vo
 {
     shmem_internal_assert(len > 0);
 
+    shmem_internal_atomic_handoff(ctx);
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
         shmem_shr_transport_cswap(ctx, target, source, dest, operand, len, pe, datatype);
     } else {
@@ -233,6 +261,7 @@ shmem_internal_cswap_nbi(shmem_ctx_t ctx, void *target, void *source,
 {
     shmem_internal_assert(len > 0);
 
+    shmem_internal_atomic_handoff(ctx);
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
         shmem_shr_transport_cswap(ctx, target, source, dest, operand, len, pe, datatype);
     } else {
@@ -249,6 +278,7 @@ shmem_internal_mswap(shmem_ctx_t ctx, void *target, void *source, void *dest, vo
 {
     shmem_internal_assert(len > 0);
 
+    shmem_internal_atomic_handoff(ctx);
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
         shmem_shr_transport_mswap(ctx, target, source, dest, mask, len, pe, datatype);
     } else {
@@ -265,6 +295,7 @@ shmem_internal_atomic(shmem_ctx_t ctx, void *target, const void *source, size_t 
 {
     shmem_internal_assert(len > 0);
 
+    shmem_internal_atomic_handoff(ctx);
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
         shmem_shr_transport_atomic(ctx, target, source, len, pe, op, datatype);
     } else {
@@ -290,6 +321,7 @@ shmem_internal_atomic_fetch(shmem_ctx_t ctx, void *target, const void *source, s
 {
     shmem_internal_assert(len > 0);
 
+    shmem_internal_atomic_handoff(ctx);
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
         shmem_shr_transport_atomic_fetch(ctx, target, source, len, pe, datatype);
     } else {
@@ -305,6 +337,7 @@ shmem_internal_atomic_set(shmem_ctx_t ctx, void *target, const void *source, siz
 {
     shmem_internal_assert(len > 0);
 
+    shmem_internal_atomic_handoff(ctx);
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
         shmem_shr_transport_atomic_set(ctx, target, source, len, pe, datatype);
     } else {
@@ -331,6 +364,7 @@ shmem_internal_fetch_atomic(shmem_ctx_t ctx, void *target, void *source, void *d
 {
     shmem_internal_assert(len > 0);
 
+    shmem_internal_atomic_handoff(ctx);
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
         shmem_shr_transport_fetch_atomic(ctx, target, source, dest, len, pe,
                                          op, datatype);
@@ -350,6 +384,7 @@ shmem_internal_atomicv(shmem_ctx_t ctx, void *target, const void *source,
     size_t len = type_size * count;
     shmem_internal_assert(len > 0);
 
+    shmem_internal_atomic_handoff(ctx);
 #if defined(DISABLE_NONFETCH_AMO) && defined(USE_OFI)
     /* FIXME: This is a temporary workaround to resolve a known issue with non-fetching AMOs when using
         the CXI provider */
@@ -384,6 +419,7 @@ shmem_internal_fetch_atomic_nbi(shmem_ctx_t ctx, void *target, void *source,
 {
     shmem_internal_assert(len > 0);
 
+    shmem_internal_atomic_handoff(ctx);
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
         shmem_shr_transport_fetch_atomic(ctx, target, source, dest, len, pe,
                                          op, datatype);
@@ -400,6 +436,7 @@ shmem_internal_atomic_fetch_nbi(shmem_ctx_t ctx, void *target, const void *sourc
 {
     shmem_internal_assert(len > 0);
 
+    shmem_internal_atomic_handoff(ctx);
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
         shmem_shr_transport_atomic_fetch(ctx, target, source, len, pe, datatype);
     } else {

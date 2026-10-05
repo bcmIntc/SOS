@@ -334,6 +334,41 @@ options.
         hierarchical barrier depends on and such a run can hang; read the fabric
         counters from it, never its barrier timings.
 
+    SHMEM_OFI_ATOMIC_CONTEXT (default: off)
+        Give public C and Fortran atomics a separate transmit endpoint,
+        completion queue and counters for each OpenSHMEM context (including
+        the default).  Internal barrier and collective atomics, locks and
+        put-signal stay on their original context.  On-node CPU atomic fast
+        paths are unchanged.  The feature is independent of the collective
+        context.  Each user context costs another endpoint; at high PE counts
+        the resource cost can be significant.  Endpoint-creation failures
+        fail initialization or context creation rather than being ignored.
+
+        Before routing a public atomic, SOS completes earlier operations on
+        its caller context.  Before subsequent operations on that context,
+        fence, quiet or destruction, it completes outstanding atomics from
+        the paired endpoint.  Consecutive nonblocking atomic fetches can stay
+        in flight until quiet.  These ordering handoffs can cost more than
+        queue separation saves; this is an experimental opt-in, not a new
+        default.  No atomic performance benefit has yet been established.
+
+    SHMEM_OFI_ATOMIC_TCLASS (default: unspec)
+        Traffic class for the public atomic endpoints, using the same values
+        as SHMEM_OFI_TCLASS.  A non-unspec value implies
+        SHMEM_OFI_ATOMIC_CONTEXT; unspec inherits the user-data class.
+        Invalid values fail initialization.  A requested class does not
+        establish which (class, type) pair the provider grants for atomics;
+        check the fabric's per-class counters before attributing a change
+        to this parameter.  The collective context's write-after-write
+        ordering request was established for puts and is not applied here.
+
+        After building and installing this branch, the focused example can
+        be compiled with `oshcc -O2 -o atomic_context
+        examples/atomic_context.c` and run as
+        `SHMEM_OFI_ATOMIC_CONTEXT=1 oshrun -n 4 ./atomic_context`.
+        Run it once with the knob unset as a control, then on separate nodes
+        for the OFI path; an all-local run checks the shared-memory path.
+
   Team Environment variables:
 
     SHMEM_TEAMS_MAX (default: 10)

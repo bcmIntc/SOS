@@ -370,6 +370,10 @@ struct shmem_transport_ctx_t {
     struct shmem_internal_tid       tid;
     struct shmem_internal_team_t   *team;
     uint32_t                        tclass;
+    struct shmem_transport_ctx_t   *atomic_ctx;
+    struct shmem_transport_ctx_t   *atomic_next;
+    uint64_t                        atomic_last_put;
+    uint64_t                        atomic_last_get;
 };
 
 typedef struct shmem_transport_ctx_t shmem_transport_ctx_t;
@@ -382,6 +386,10 @@ extern shmem_transport_ctx_t shmem_transport_ctx_default;
  * by the collective code, shmem_internal_coll_ctx, is declared in shmem_comm.h;
  * it points here when enabled and at the default context otherwise. */
 extern shmem_transport_ctx_t shmem_transport_ctx_coll;
+extern shmem_transport_ctx_t *shmem_transport_ofi_atomic_contexts;
+extern pthread_mutex_t shmem_transport_ofi_atomic_lock;
+
+static inline void shmem_transport_atomic_handoff(shmem_transport_ctx_t *ctx);
 
 extern struct fid_ep* shmem_transport_ofi_target_ep;
 
@@ -446,6 +454,11 @@ void shmem_transport_probe(void)
          * issuing path, which reads the error queue. */
         if (shmem_transport_ctx_coll.cq != NULL)
             fi_cq_read(shmem_transport_ctx_coll.cq, (void *)&buf, 0);
+        pthread_mutex_lock(&shmem_transport_ofi_atomic_lock);
+        for (shmem_transport_ctx_t *atomic = shmem_transport_ofi_atomic_contexts;
+             atomic != NULL; atomic = atomic->atomic_next)
+            fi_cq_read(atomic->cq, (void *)&buf, 0);
+        pthread_mutex_unlock(&shmem_transport_ofi_atomic_lock);
 #  ifdef USE_THREAD_COMPLETION
         pthread_mutex_unlock(&shmem_transport_ofi_progress_lock);
     }
@@ -580,14 +593,46 @@ int shmem_transport_quiet(shmem_transport_ctx_t* ctx)
 
     shmem_transport_put_quiet(ctx);
     shmem_transport_get_wait(ctx);
+    shmem_transport_atomic_handoff(ctx);
 
     return 0;
 }
 
+static inline void
+shmem_transport_atomic_handoff(shmem_transport_ctx_t *ctx)
+{
+    if (ctx->atomic_ctx) {
+        SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx->atomic_ctx);
+        uint64_t puts = SHMEM_TRANSPORT_OFI_CNTR_READ(&ctx->atomic_ctx->pending_put_cntr);
+        uint64_t gets = SHMEM_TRANSPORT_OFI_CNTR_READ(&ctx->atomic_ctx->pending_get_cntr);
+        SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx->atomic_ctx);
+        if (__atomic_load_n(&ctx->atomic_last_put, __ATOMIC_ACQUIRE) == puts &&
+            __atomic_load_n(&ctx->atomic_last_get, __ATOMIC_ACQUIRE) == gets)
+            return;
+
+        shmem_transport_put_quiet(ctx->atomic_ctx);
+        shmem_transport_get_wait(ctx->atomic_ctx);
+        __atomic_store_n(&ctx->atomic_last_put,
+                         puts, __ATOMIC_RELEASE);
+        __atomic_store_n(&ctx->atomic_last_get, gets, __ATOMIC_RELEASE);
+    }
+}
+
+static inline shmem_transport_ctx_t *
+shmem_transport_user_atomic_ctx(shmem_transport_ctx_t *ctx)
+{
+    if (ctx->atomic_ctx == NULL)
+        return ctx;
+
+    shmem_transport_put_quiet(ctx);
+    shmem_transport_get_wait(ctx);
+    return ctx->atomic_ctx;
+}
 
 static inline
 int shmem_transport_fence(shmem_transport_ctx_t* ctx)
 {
+    shmem_transport_atomic_handoff(ctx);
 #if WANT_TOTAL_DATA_ORDERING == 0
     /* Communication is unordered; must wait for puts and buffered (injected)
      * non-fetching atomics to be completed in order to ensure ordering. */

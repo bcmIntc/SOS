@@ -139,6 +139,11 @@ SHMEM_INTERNAL_ENV_DEF(OFI_COLL_CTX_UNRESTRICTED, bool, true, SHMEM_INTERNAL_ENV
                        "Request write-after-write ordering on the dedicated collective context "
                        "when it has a class of its own.  On CXI this is what makes the class it "
                        "asks for one the job grants.  Off restores the cheaper restricted path")
+SHMEM_INTERNAL_ENV_DEF(OFI_ATOMIC_CONTEXT, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Give public atomics a separate transmit context per OpenSHMEM context")
+SHMEM_INTERNAL_ENV_DEF(OFI_ATOMIC_TCLASS, string, "unspec", SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Traffic class for public atomic contexts; non-unspec implies "
+                       "OFI_ATOMIC_CONTEXT, unspec inherits OFI_TCLASS")
 #endif
 
 #ifdef USE_UCX

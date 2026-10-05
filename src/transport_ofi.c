@@ -125,6 +125,9 @@ static uint32_t shmem_transport_ofi_tclass;
  * context was asked for, and then the collective endpoint requests no class and
  * carries whatever SHMEM_OFI_TCLASS carries. */
 static uint32_t shmem_transport_ofi_coll_tclass;
+static uint32_t shmem_transport_ofi_atomic_tclass;
+shmem_transport_ctx_t *shmem_transport_ofi_atomic_contexts;
+pthread_mutex_t shmem_transport_ofi_atomic_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #ifdef ENABLE_OFI_CXI_PCIE_AMO
 bool shmem_transport_ofi_is_cxi;
@@ -239,6 +242,7 @@ shmem_ctx_t SHMEM_CTX_DEFAULT = (shmem_ctx_t) &shmem_transport_ctx_default;
  * shmem_internal_coll_ctx aliases the default context until startup enables the
  * dedicated one, so collective code can route through it with no branch. */
 #define SHMEM_TRANSPORT_CTX_COLL_ID -2
+#define SHMEM_TRANSPORT_CTX_ATOMIC_ID -3
 shmem_transport_ctx_t shmem_transport_ctx_coll;
 shmem_ctx_t shmem_internal_coll_ctx = (shmem_ctx_t) &shmem_transport_ctx_default;
 
@@ -2322,6 +2326,37 @@ static int shmem_transport_ofi_coll_ctx_init(void)
     return 0;
 }
 
+static int shmem_transport_ofi_atomic_ctx_init(shmem_transport_ctx_t *parent,
+                                               shmem_transport_ctx_t **failed)
+{
+    *failed = NULL;
+    shmem_transport_ctx_t *atomic = calloc(1, sizeof(*atomic));
+    if (atomic == NULL)
+        RAISE_ERROR_STR("Out of memory when allocating OFI atomic context");
+
+    atomic->id = SHMEM_TRANSPORT_CTX_ATOMIC_ID;
+    atomic->stx_idx = -1;
+    atomic->team = parent->team;
+    atomic->options = parent->options & ~SHMEMX_CTX_BOUNCE_BUFFER;
+    atomic->tclass = shmem_transport_ofi_atomic_tclass != FI_TC_UNSPEC
+                   ? shmem_transport_ofi_atomic_tclass : parent->tclass;
+
+    int ret = shmem_transport_ofi_ctx_init(atomic, SHMEM_TRANSPORT_CTX_ATOMIC_ID);
+    if (ret != 0) {
+        RAISE_WARN_MSG("Dedicated atomic context creation failed for context %d (%d)\n",
+                       parent->id, ret);
+        *failed = atomic;
+        return ret;
+    }
+
+    pthread_mutex_lock(&shmem_transport_ofi_atomic_lock);
+    atomic->atomic_next = shmem_transport_ofi_atomic_contexts;
+    shmem_transport_ofi_atomic_contexts = atomic;
+    pthread_mutex_unlock(&shmem_transport_ofi_atomic_lock);
+    parent->atomic_ctx = atomic;
+    return 0;
+}
+
 
 int shmem_transport_init(void)
 {
@@ -2376,6 +2411,11 @@ int shmem_transport_init(void)
     /* Either knob creates the dedicated collective context (see
      * coll_ctx_requested); only the class knob gives it a class of its own. */
     shmem_transport_ofi_coll_tclass = parse_tclass(shmem_internal_params.OFI_COLL_TCLASS);
+    shmem_transport_ofi_atomic_tclass = parse_tclass(shmem_internal_params.OFI_ATOMIC_TCLASS);
+    if (strcmp(shmem_internal_params.OFI_ATOMIC_TCLASS, "unspec") != 0 &&
+        shmem_transport_ofi_atomic_tclass == FI_TC_UNSPEC)
+        RAISE_ERROR_MSG("Invalid SHMEM_OFI_ATOMIC_TCLASS '%s'\n",
+                        shmem_internal_params.OFI_ATOMIC_TCLASS);
 
     ret = query_for_fabric(&shmem_transport_ofi_info);
     if (ret != 0) return ret;
@@ -2499,6 +2539,17 @@ int shmem_transport_startup(void)
 
     ret = shmem_transport_ofi_ctx_init(&shmem_transport_ctx_default, SHMEM_TRANSPORT_CTX_DEFAULT_ID);
     if (ret != 0) return ret;
+
+    if (shmem_internal_params.OFI_ATOMIC_CONTEXT ||
+        shmem_transport_ofi_atomic_tclass != FI_TC_UNSPEC) {
+        shmem_transport_ctx_t *failed = NULL;
+        ret = shmem_transport_ofi_atomic_ctx_init(&shmem_transport_ctx_default, &failed);
+        if (ret != 0) {
+            shmem_transport_ctx_destroy(failed);
+            free(failed);
+            return ret;
+        }
+    }
 
     /* After the target endpoint and the default context: this context shares
      * their domain, and its STX, where the provider has any, comes from the pool
@@ -2647,8 +2698,16 @@ int shmem_transport_ctx_create(struct shmem_internal_team_t *team, long options,
 
     ret = shmem_transport_ofi_ctx_init(ctxp, id);
 
+    shmem_transport_ctx_t *failed_atomic = NULL;
+    if (!ret && shmem_transport_ctx_default.atomic_ctx)
+        ret = shmem_transport_ofi_atomic_ctx_init(ctxp, &failed_atomic);
+
     if (ret) {
+        SHMEM_MUTEX_UNLOCK(shmem_transport_ofi_lock);
+        shmem_transport_ctx_destroy(failed_atomic);
+        free(failed_atomic);
         shmem_transport_ctx_destroy(ctxp);
+        return ret;
     } else {
         team->contexts[id] = ctxp;
         *ctx = ctxp;
@@ -2666,6 +2725,21 @@ void shmem_transport_ctx_destroy(shmem_transport_ctx_t *ctx)
 
     if (ctx == NULL)
         return;
+
+    if (ctx->atomic_ctx) {
+        shmem_transport_ctx_t *atomic = ctx->atomic_ctx;
+        ctx->atomic_ctx = NULL;
+        shmem_transport_quiet(atomic);
+        pthread_mutex_lock(&shmem_transport_ofi_atomic_lock);
+        shmem_transport_ctx_t **next = &shmem_transport_ofi_atomic_contexts;
+        while (*next && *next != atomic)
+            next = &(*next)->atomic_next;
+        if (*next == atomic)
+            *next = atomic->atomic_next;
+        pthread_mutex_unlock(&shmem_transport_ofi_atomic_lock);
+        shmem_transport_ctx_destroy(atomic);
+        free(atomic);
+    }
 
     if(shmem_internal_params.DEBUG) {
         SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
@@ -2756,7 +2830,8 @@ void shmem_transport_ctx_destroy(shmem_transport_ctx_t *ctx)
         free(ctx);
     }
     else if (ctx->id != SHMEM_TRANSPORT_CTX_DEFAULT_ID &&
-             ctx->id != SHMEM_TRANSPORT_CTX_COLL_ID) {
+             ctx->id != SHMEM_TRANSPORT_CTX_COLL_ID &&
+             ctx->id != SHMEM_TRANSPORT_CTX_ATOMIC_ID) {
         RAISE_ERROR_MSG("Attempted to destroy an invalid context (%d)\n", ctx->id);
     }
 }
