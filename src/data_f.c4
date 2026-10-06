@@ -106,9 +106,10 @@ SHMEM_BIND_F_SIZES(`SHMEM_WRAP_FC_PUT_NBI_SIZE')
         SHMEM_ERR_CHECK_SYMMETRIC(target, SIZE * ((len-1) * *tst + 1)); \
         SHMEM_ERR_CHECK_NULL(source, len);                              \
                                                                         \
+        uint64_t put_epoch = UINT64_MAX;                                            \
         for ( ; len > 0 ; --len) {                                      \
-            shmem_internal_put_scalar(SHMEM_CTX_DEFAULT, target,        \
-                                      source, SIZE, *pe);               \
+            shmem_internal_put_scalar_chunk(SHMEM_CTX_DEFAULT, target,  \
+                                      source, SIZE, *pe, &put_epoch);       \
             target += (*tst * SIZE);                                    \
             source += (*sst * SIZE);                                    \
         }                                                               \

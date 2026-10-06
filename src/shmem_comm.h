@@ -32,17 +32,33 @@
 
 static inline
 void
-shmem_internal_put_nb(shmem_ctx_t ctx, void *target, const void *source, size_t len, int pe,
-                      long *completion)
+shmem_internal_put_nb_chunk(shmem_ctx_t ctx, void *target, const void *source,
+                            size_t len, int pe, long *completion, uint64_t *epoch)
 {
+#ifndef USE_OFI
+    (void) epoch;
+#endif
     if (len == 0)
         return;
 
     if (shmem_shr_transport_use_write(ctx, target, source, len, pe)) {
         shmem_shr_transport_put(ctx, target, source, len, pe);
     } else {
+#ifdef USE_OFI
+        shmem_transport_ofi_put_nb_chunk((shmem_transport_ctx_t *)ctx, target,
+                                         source, len, pe, completion, epoch);
+#else
         shmem_transport_put_nb((shmem_transport_ctx_t *)ctx, target, source, len, pe, completion);
+#endif
     }
+}
+
+static inline
+void
+shmem_internal_put_nb(shmem_ctx_t ctx, void *target, const void *source, size_t len,
+                      int pe, long *completion)
+{
+    shmem_internal_put_nb_chunk(ctx, target, source, len, pe, completion, NULL);
 }
 
 
@@ -57,21 +73,43 @@ shmem_internal_put_wait(shmem_ctx_t ctx, long *completion)
 
 static inline
 void
-shmem_internal_put_scalar(shmem_ctx_t ctx, void *target, const void *source, size_t len, int pe)
+shmem_internal_put_scalar_chunk(shmem_ctx_t ctx, void *target, const void *source,
+                                size_t len, int pe, uint64_t *epoch)
 {
+#ifndef USE_OFI
+    (void) epoch;
+#endif
     shmem_internal_assert(len > 0);
 
     if (shmem_shr_transport_use_write(ctx, target, source, len, pe)) {
         shmem_shr_transport_put_scalar(ctx, target, source, len, pe);
     } else {
 #ifndef DISABLE_OFI_INJECT
+#ifdef USE_OFI
+        shmem_transport_ofi_put_scalar_chunk((shmem_transport_ctx_t *)ctx, target,
+                                             source, len, pe, epoch);
+#else
         shmem_transport_put_scalar((shmem_transport_ctx_t *)ctx, target, source, len, pe);
+#endif
 #else
         long completion = 0;
+#ifdef USE_OFI
+        shmem_transport_ofi_put_nb_chunk((shmem_transport_ctx_t *)ctx, target,
+                                         source, len, pe, &completion, epoch);
+#else
         shmem_transport_put_nb((shmem_transport_ctx_t *)ctx, target, source, len, pe, &completion);
+#endif
 	shmem_internal_put_wait(ctx, &completion);
 #endif
     }
+}
+
+static inline
+void
+shmem_internal_put_scalar(shmem_ctx_t ctx, void *target, const void *source,
+                          size_t len, int pe)
+{
+    shmem_internal_put_scalar_chunk(ctx, target, source, len, pe, NULL);
 }
 
 static inline

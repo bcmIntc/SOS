@@ -4,6 +4,7 @@
  * and could hide a broken quiet implementation.
  */
 #include <shmem.h>
+#include <shmemx.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,6 +41,55 @@ int main(void)
         shmem_ctx_t active = context ? ctx : SHMEM_CTX_DEFAULT;
         for (int epoch = 0; epoch < epochs; epoch++) {
             unsigned char value = (unsigned char) (me + epoch + 1);
+
+            /* One logical NBI put per quiet must use the counter even when
+             * the provider fragments the payload into several RMA writes. */
+            memset(source, value ^ 0x40, payload_size);
+            for (int pe = 0; pe < npes; pe++) {
+                shmem_ctx_putmem_nbi(active, target + (size_t) me * payload_size,
+                                     source, payload_size, pe);
+                shmem_ctx_quiet(active);
+            }
+            memset(source, 0xff, payload_size);
+            shmem_sync_all();
+            for (int sender = 0; sender < npes; sender++) {
+                unsigned char expected = (unsigned char) ((sender + epoch + 1) ^ 0x40);
+                for (size_t i = 0; i < payload_size; i++)
+                    if (target[(size_t) sender * payload_size + i] != expected)
+                        shmem_global_exit(8);
+            }
+            shmem_sync_all();
+
+            /* A single strided API call remains one logical put even though
+             * its elements/blocks become separate transport operations. */
+            memset(source, value ^ 0x20, payload_size);
+            for (int pe = 0; pe < npes; pe++) {
+                shmem_ctx_uchar_iput(active, target + (size_t) me * payload_size,
+                                     source, 2, 1, 32, pe);
+                shmem_ctx_quiet(active);
+            }
+            shmem_sync_all();
+            for (int sender = 0; sender < npes; sender++)
+                for (size_t i = 0; i < 32; i++)
+                    if (target[(size_t) sender * payload_size + 2 * i] !=
+                        (unsigned char) ((sender + epoch + 1) ^ 0x20))
+                        shmem_global_exit(10);
+            shmem_sync_all();
+            for (int pe = 0; pe < npes; pe++) {
+                shmemx_ctx_uchar_ibput(active, target + (size_t) me * payload_size,
+                                       source, 32, 16, 16, 4, pe);
+                shmem_ctx_quiet(active);
+            }
+            memset(source, 0xff, payload_size);
+            shmem_sync_all();
+            for (int sender = 0; sender < npes; sender++)
+                for (size_t block = 0; block < 4; block++)
+                    for (size_t i = 0; i < 16; i++)
+                        if (target[(size_t) sender * payload_size + 32 * block + i] !=
+                            (unsigned char) ((sender + epoch + 1) ^ 0x20))
+                            shmem_global_exit(11);
+            shmem_sync_all();
+
             memset(source, value, payload_size);
             for (int pe = 0; pe < npes; pe++) {
                 shmem_ctx_putmem(active, buffered + (size_t) me * buffered_size,
@@ -65,10 +115,28 @@ int main(void)
                 for (size_t i = 0; i < buffered_size; i++)
                     if (buffered[(size_t) sender * buffered_size + i] != expected)
                         shmem_global_exit(3);
-                if (counts[sender] != context * epochs + epoch + 1)
+                if (counts[sender] != 2 * (context * epochs + epoch) + 1)
                     shmem_global_exit(4);
                 if (scalars[sender] != expected)
                     shmem_global_exit(5);
+            }
+            shmem_sync_all();
+
+            /* Return to single-put and atomic-only counter epochs after a
+             * batch.  Terminal writes must not corrupt counter thresholds. */
+            for (int pe = 0; pe < npes; pe++) {
+                shmem_ctx_uchar_p(active, &scalars[me], value ^ 0x40, pe);
+                shmem_ctx_quiet(active);
+                shmem_ctx_long_atomic_add(active, &counts[me], 1, pe);
+                shmem_ctx_quiet(active);
+            }
+            shmem_ctx_quiet(active);
+            shmem_sync_all();
+            for (int sender = 0; sender < npes; sender++) {
+                unsigned char expected = (unsigned char) ((sender + epoch + 1) ^ 0x40);
+                if (scalars[sender] != expected ||
+                    counts[sender] != 2 * (context * epochs + epoch + 1))
+                    shmem_global_exit(9);
             }
             shmem_sync_all();
 

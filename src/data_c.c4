@@ -488,9 +488,10 @@ SHMEM_PROF_DEF_CTX_PUT_N_SIGNAL_NBI(`mem')
                    sizeof(TYPE) * ((nelems-1) * tst + 1),     \
                    sizeof(TYPE) * ((nelems-1) * sst + 1), 0,  \
                    (shmem_internal_my_pe == pe));             \
+    uint64_t put_epoch = UINT64_MAX;                                     \
     for ( ; nelems > 0 ; --nelems) {                          \
-      shmem_internal_put_scalar(ctx, target, source,          \
-                               sizeof(TYPE), pe);             \
+      shmem_internal_put_scalar_chunk(ctx, target, source,    \
+                                       sizeof(TYPE), pe, &put_epoch); \
       target += tst;                                          \
       source += sst;                                          \
     }                                                         \
@@ -513,10 +514,11 @@ SHMEM_PROF_DEF_CTX_PUT_N_SIGNAL_NBI(`mem')
                    sizeof(TYPE) * ((nblocks-1) * tst + bsize), \
                    sizeof(TYPE) * ((nblocks-1) * sst + bsize), \
                    0, (shmem_internal_my_pe == pe));          \
+    uint64_t put_epoch = UINT64_MAX;                                     \
     for ( ; nblocks > 0 ; --nblocks) {                        \
-      shmem_internal_put_nb(ctx, target, source,              \
+      shmem_internal_put_nb_chunk(ctx, target, source,        \
                                 bsize * sizeof(TYPE), pe,     \
-                                &completion);                 \
+                                &completion, &put_epoch);        \
       target += tst;                                          \
       source += sst;                                          \
     }                                                         \
@@ -540,9 +542,10 @@ SHMEM_PROF_DEF_CTX_PUT_N_SIGNAL_NBI(`mem')
                         (SIZE) * ((nelems-1) * tst + 1),     \
                         (SIZE) * ((nelems-1) * sst + 1), 0,  \
                         (shmem_internal_my_pe == pe));       \
+    uint64_t put_epoch = UINT64_MAX;                                    \
     for ( ; nelems > 0 ; --nelems) {                         \
-      shmem_internal_put_scalar(ctx, target, source, (SIZE), \
-                               pe);                          \
+      shmem_internal_put_scalar_chunk(ctx, target, source, (SIZE), \
+                                       pe, &put_epoch);        \
       target = (uint8_t *) target + tst * (SIZE);            \
       source = (uint8_t *) source + sst * (SIZE);            \
     }                                                        \
@@ -566,10 +569,11 @@ SHMEM_PROF_DEF_CTX_PUT_N_SIGNAL_NBI(`mem')
                         (SIZE) * ((nblocks-1) * tst + bsize), \
                         (SIZE) * ((nblocks-1) * sst + bsize), \
                         0, (shmem_internal_my_pe == pe));    \
+    uint64_t put_epoch = UINT64_MAX;                                    \
     for ( ; nblocks > 0 ; --nblocks) {                       \
-      shmem_internal_put_nb(ctx, target, source,             \
+      shmem_internal_put_nb_chunk(ctx, target, source,       \
                             bsize * (SIZE), pe,              \
-                            &completion);                    \
+                            &completion, &put_epoch);           \
       target = (uint8_t *) target + tst * (SIZE);            \
       source = (uint8_t *) source + sst * (SIZE);            \
     }                                                        \

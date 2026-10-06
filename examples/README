@@ -24,7 +24,12 @@ The Licensing information can be found in the "LICENSE" file
 
 ofi_epoch_quiet.c checks remote completion and source reuse across multiple
 destinations, puts, signals, non-fetching atomics, repeated quiet epochs, and
-default/created contexts.  Run it with
+default/created contexts.
+The regression alternates isolated puts, batches, isolated scalar puts, and
+atomic-only epochs to check hybrid completion and cumulative counter accounting.
+Isolated large NBI and strided puts cover completion after transport fragmentation
+and element/block decomposition; the public API does not expose which completion
+branch ran.  Run it with
 at least two PEs using the OFI transport.  A useful configuration matrix includes
 BOUNCE_SIZE=0 and an enabled bounce buffer, single-endpoint and separate-endpoint
 providers, both thread-completion settings, and messages larger than the

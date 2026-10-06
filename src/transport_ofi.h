@@ -352,8 +352,16 @@ struct shmem_transport_ctx_t {
 #endif
     long                            options;
     struct fid_ep*                  ep;
+    struct fid_cntr*                put_cntr;
     struct fid_cntr*                get_cntr;
     struct fid_cq*                  cq;
+    /* Includes every non-fetching fabric operation, including terminal
+     * writes.  Protected by the context lock, never reset between epochs. */
+    uint64_t                        put_cntr_pending;
+    /* Saturates at two logical puts; transport fragments do not count as
+     * separate puts.  Atomics alone use counter completion. */
+    unsigned int                    put_epoch_puts;
+    uint64_t                        put_epoch_id;
     unsigned char                  *put_epoch_dirty;
     int                            *put_epoch_pes;
     size_t                          put_epoch_npes;
@@ -425,8 +433,20 @@ void shmem_transport_ofi_ctx_unlock(shmem_transport_ctx_t *ctx)
 #define SHMEM_TRANSPORT_OFI_CNTR_INC(cntr) shmem_internal_cntr_inc(cntr)
 #endif /* USE_CTX_LOCK */
 
-/* Called under the context lock.  Issued counts are software statistics only;
- * quiet never compares them with a fabric completion counter. */
+/* Called once per logical put under the context lock, before fragmentation. */
+static inline
+void shmem_transport_ofi_begin_put(shmem_transport_ctx_t *ctx, uint64_t *epoch)
+{
+    /* A strided API call carries a cookie across its transport chunks.  Count
+     * it once in each epoch it touches, including after concurrent quiet. */
+    if (epoch && *epoch == ctx->put_epoch_id) return;
+    if (ctx->put_epoch_puts < 2) ctx->put_epoch_puts++;
+    if (epoch) *epoch = ctx->put_epoch_id;
+}
+
+/* Called once per non-fetching fabric operation under the context lock.
+ * Software statistics exclude terminal writes; the fabric threshold includes
+ * them so alternating batch and single-put epochs cannot complete early. */
 static inline
 void shmem_transport_ofi_record_put(shmem_transport_ctx_t *ctx, int pe)
 {
@@ -434,6 +454,7 @@ void shmem_transport_ofi_record_put(shmem_transport_ctx_t *ctx, int pe)
         ctx->put_epoch_dirty[pe] = 1;
         ctx->put_epoch_pes[ctx->put_epoch_npes++] = pe;
     }
+    ctx->put_cntr_pending++;
     SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
 }
 
@@ -569,8 +590,7 @@ void shmem_transport_put_quiet(shmem_transport_ctx_t* ctx)
 {
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
 
-    /* Reclaim bounce buffers using their delivery completions.  Unbuffered
-     * operations are completed by the terminal writes below. */
+    /* Reclaim bounce buffers using their delivery completions. */
     if (ctx->bounce_buffers) {
         SHMEM_TRANSPORT_OFI_CTX_BB_LOCK(ctx);
 
@@ -581,49 +601,62 @@ void shmem_transport_put_quiet(shmem_transport_ctx_t* ctx)
         SHMEM_TRANSPORT_OFI_CTX_BB_UNLOCK(ctx);
     }
 
-    for (size_t i = 0; i < ctx->put_epoch_npes; i++) {
-        int pe = ctx->put_epoch_pes[i];
-        uint8_t *addr;
-        uint64_t key, polled = 0;
-        int ret;
-
-        /* Use a registered symmetric address even though no bytes are
-         * transferred.  No user data or extra symmetric allocation is needed. */
-        shmem_transport_ofi_get_mr(shmem_internal_data_base, pe, &addr, &key);
-        const struct iovec iov = {
-            .iov_base = shmem_internal_data_base, .iov_len = 0
-        };
-        const struct fi_rma_iov rma_iov = {
-            .addr = (uint64_t) addr, .len = 0, .key = key
-        };
-        const struct fi_msg_rma msg = {
-            .msg_iov = &iov,
-            .desc = GET_MR_DESC_ADDR(shmem_transport_ofi_get_mr_desc_index(
-                                        shmem_internal_data_base)),
-            .iov_count = 1,
-            .addr = GET_DEST(pe),
-            .rma_iov = &rma_iov,
-            .rma_iov_count = 1,
-            .context = &ctx->put_epoch_context
-        };
-
-        ctx->put_epoch_complete = false;
-        do {
-            ret = fi_writemsg(ctx->ep, &msg,
-                              FI_FENCE | FI_DELIVERY_COMPLETE | FI_COMPLETION);
-        } while (try_again(ctx, ret, &polled));
-
-        /* Only the terminal operation generates a write-completion event
-         * (apart from events needed to reclaim bounce buffers). */
-        if (ctx->bounce_buffers) SHMEM_TRANSPORT_OFI_CTX_BB_LOCK(ctx);
-        while (!ctx->put_epoch_complete) {
-            shmem_transport_ofi_drain_cq(ctx);
-            shmem_transport_probe();
+    /* The first put cannot know whether a second will follow.  The counter
+     * stays bound; only batched epochs avoid counter reads and waits. */
+    if (ctx->put_epoch_puts < 2) {
+        if (ctx->put_epoch_npes > 0) {
+            ssize_t ret = fi_cntr_wait(ctx->put_cntr, ctx->put_cntr_pending, -1);
+            OFI_CTX_CHECK_ERROR(ctx, ret);
         }
-        if (ctx->bounce_buffers) SHMEM_TRANSPORT_OFI_CTX_BB_UNLOCK(ctx);
-        ctx->put_epoch_dirty[pe] = 0;
+    } else {
+        for (size_t i = 0; i < ctx->put_epoch_npes; i++) {
+            int pe = ctx->put_epoch_pes[i];
+            uint8_t *addr;
+            uint64_t key, polled = 0;
+            int ret;
+
+            /* Use a registered symmetric address even though no bytes are
+             * transferred.  No user data or extra symmetric allocation is needed. */
+            shmem_transport_ofi_get_mr(shmem_internal_data_base, pe, &addr, &key);
+            const struct iovec iov = {
+                .iov_base = shmem_internal_data_base, .iov_len = 0
+            };
+            const struct fi_rma_iov rma_iov = {
+                .addr = (uint64_t) addr, .len = 0, .key = key
+            };
+            const struct fi_msg_rma msg = {
+                .msg_iov = &iov,
+                .desc = GET_MR_DESC_ADDR(shmem_transport_ofi_get_mr_desc_index(
+                                            shmem_internal_data_base)),
+                .iov_count = 1,
+                .addr = GET_DEST(pe),
+                .rma_iov = &rma_iov,
+                .rma_iov_count = 1,
+                .context = &ctx->put_epoch_context
+            };
+
+            ctx->put_epoch_complete = false;
+            ctx->put_cntr_pending++;
+            do {
+                ret = fi_writemsg(ctx->ep, &msg,
+                                  FI_FENCE | FI_DELIVERY_COMPLETE | FI_COMPLETION);
+            } while (try_again(ctx, ret, &polled));
+
+            /* Only the terminal operation generates a write CQ event (apart
+             * from events needed to reclaim bounce buffers). */
+            if (ctx->bounce_buffers) SHMEM_TRANSPORT_OFI_CTX_BB_LOCK(ctx);
+            while (!ctx->put_epoch_complete) {
+                shmem_transport_ofi_drain_cq(ctx);
+                shmem_transport_probe();
+            }
+            if (ctx->bounce_buffers) SHMEM_TRANSPORT_OFI_CTX_BB_UNLOCK(ctx);
+        }
     }
+    for (size_t i = 0; i < ctx->put_epoch_npes; i++)
+        ctx->put_epoch_dirty[ctx->put_epoch_pes[i]] = 0;
     ctx->put_epoch_npes = 0;
+    ctx->put_epoch_puts = 0;
+    ctx->put_epoch_id++;
     ctx->completed_put_cntr = SHMEM_TRANSPORT_OFI_CNTR_READ(&ctx->pending_put_cntr);
 
     SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
@@ -697,8 +730,45 @@ int try_again(shmem_transport_ctx_t *ctx, const int ret, uint64_t *polled) {
 
 
 static inline
-void shmem_transport_put_scalar(shmem_transport_ctx_t* ctx, void *target, const
-                               void *source, size_t len, int pe)
+int shmem_transport_ofi_post_write(shmem_transport_ctx_t *ctx,
+                                   const void *source, size_t len,
+                                   fi_addr_t dest, uint64_t addr, uint64_t key,
+                                   uint64_t flags)
+{
+    const struct iovec iov = { .iov_base = (void *) source, .iov_len = len };
+    const struct fi_rma_iov rma_iov = { .addr = addr, .len = len, .key = key };
+    const struct fi_msg_rma msg = {
+        .msg_iov = &iov,
+        .desc = GET_MR_DESC_ADDR(shmem_transport_ofi_get_mr_desc_index(source)),
+        .iov_count = 1, .addr = dest,
+        .rma_iov = &rma_iov, .rma_iov_count = 1
+    };
+    /* fi_inject_write may ignore endpoint defaults on some providers. */
+    return fi_writemsg(ctx->ep, &msg, flags | FI_DELIVERY_COMPLETE);
+}
+
+static inline
+int shmem_transport_ofi_post_atomic(shmem_transport_ctx_t *ctx,
+                                    const void *source, size_t count,
+                                    fi_addr_t dest, uint64_t addr, uint64_t key,
+                                    int datatype, int op, uint64_t flags)
+{
+    const struct fi_ioc iov = { .addr = (void *) source, .count = count };
+    const struct fi_rma_ioc rma_iov = { .addr = addr, .count = count, .key = key };
+    const struct fi_msg_atomic msg = {
+        .msg_iov = &iov,
+        .desc = GET_MR_DESC_ADDR(shmem_transport_ofi_get_mr_desc_index(source)),
+        .iov_count = 1, .addr = dest,
+        .rma_iov = &rma_iov, .rma_iov_count = 1,
+        .datatype = datatype, .op = op
+    };
+    return fi_atomicmsg(ctx->ep, &msg, flags | FI_DELIVERY_COMPLETE);
+}
+
+static inline
+void shmem_transport_ofi_put_scalar_chunk(shmem_transport_ctx_t* ctx, void *target,
+                                         const void *source, size_t len, int pe,
+                                         uint64_t *epoch)
 {
     int ret = 0;
     uint64_t dst = (uint64_t) pe;
@@ -711,24 +781,29 @@ void shmem_transport_put_scalar(shmem_transport_ctx_t* ctx, void *target, const
     shmem_internal_assert(len <= shmem_transport_ofi_max_buffered_send);
 
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
+    shmem_transport_ofi_begin_put(ctx, epoch);
     shmem_transport_ofi_record_put(ctx, pe);
 
     do {
 
-        ret = fi_inject_write(ctx->ep,
-                              source,
-                              len,
-                              GET_DEST(dst),
-                              (uint64_t) addr,
-                              key);
+        ret = shmem_transport_ofi_post_write(ctx, source, len, GET_DEST(dst),
+                                             (uint64_t) addr, key, FI_INJECT);
 
     } while (try_again(ctx, ret, &polled));
     SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
 }
 
 static inline
-void shmem_transport_ofi_put_large(shmem_transport_ctx_t* ctx, void *target, const void *source,
-                                   size_t len, int pe)
+void shmem_transport_put_scalar(shmem_transport_ctx_t *ctx, void *target,
+                                const void *source, size_t len, int pe)
+{
+    shmem_transport_ofi_put_scalar_chunk(ctx, target, source, len, pe, NULL);
+}
+
+static inline
+void shmem_transport_ofi_put_large_chunk(shmem_transport_ctx_t* ctx, void *target,
+                                        const void *source, size_t len, int pe,
+                                        uint64_t *epoch)
 {
     int ret = 0;
     uint64_t dst = (uint64_t) pe;
@@ -742,9 +817,9 @@ void shmem_transport_ofi_put_large(shmem_transport_ctx_t* ctx, void *target, con
     uint64_t frag_target = (uint64_t) addr;
     size_t frag_len = len;
 
-    /* Each fragment belongs to the destination's epoch and is completed by
-     * quiet's terminal fence. */
+    /* A fragmented transfer is one logical put for batch selection. */
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
+    shmem_transport_ofi_begin_put(ctx, epoch);
     while (frag_source < ((uint8_t *) source) + len) {
         frag_len = MIN(shmem_transport_ofi_max_msg_size,
                        (size_t) (((uint8_t *) source) + len - frag_source));
@@ -753,11 +828,8 @@ void shmem_transport_ofi_put_large(shmem_transport_ctx_t* ctx, void *target, con
         shmem_transport_ofi_record_put(ctx, pe);
 
         do {
-            ret = fi_write(ctx->ep,
-                           frag_source, frag_len,
-                           GET_MR_DESC(shmem_transport_ofi_get_mr_desc_index(source)),
-                           GET_DEST(dst), frag_target,
-                           key, NULL);
+            ret = shmem_transport_ofi_post_write(ctx, frag_source, frag_len,
+                                                 GET_DEST(dst), frag_target, key, 0);
         } while (try_again(ctx, ret, &polled));
 
         frag_source += frag_len;
@@ -767,8 +839,16 @@ void shmem_transport_ofi_put_large(shmem_transport_ctx_t* ctx, void *target, con
 }
 
 static inline
-void shmem_transport_put_nb(shmem_transport_ctx_t* ctx, void *target, const void *source, size_t len,
-                            int pe, long *completion)
+void shmem_transport_ofi_put_large(shmem_transport_ctx_t *ctx, void *target,
+                                   const void *source, size_t len, int pe)
+{
+    shmem_transport_ofi_put_large_chunk(ctx, target, source, len, pe, NULL);
+}
+
+static inline
+void shmem_transport_ofi_put_nb_chunk(shmem_transport_ctx_t* ctx, void *target,
+                                     const void *source, size_t len, int pe,
+                                     long *completion, uint64_t *epoch)
 {
     int ret = 0;
     uint64_t dst = (uint64_t) pe;
@@ -780,11 +860,12 @@ void shmem_transport_put_nb(shmem_transport_ctx_t* ctx, void *target, const void
 
     if (len <= shmem_transport_ofi_max_buffered_send) {
 
-        shmem_transport_put_scalar(ctx, target, source, len, pe);
+        shmem_transport_ofi_put_scalar_chunk(ctx, target, source, len, pe, epoch);
 
     } else if (len <= shmem_transport_ofi_bounce_buffer_size && ctx->bounce_buffers) {
 
         SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
+        shmem_transport_ofi_begin_put(ctx, epoch);
         shmem_transport_ofi_record_put(ctx, pe);
         shmem_transport_ofi_get_mr(target, pe, &addr, &key);
 
@@ -810,9 +891,17 @@ void shmem_transport_put_nb(shmem_transport_ctx_t* ctx, void *target, const void
         SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
 
     } else {
-        shmem_transport_ofi_put_large(ctx, target, source,len, pe);
+        shmem_transport_ofi_put_large_chunk(ctx, target, source, len, pe, epoch);
         (*completion)++;
     }
+}
+
+static inline
+void shmem_transport_put_nb(shmem_transport_ctx_t *ctx, void *target,
+                            const void *source, size_t len, int pe,
+                            long *completion)
+{
+    shmem_transport_ofi_put_nb_chunk(ctx, target, source, len, pe, completion, NULL);
 }
 
 static inline
@@ -831,6 +920,7 @@ void shmem_transport_put_signal_nbi(shmem_transport_ctx_t* ctx, void *target, co
         uint8_t *src_buf = (uint8_t *) source;
 
         SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
+        shmem_transport_ofi_begin_put(ctx, NULL);
         shmem_transport_ofi_record_put(ctx, pe);
 
         const struct iovec msg_iov = {
@@ -854,7 +944,7 @@ void shmem_transport_put_signal_nbi(shmem_transport_ctx_t* ctx, void *target, co
                                       };
 
         do {
-            ret = fi_writemsg(ctx->ep, &msg, FI_INJECT);
+            ret = fi_writemsg(ctx->ep, &msg, FI_INJECT | FI_DELIVERY_COMPLETE);
         } while (try_again(ctx, ret, &polled));
 
         SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
@@ -884,6 +974,7 @@ void shmem_transport_put_signal_nbi(shmem_transport_ctx_t* ctx, void *target, co
                                 };
 
         SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
+        shmem_transport_ofi_begin_put(ctx, NULL);
         while (frag_source < (((uint8_t *) source) + len)) {
             frag_len = MIN(shmem_transport_ofi_max_msg_size, 
                           (size_t) (((uint8_t *) source) + len - frag_source));
@@ -902,7 +993,7 @@ void shmem_transport_put_signal_nbi(shmem_transport_ctx_t* ctx, void *target, co
             shmem_transport_ofi_record_put(ctx, pe);
 
             do {
-                ret = fi_writemsg(ctx->ep, &msg, 0);
+                ret = fi_writemsg(ctx->ep, &msg, FI_DELIVERY_COMPLETE);
             } while (try_again(ctx, ret, &polled));
 
             frag_source += frag_len;
@@ -1220,14 +1311,10 @@ void shmem_transport_atomic(shmem_transport_ctx_t* ctx, void *target, const void
     shmem_transport_ofi_record_put(ctx, pe);
 
     do {
-        ret = fi_inject_atomic(ctx->ep,
-                               source,
-                               1,
-                               GET_DEST(dst),
-                               (uint64_t) addr,
-                               key,
-                               SHMEM_TRANSPORT_DTYPE(datatype),
-                               op);
+        ret = shmem_transport_ofi_post_atomic(ctx, source, 1, GET_DEST(dst),
+                                              (uint64_t) addr, key,
+                                              SHMEM_TRANSPORT_DTYPE(datatype), op,
+                                              FI_INJECT);
     } while (try_again(ctx, ret, &polled));
     SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
 }
@@ -1271,14 +1358,9 @@ void shmem_transport_atomicv(shmem_transport_ctx_t* ctx, void *target, const voi
         shmem_transport_ofi_record_put(ctx, pe);
 
         do {
-            ret = fi_inject_atomic(ctx->ep,
-                                   source,
-                                   len,
-                                   GET_DEST(dst),
-                                   (uint64_t) addr,
-                                   key,
-                                   dt,
-                                   op);
+            ret = shmem_transport_ofi_post_atomic(ctx, source, len, GET_DEST(dst),
+                                                  (uint64_t) addr, key, dt, op,
+                                                  FI_INJECT);
         } while (try_again(ctx, ret, &polled));
 
     } else if (full_len <=
@@ -1319,18 +1401,10 @@ void shmem_transport_atomicv(shmem_transport_ctx_t* ctx, void *target, const voi
             polled = 0;
             shmem_transport_ofi_record_put(ctx, pe);
             do {
-                ret = fi_atomic(ctx->ep,
-                                (void *)((char *)source +
-                                         (sent*SHMEM_Dtsize[dt])),
-                                chunksize,
-                                GET_MR_DESC(shmem_transport_ofi_get_mr_desc_index(source)),
-                                GET_DEST(dst),
-                                ((uint64_t) addr +
-                                 (sent*SHMEM_Dtsize[dt])),
-                                key,
-                                dt,
-                                op,
-                                NULL);
+                ret = shmem_transport_ofi_post_atomic(ctx,
+                    (const char *) source + sent * SHMEM_Dtsize[dt],
+                    chunksize, GET_DEST(dst),
+                    (uint64_t) addr + sent * SHMEM_Dtsize[dt], key, dt, op, 0);
             } while (try_again(ctx, ret, &polled));
 
             sent += chunksize;
