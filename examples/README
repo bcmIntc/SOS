@@ -21,3 +21,16 @@ For more detailed information visit the Getting Started Guide:
   https://github.com/Sandia-OpenSHMEM/SOS/wiki/Getting-Started-Guide
 
 The Licensing information can be found in the "LICENSE" file
+
+ofi_epoch_quiet.c checks remote completion and source reuse across multiple
+destinations, puts, signals, non-fetching atomics, repeated quiet epochs, and
+default/created contexts.  Run it with
+at least two PEs using the OFI transport.  A useful configuration matrix includes
+BOUNCE_SIZE=0 and an enabled bounce buffer, single-endpoint and separate-endpoint
+providers, both thread-completion settings, and messages larger than the
+provider's maximum message size (to exercise fragmentation).  The burst of
+512 scalar puts per destination also exercises progress under queue pressure;
+providers with small transmit queues make this check more demanding.  The test uses
+shmem_sync_all after quiet so a barrier's implicit quiet cannot hide missing
+completions.  Build with "make ofi_epoch_quiet" and run with, for example,
+"oshrun -n 4 ./ofi_epoch_quiet".

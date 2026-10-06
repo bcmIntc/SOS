@@ -319,9 +319,9 @@ AC_ARG_ENABLE([memcpy],
 
 AC_ARG_ENABLE([ofi-fence],
     [AS_HELP_STRING([--enable-ofi-fence],
-                    [Use FI_FENCE feature to optimize put-with-signal operations. (default: disabled)])])
+                    [Use FI_FENCE directly for put-with-signal operations; OFI quiet always requires FI_FENCE. (default: disabled)])])
 AS_IF([test "$enable_ofi_fence" = "yes"],
-      [AC_DEFINE([USE_FI_FENCE], [1], [If defined, the OFI transport will use FI_FENCE. Otherwise, transport layer fence is used.])])
+      [AC_DEFINE([USE_FI_FENCE], [1], [Use FI_FENCE directly for OFI put-with-signal; otherwise use transport quiet for signal ordering.])])
 
 AC_ARG_ENABLE([shr-atomics],
     [AS_HELP_STRING([--enable-shr-atomics],

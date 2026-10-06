@@ -6,6 +6,18 @@ Sandia OpenSHMEM
 Sandia OpenSHMEM is an implementation of the OpenSHMEM specification over
 Portals 4.0, the Open Fabrics Interface (OFI), and XPMEM.
 
+The OFI transport requires FI_FENCE and FI_DELIVERY_COMPLETE support, including
+zero-length RMA writes with these flags.  Writes are completed in epochs:
+shmem_quiet posts one terminal zero-length write to each destination touched by
+the context since its last quiet and waits for that write's CQ completion.
+Individual writes are not bound to a fabric write-completion counter.  Bounce
+buffers still use delivery-complete CQ events for reclamation, and reads retain
+their completion counter.  Software write statistics retain issued-operation counts;
+completed-write statistics advance at quiet (or a fence that performs quiet)
+and may lag operations that have already arrived.  The additional bounce-buffer
+statistics still advance on their delivery-complete CQ events.  Terminal writes
+are excluded from issued/completed statistics, but may appear in remote RMA counters.
+
 Please refer to the "tests-sos" repository (https://github.com/openshmem-org/tests-sos)
 to download only the unit tests and the performance test suite that are
 included with Sandia OpenSHMEM.

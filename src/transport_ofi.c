@@ -612,19 +612,13 @@ int bind_enable_ep_resources(shmem_transport_ctx_t *ctx)
         OFI_CHECK_RETURN_STR(ret, "fi_ep_bind STX to endpoint failed");
     }
 
-    /* Put counter captures completions for non-fetching operations (put,
-     * atomic, etc.) */
-    ret = fi_ep_bind(ctx->ep, &ctx->put_cntr->fid, FI_WRITE);
-    OFI_CHECK_RETURN_STR(ret, "fi_ep_bind put CNTR to endpoint failed");
-
     /* Get counter captures completions for fetching operations (get,
      * fetch-atomic, etc.) */
     ret = fi_ep_bind(ctx->ep, &ctx->get_cntr->fid, FI_READ);
     OFI_CHECK_RETURN_STR(ret, "fi_ep_bind get CNTR to endpoint failed");
 
-    /* In addition to incrementing the put counter, bounce buffered puts and
-     * non-fetching AMOs generate a CQ event that is used to reclaim the buffer
-     * (pointer is returned in event context) after the operation completes. */
+    /* Write completions are selective: terminal epoch fences and delivery
+     * completions used to reclaim bounce buffers generate CQ events. */
 
     /* Note: The CQ is bound with FI_RECV even though no receive capabilities
      * are enabled on this EP.  FI_RECV is required to drive progress for this
@@ -1488,11 +1482,8 @@ int query_for_fabric(struct fabric_info *info)
 #if ENABLE_TARGET_CNTR
     hints.caps |= FI_RMA_EVENT; /* want to use remote counters */
 #endif /* ENABLE_TARGET_CNTR */
-#ifdef USE_FI_FENCE
-    hints.caps |= FI_FENCE;     /* request fence capability; FI_FENCE adds
-                                   ordering semantics to fi_atomicmsg
-                                   for put with signal implementation */
-#endif
+    /* quiet uses a fenced delivery-complete write to finish each epoch. */
+    hints.caps |= FI_FENCE;
 #ifdef USE_FI_HMEM
     hints.caps |= FI_HMEM;
 #endif
@@ -1693,7 +1684,9 @@ static int shmem_transport_ofi_target_ep_init(void)
 
     struct fabric_info* info = &shmem_transport_ofi_info;
     info->p_info->ep_attr->tx_ctx_cnt = 0;
-    info->p_info->caps = FI_RMA | FI_ATOMIC | FI_REMOTE_READ | FI_REMOTE_WRITE;
+    /* CXI also uses the target EP's FI_FENCE capability to disable PCIe
+     * relaxed ordering when registering remote memory. */
+    info->p_info->caps = FI_RMA | FI_ATOMIC | FI_REMOTE_READ | FI_REMOTE_WRITE | FI_FENCE;
     if (shmem_transport_ofi_single_ep) {
         info->p_info->caps |= FI_WRITE | FI_READ | FI_RECV;
     }
@@ -1704,8 +1697,9 @@ static int shmem_transport_ofi_target_ep_init(void)
     info->p_info->mode = 0;
     info->p_info->tx_attr->mode = 0;
     info->p_info->rx_attr->mode = 0;
-    info->p_info->tx_attr->caps = FI_RMA | FI_ATOMIC;
-    info->p_info->rx_attr->caps = info->p_info->caps;
+    info->p_info->tx_attr->caps = FI_RMA | FI_ATOMIC | FI_FENCE;
+    /* FI_FENCE is a transmit capability, including for a shared target EP. */
+    info->p_info->rx_attr->caps = info->p_info->caps & ~FI_FENCE;
 
     ret = fi_endpoint(shmem_transport_ofi_domainfd,
                       info->p_info, &shmem_transport_ofi_target_ep, NULL);
@@ -1716,6 +1710,7 @@ static int shmem_transport_ofi_target_ep_init(void)
     OFI_CHECK_RETURN_STR(ret, "fi_ep_bind AV to target endpoint failed");
 
     struct fi_cq_attr cq_attr = {0};
+    cq_attr.format = FI_CQ_FORMAT_CONTEXT;
 
     ret = fi_cq_open(shmem_transport_ofi_domainfd, &cq_attr,
                      &shmem_transport_ofi_target_cq, NULL);
@@ -1738,26 +1733,10 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
 {
     int ret = 0;
 
-    struct fi_cntr_attr cntr_put_attr = {0};
     struct fi_cntr_attr cntr_get_attr = {0};
-    cntr_put_attr.events   = FI_CNTR_EVENTS_COMP;
     cntr_get_attr.events   = FI_CNTR_EVENTS_COMP;
 
-#if 0
-    /* Set FI_WAIT based on the put and get polling limits defined above */
-    if (shmem_transport_ofi_put_poll_limit < 0) {
-        cntr_put_attr.wait_obj = FI_WAIT_NONE;
-    } else {
-        cntr_put_attr.wait_obj = FI_WAIT_UNSPEC;
-    }
-    if (shmem_transport_ofi_get_poll_limit < 0) {
-        cntr_get_attr.wait_obj = FI_WAIT_NONE;
-    } else {
-        cntr_get_attr.wait_obj = FI_WAIT_UNSPEC;
-    }
-#endif
-        cntr_put_attr.wait_obj = FI_WAIT_UNSPEC;
-        cntr_get_attr.wait_obj = FI_WAIT_UNSPEC;
+    cntr_get_attr.wait_obj = FI_WAIT_UNSPEC;
 
     /* Allow provider to choose CQ size, since we are using FI_RM_ENABLED.
      * Context format is used to return bounce buffer pointers in the event
@@ -1768,8 +1747,9 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
     struct fabric_info* info = &shmem_transport_ofi_info;
 
     info->p_info->ep_attr->tx_ctx_cnt = shmem_transport_ofi_stx_max > 0 ? FI_SHARED_CONTEXT : 0;
-    info->p_info->caps = FI_RMA | FI_WRITE | FI_READ | FI_ATOMIC | FI_RECV;
-    info->p_info->tx_attr->op_flags = FI_DELIVERY_COMPLETE;
+    info->p_info->caps = FI_RMA | FI_WRITE | FI_READ | FI_ATOMIC | FI_RECV | FI_FENCE;
+    /* Ordinary writes need no delivery-completion notification. */
+    info->p_info->tx_attr->op_flags = 0;
     info->p_info->mode = 0;
     info->p_info->tx_attr->mode = 0;
     info->p_info->rx_attr->mode = 0;
@@ -1777,13 +1757,12 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
     info->p_info->rx_attr->caps = FI_RECV; /* to drive progress on the CQ */;
 
     ctx->id = id;
-#ifdef USE_CTX_LOCK
     SHMEM_MUTEX_INIT(ctx->lock);
-#endif
 
-    ret = fi_cntr_open(shmem_transport_ofi_domainfd, &cntr_put_attr,
-                       &ctx->put_cntr, NULL);
-    OFI_CHECK_RETURN_MSG(ret, "put_cntr creation failed (%s)\n", fi_strerror(errno));
+    ctx->put_epoch_dirty = calloc(shmem_internal_num_pes, sizeof(*ctx->put_epoch_dirty));
+    ctx->put_epoch_pes = calloc(shmem_internal_num_pes, sizeof(*ctx->put_epoch_pes));
+    if (!ctx->put_epoch_dirty || !ctx->put_epoch_pes)
+        RAISE_ERROR_STR("Out of memory when allocating OFI epoch destinations");
 
     ret = fi_cntr_open(shmem_transport_ofi_domainfd, &cntr_get_attr,
                        &ctx->get_cntr, NULL);
@@ -2132,7 +2111,7 @@ void shmem_transport_ctx_destroy(shmem_transport_ctx_t *ctx)
                   ctx->id, (unsigned long) ctx->options, ctx->stx_idx,
                   shmem_internal_my_pe,
                   SHMEM_TRANSPORT_OFI_CNTR_READ(&ctx->pending_put_cntr),
-                  ctx->put_cntr ? fi_cntr_read(ctx->put_cntr) : 0,
+                  ctx->completed_put_cntr,
                   shmem_internal_my_pe,
                   SHMEM_TRANSPORT_OFI_CNTR_READ(&ctx->pending_get_cntr),
                   ctx->get_cntr ? fi_cntr_read(ctx->get_cntr) : 0,
@@ -2185,11 +2164,6 @@ void shmem_transport_ctx_destroy(shmem_transport_ctx_t *ctx)
         SHMEM_MUTEX_UNLOCK(shmem_transport_ofi_lock);
     }
 
-    if (ctx->put_cntr && close_default_ctx) {
-        ret = fi_close(&ctx->put_cntr->fid);
-        OFI_CHECK_ERROR_MSG(ret, "Context put CNTR close failed (%s)\n", fi_strerror(errno));
-    }
-
     if (ctx->get_cntr && close_default_ctx) {
         ret = fi_close(&ctx->get_cntr->fid);
         OFI_CHECK_ERROR_MSG(ret, "Context get CNTR close failed (%s)\n", fi_strerror(errno));
@@ -2200,9 +2174,9 @@ void shmem_transport_ctx_destroy(shmem_transport_ctx_t *ctx)
         OFI_CHECK_ERROR_MSG(ret, "Context CQ close failed (%s)\n", fi_strerror(errno));
     }
 
-#ifdef USE_CTX_LOCK
     SHMEM_MUTEX_DESTROY(ctx->lock);
-#endif
+    free(ctx->put_epoch_dirty);
+    free(ctx->put_epoch_pes);
 
     if (ctx->id >= 0) {
         SHMEM_MUTEX_LOCK(shmem_transport_ofi_lock);
@@ -2286,11 +2260,8 @@ int shmem_transport_fini(void)
     ret = fi_close(&shmem_transport_ofi_target_ep->fid);
     OFI_CHECK_ERROR_MSG(ret, "Target endpoint close failed (%s)\n", fi_strerror(errno));
 
-    /* If single-endpoint mode, need to close the default context's put and get counters */
+    /* In single-endpoint mode the default context's read counter is deferred. */
     if (shmem_transport_ofi_single_ep) {
-        ret = fi_close(&shmem_transport_ctx_default.put_cntr->fid);
-        OFI_CHECK_ERROR_MSG(ret, "Default EP put CNTR close failed (%s)\n", fi_strerror(errno));
-
         ret = fi_close(&shmem_transport_ctx_default.get_cntr->fid);
         OFI_CHECK_ERROR_MSG(ret, "Default EP get CNTR close failed (%s)\n", fi_strerror(errno));
     }

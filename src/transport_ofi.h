@@ -346,14 +346,22 @@ struct shmem_internal_tid
 
 struct shmem_transport_ctx_t {
     int                             id;
-#ifdef USE_CTX_LOCK
+#ifdef ENABLE_THREADS
+    /* Epoch membership and posting must be serialized even with FI_THREAD_SAFE. */
     shmem_internal_mutex_t          lock;
 #endif
     long                            options;
     struct fid_ep*                  ep;
-    struct fid_cntr*                put_cntr;
     struct fid_cntr*                get_cntr;
     struct fid_cq*                  cq;
+    unsigned char                  *put_epoch_dirty;
+    int                            *put_epoch_pes;
+    size_t                          put_epoch_npes;
+    /* Only one terminal write is outstanding at a time.  The provider may
+     * use this storage for either FI_CONTEXT or FI_CONTEXT2. */
+    struct fi_context2              put_epoch_context;
+    bool                            put_epoch_complete;
+    uint64_t                        completed_put_cntr;
 #ifdef USE_CTX_LOCK
     /* Pending cntr accesses are protected by ctx lock */
     uint64_t                        pending_put_cntr;
@@ -376,28 +384,58 @@ extern shmem_transport_ctx_t shmem_transport_ctx_default;
 
 extern struct fid_ep* shmem_transport_ofi_target_ep;
 
+static inline
+void shmem_transport_ofi_ctx_lock(shmem_transport_ctx_t *ctx)
+{
+    if (ctx->options & (SHMEM_CTX_PRIVATE | SHMEM_CTX_SERIALIZED)) return;
+#ifdef USE_THREAD_COMPLETION
+    /* The default EP, target CQ and target counter share a completion
+     * mechanism in single-EP mode.  Use the target progress lock for all
+     * accesses, including posting, to satisfy FI_THREAD_COMPLETION. */
+    if (shmem_transport_ofi_single_ep && ctx == &shmem_transport_ctx_default) {
+        pthread_mutex_lock(&shmem_transport_ofi_progress_lock);
+        return;
+    }
+#endif
+    SHMEM_MUTEX_LOCK(ctx->lock);
+}
+
+static inline
+void shmem_transport_ofi_ctx_unlock(shmem_transport_ctx_t *ctx)
+{
+    if (ctx->options & (SHMEM_CTX_PRIVATE | SHMEM_CTX_SERIALIZED)) return;
+#ifdef USE_THREAD_COMPLETION
+    if (shmem_transport_ofi_single_ep && ctx == &shmem_transport_ctx_default) {
+        pthread_mutex_unlock(&shmem_transport_ofi_progress_lock);
+        return;
+    }
+#endif
+    SHMEM_MUTEX_UNLOCK(ctx->lock);
+}
+
+#define SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx) shmem_transport_ofi_ctx_lock(ctx)
+#define SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx) shmem_transport_ofi_ctx_unlock(ctx)
+
 #ifdef USE_CTX_LOCK
-#define SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx)                                       \
-    do {                                                                        \
-        if (!((ctx)->options & (SHMEM_CTX_PRIVATE | SHMEM_CTX_SERIALIZED)))     \
-            SHMEM_MUTEX_LOCK((ctx)->lock);                                      \
-    } while (0)
-
-#define SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx)                                     \
-    do {                                                                        \
-        if (!((ctx)->options & (SHMEM_CTX_PRIVATE | SHMEM_CTX_SERIALIZED)))     \
-            SHMEM_MUTEX_UNLOCK((ctx)->lock);                                    \
-    } while (0)
-
 #define SHMEM_TRANSPORT_OFI_CNTR_READ(cntr) *(cntr)
 #define SHMEM_TRANSPORT_OFI_CNTR_INC(cntr) (*(cntr))++
 
 #else
-#define SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx)
-#define SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx)
 #define SHMEM_TRANSPORT_OFI_CNTR_READ(cntr) shmem_internal_cntr_read(cntr)
 #define SHMEM_TRANSPORT_OFI_CNTR_INC(cntr) shmem_internal_cntr_inc(cntr)
 #endif /* USE_CTX_LOCK */
+
+/* Called under the context lock.  Issued counts are software statistics only;
+ * quiet never compares them with a fabric completion counter. */
+static inline
+void shmem_transport_ofi_record_put(shmem_transport_ctx_t *ctx, int pe)
+{
+    if (!ctx->put_epoch_dirty[pe]) {
+        ctx->put_epoch_dirty[pe] = 1;
+        ctx->put_epoch_pes[ctx->put_epoch_npes++] = pe;
+    }
+    SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
+}
 
 #define SHMEM_TRANSPORT_OFI_CTX_BB_LOCK(ctx)                                    \
     do {                                                                        \
@@ -446,8 +484,8 @@ extern size_t SHMEM_Dtsize[FI_DATATYPE_LAST];
 
 static inline void shmem_transport_get_wait(shmem_transport_ctx_t* ctx);
 
-/* Drain all available events from the CQ.  Note, ctx->bounce_buffers must be
- * locked before calling this routine */
+/* Drain all available events from the CQ.  The context must be locked; if
+ * bounce buffers are enabled, their free list must also be locked. */
 static inline
 void shmem_transport_ofi_drain_cq(shmem_transport_ctx_t *ctx)
 {
@@ -460,8 +498,15 @@ void shmem_transport_ofi_drain_cq(shmem_transport_ctx_t *ctx)
         if (ret == -FI_EAGAIN) break; /* No events */
 
         else if (ret == 1) {
+            if (buf.op_context == &ctx->put_epoch_context) {
+                ctx->put_epoch_complete = true;
+                continue;
+            }
             shmem_transport_ofi_frag_t *frag =
                 (shmem_transport_ofi_frag_t *) buf.op_context;
+
+            if (frag == NULL)
+                RAISE_ERROR_STR("CQ completion has no operation context");
 
             if (SHMEM_TRANSPORT_OFI_TYPE_BOUNCE == frag->mytype) {
                 shmem_free_list_free(ctx->bounce_buffers,
@@ -516,12 +561,16 @@ shmem_transport_ofi_bounce_buffer_t * create_bounce_buffer(shmem_transport_ctx_t
     return buff;
 }
 
+static inline int try_again(shmem_transport_ctx_t *ctx, const int ret,
+                            uint64_t *polled);
+
 static inline
 void shmem_transport_put_quiet(shmem_transport_ctx_t* ctx)
 {
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
 
-    /* Wait for bounce buffered operations to complete */
+    /* Reclaim bounce buffers using their delivery completions.  Unbuffered
+     * operations are completed by the terminal writes below. */
     if (ctx->bounce_buffers) {
         SHMEM_TRANSPORT_OFI_CTX_BB_LOCK(ctx);
 
@@ -532,24 +581,50 @@ void shmem_transport_put_quiet(shmem_transport_ctx_t* ctx)
         SHMEM_TRANSPORT_OFI_CTX_BB_UNLOCK(ctx);
     }
 
-    /* wait for put counter to meet outstanding count value */
+    for (size_t i = 0; i < ctx->put_epoch_npes; i++) {
+        int pe = ctx->put_epoch_pes[i];
+        uint8_t *addr;
+        uint64_t key, polled = 0;
+        int ret;
 
-    /* Note: the communication routines increment pending put counters before
-     * each FI call (thus before the corresponding event counter is
-     * incremented), but the completion routine below reads the counters in the
-     * reverse order: first the fid_cntr event counter, then the put issued
-     * counter.  We'll want to preserve this property in the future.
-     */
-    uint64_t cnt, cnt_new;
+        /* Use a registered symmetric address even though no bytes are
+         * transferred.  No user data or extra symmetric allocation is needed. */
+        shmem_transport_ofi_get_mr(shmem_internal_data_base, pe, &addr, &key);
+        const struct iovec iov = {
+            .iov_base = shmem_internal_data_base, .iov_len = 0
+        };
+        const struct fi_rma_iov rma_iov = {
+            .addr = (uint64_t) addr, .len = 0, .key = key
+        };
+        const struct fi_msg_rma msg = {
+            .msg_iov = &iov,
+            .desc = GET_MR_DESC_ADDR(shmem_transport_ofi_get_mr_desc_index(
+                                        shmem_internal_data_base)),
+            .iov_count = 1,
+            .addr = GET_DEST(pe),
+            .rma_iov = &rma_iov,
+            .rma_iov_count = 1,
+            .context = &ctx->put_epoch_context
+        };
 
-    cnt_new = SHMEM_TRANSPORT_OFI_CNTR_READ(&ctx->pending_put_cntr);
-    do {
-        cnt = cnt_new;
-        ssize_t ret = fi_cntr_wait(ctx->put_cntr, cnt, -1);
-        cnt_new = SHMEM_TRANSPORT_OFI_CNTR_READ(&ctx->pending_put_cntr);
-        OFI_CTX_CHECK_ERROR(ctx, ret);
-    } while (cnt < cnt_new);
-    shmem_internal_assert(cnt == cnt_new);
+        ctx->put_epoch_complete = false;
+        do {
+            ret = fi_writemsg(ctx->ep, &msg,
+                              FI_FENCE | FI_DELIVERY_COMPLETE | FI_COMPLETION);
+        } while (try_again(ctx, ret, &polled));
+
+        /* Only the terminal operation generates a write-completion event
+         * (apart from events needed to reclaim bounce buffers). */
+        if (ctx->bounce_buffers) SHMEM_TRANSPORT_OFI_CTX_BB_LOCK(ctx);
+        while (!ctx->put_epoch_complete) {
+            shmem_transport_ofi_drain_cq(ctx);
+            shmem_transport_probe();
+        }
+        if (ctx->bounce_buffers) SHMEM_TRANSPORT_OFI_CTX_BB_UNLOCK(ctx);
+        ctx->put_epoch_dirty[pe] = 0;
+    }
+    ctx->put_epoch_npes = 0;
+    ctx->completed_put_cntr = SHMEM_TRANSPORT_OFI_CNTR_READ(&ctx->pending_put_cntr);
 
     SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
 }
@@ -594,16 +669,10 @@ int try_again(shmem_transport_ctx_t *ctx, const int ret, uint64_t *polled) {
                 SHMEM_TRANSPORT_OFI_CTX_BB_UNLOCK(ctx);
             }
             else {
-                /* Poke CQ for errors to encourage progress */
-                struct fi_cq_err_entry e = {0};
-                ssize_t ret = fi_cq_readerr(ctx->cq, (void *)&e, 0);
-                if (ret == 1) {
-                    const char *errmsg = fi_cq_strerror(ctx->cq, e.prov_errno,
-                                                        e.err_data, NULL, 0);
-                    RAISE_ERROR_MSG("Error in operation: %s\n", errmsg);
-                } else if (ret && ret != -FI_EAGAIN) {
-                    RAISE_ERROR_MSG("Error reading from CQ (%zd)\n", ret);
-                }
+                /* Reading errors alone need not progress the provider.  In
+                 * single-EP/thread-completion mode probe also cannot acquire
+                 * the shared lock held here, so progress this CQ directly. */
+                shmem_transport_ofi_drain_cq(ctx);
             }
 
             shmem_transport_probe();
@@ -642,7 +711,7 @@ void shmem_transport_put_scalar(shmem_transport_ctx_t* ctx, void *target, const
     shmem_internal_assert(len <= shmem_transport_ofi_max_buffered_send);
 
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
-    SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
+    shmem_transport_ofi_record_put(ctx, pe);
 
     do {
 
@@ -673,15 +742,15 @@ void shmem_transport_ofi_put_large(shmem_transport_ctx_t* ctx, void *target, con
     uint64_t frag_target = (uint64_t) addr;
     size_t frag_len = len;
 
-    /* operation generates counting events and must be completed by
-     * quiet. */
+    /* Each fragment belongs to the destination's epoch and is completed by
+     * quiet's terminal fence. */
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
     while (frag_source < ((uint8_t *) source) + len) {
         frag_len = MIN(shmem_transport_ofi_max_msg_size,
                        (size_t) (((uint8_t *) source) + len - frag_source));
         polled = 0;
 
-        SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
+        shmem_transport_ofi_record_put(ctx, pe);
 
         do {
             ret = fi_write(ctx->ep,
@@ -716,7 +785,7 @@ void shmem_transport_put_nb(shmem_transport_ctx_t* ctx, void *target, const void
     } else if (len <= shmem_transport_ofi_bounce_buffer_size && ctx->bounce_buffers) {
 
         SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
-        SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
+        shmem_transport_ofi_record_put(ctx, pe);
         shmem_transport_ofi_get_mr(target, pe, &addr, &key);
 
         shmem_transport_ofi_bounce_buffer_t *buff =
@@ -762,7 +831,7 @@ void shmem_transport_put_signal_nbi(shmem_transport_ctx_t* ctx, void *target, co
         uint8_t *src_buf = (uint8_t *) source;
 
         SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
-        SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
+        shmem_transport_ofi_record_put(ctx, pe);
 
         const struct iovec msg_iov = {
                                        .iov_base = src_buf,
@@ -785,7 +854,7 @@ void shmem_transport_put_signal_nbi(shmem_transport_ctx_t* ctx, void *target, co
                                       };
 
         do {
-            ret = fi_writemsg(ctx->ep, &msg, FI_DELIVERY_COMPLETE | FI_INJECT);
+            ret = fi_writemsg(ctx->ep, &msg, FI_INJECT);
         } while (try_again(ctx, ret, &polled));
 
         SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
@@ -830,10 +899,10 @@ void shmem_transport_put_signal_nbi(shmem_transport_ctx_t* ctx, void *target, co
             msg.rma_iov = &rma_iov;
             msg.context = frag_source;
 
-            SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
+            shmem_transport_ofi_record_put(ctx, pe);
 
             do {
-                ret = fi_writemsg(ctx->ep, &msg, FI_DELIVERY_COMPLETE);
+                ret = fi_writemsg(ctx->ep, &msg, 0);
             } while (try_again(ctx, ret, &polled));
 
             frag_source += frag_len;
@@ -858,7 +927,7 @@ void shmem_transport_put_signal_nbi(shmem_transport_ctx_t* ctx, void *target, co
     int atomic_op = (sig_op == SHMEM_SIGNAL_ADD) ? FI_SUM : FI_ATOMIC_WRITE;
 
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
-    SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
+    shmem_transport_ofi_record_put(ctx, pe);
 
     const struct fi_ioc msg_iov_signal = {
                                           .addr = (uint8_t *) &signal,
@@ -1148,7 +1217,7 @@ void shmem_transport_atomic(shmem_transport_ctx_t* ctx, void *target, const void
     shmem_internal_assert(SHMEM_Dtsize[SHMEM_TRANSPORT_DTYPE(datatype)] == len);
 
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
-    SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
+    shmem_transport_ofi_record_put(ctx, pe);
 
     do {
         ret = fi_inject_atomic(ctx->ep,
@@ -1199,7 +1268,7 @@ void shmem_transport_atomicv(shmem_transport_ctx_t* ctx, void *target, const voi
 
         polled = 0;
 
-        SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
+        shmem_transport_ofi_record_put(ctx, pe);
 
         do {
             ret = fi_inject_atomic(ctx->ep,
@@ -1220,7 +1289,7 @@ void shmem_transport_atomicv(shmem_transport_ctx_t* ctx, void *target, const voi
             create_bounce_buffer(ctx, source, full_len);
 
         polled = 0;
-        SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
+        shmem_transport_ofi_record_put(ctx, pe);
 
         const struct fi_ioc        msg_iov = { .addr = buff->data, .count = len };
         const struct fi_rma_ioc    rma_iov = { .addr = (uint64_t) addr, .count = len, .key = key };
@@ -1248,7 +1317,7 @@ void shmem_transport_atomicv(shmem_transport_ctx_t* ctx, void *target, const voi
             size_t chunksize = MIN((len-sent),
                                    (max_atomic_size/SHMEM_Dtsize[dt]));
             polled = 0;
-            SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
+            shmem_transport_ofi_record_put(ctx, pe);
             do {
                 ret = fi_atomic(ctx->ep,
                                 (void *)((char *)source +
@@ -1573,7 +1642,7 @@ uint64_t shmem_transport_pcntr_get_completed_write(shmem_transport_ctx_t *ctx)
 {
     uint64_t cnt;
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
-    cnt = fi_cntr_read(ctx->put_cntr);
+    cnt = ctx->completed_put_cntr;
     SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
 
     if (ctx->options & SHMEMX_CTX_BOUNCE_BUFFER) {
@@ -1626,7 +1695,7 @@ void shmem_transport_pcntr_get_all(shmem_transport_ctx_t *ctx, shmemx_pcntr_t *p
         pcntr->pending_put = ctx->pending_bb_cntr;
         SHMEM_TRANSPORT_OFI_CTX_BB_UNLOCK(ctx);
     }
-    pcntr->completed_put += fi_cntr_read(ctx->put_cntr);
+    pcntr->completed_put += ctx->completed_put_cntr;
     pcntr->completed_get = fi_cntr_read(ctx->get_cntr);
 
     pcntr->pending_put += SHMEM_TRANSPORT_OFI_CNTR_READ(&ctx->pending_put_cntr);
