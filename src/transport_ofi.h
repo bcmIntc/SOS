@@ -374,17 +374,21 @@ struct shmem_transport_ctx_t {
     struct shmem_transport_ctx_t   *atomic_next;
     uint64_t                        atomic_last_put;
     uint64_t                        atomic_last_get;
+    uint64_t                        atomic_profile_calls;
+    uint64_t                        atomic_profile_handoff_checks;
+    uint64_t                        atomic_profile_handoff_drains;
+    uint64_t                        atomic_profile_parent_put_ns;
+    uint64_t                        atomic_profile_parent_get_ns;
+    uint64_t                        atomic_profile_handoff_put_ns;
+    uint64_t                        atomic_profile_handoff_get_ns;
 };
 
 typedef struct shmem_transport_ctx_t shmem_transport_ctx_t;
 extern shmem_transport_ctx_t shmem_transport_ctx_default;
 
-/* Optional dedicated internal context for the hierarchical barrier's internode
- * pSync puts, created when SHMEM_OFI_COLL_CONTEXT or SHMEM_OFI_COLL_TCLASS is
- * set, so the barrier can queue separately from user data and, with the class
- * knob, live on a different CXI traffic class.  The transport-neutral handle used
- * by the collective code, shmem_internal_coll_ctx, is declared in shmem_comm.h;
- * it points here when enabled and at the default context otherwise. */
+/* Optional internal context for the hierarchical barrier's internode pSync puts.
+ * It owns an endpoint unless sharing was requested, in which case the handle in
+ * shmem_comm.h points at the default context's atomic companion instead. */
 extern shmem_transport_ctx_t shmem_transport_ctx_coll;
 extern shmem_transport_ctx_t *shmem_transport_ofi_atomic_contexts;
 extern pthread_mutex_t shmem_transport_ofi_atomic_lock;
@@ -444,9 +448,9 @@ void shmem_transport_probe(void)
         if (!shmem_transport_ofi_single_ep && ret == 1)
             RAISE_WARN_STR("Unexpected event");
 
-        /* The dedicated collective context has an endpoint and a completion
-         * queue of its own, so the read above does not progress it.  Under
-         * manual progress that matters: a PE waiting on a peer's phase-2 stamp
+        /* A separately allocated collective context has a CQ of its own; a
+         * merged context is instead visited in the atomic companion list.
+         * Under manual progress, a PE waiting on a peer's phase-2 stamp
          * spins on this function alone, and the operation it is waiting to have
          * pushed was issued on that context, so without a read here the barrier
          * can wait on progress nothing is driving.  Count 0 because no operation
@@ -602,6 +606,9 @@ static inline void
 shmem_transport_atomic_handoff(shmem_transport_ctx_t *ctx)
 {
     if (ctx->atomic_ctx) {
+        bool profile = shmem_internal_params.OFI_ATOMIC_PROFILE && shmem_internal_my_pe == 0;
+        if (profile)
+            __atomic_fetch_add(&ctx->atomic_profile_handoff_checks, 1, __ATOMIC_RELAXED);
         SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx->atomic_ctx);
         uint64_t puts = SHMEM_TRANSPORT_OFI_CNTR_READ(&ctx->atomic_ctx->pending_put_cntr);
         uint64_t gets = SHMEM_TRANSPORT_OFI_CNTR_READ(&ctx->atomic_ctx->pending_get_cntr);
@@ -610,8 +617,22 @@ shmem_transport_atomic_handoff(shmem_transport_ctx_t *ctx)
             __atomic_load_n(&ctx->atomic_last_get, __ATOMIC_ACQUIRE) == gets)
             return;
 
+        if (profile)
+            __atomic_fetch_add(&ctx->atomic_profile_handoff_drains, 1, __ATOMIC_RELAXED);
+        double start = 0, middle;
+        if (profile)
+            start = shmem_internal_wtime();
         shmem_transport_put_quiet(ctx->atomic_ctx);
+        if (profile)
+            middle = shmem_internal_wtime();
         shmem_transport_get_wait(ctx->atomic_ctx);
+        if (profile) {
+            double end = shmem_internal_wtime();
+            __atomic_fetch_add(&ctx->atomic_profile_handoff_put_ns,
+                               (uint64_t) ((middle - start) * 1.0e9), __ATOMIC_RELAXED);
+            __atomic_fetch_add(&ctx->atomic_profile_handoff_get_ns,
+                               (uint64_t) ((end - middle) * 1.0e9), __ATOMIC_RELAXED);
+        }
         __atomic_store_n(&ctx->atomic_last_put,
                          puts, __ATOMIC_RELEASE);
         __atomic_store_n(&ctx->atomic_last_get, gets, __ATOMIC_RELEASE);
@@ -621,11 +642,28 @@ shmem_transport_atomic_handoff(shmem_transport_ctx_t *ctx)
 static inline shmem_transport_ctx_t *
 shmem_transport_user_atomic_ctx(shmem_transport_ctx_t *ctx)
 {
+    bool profile = shmem_internal_params.OFI_ATOMIC_PROFILE && shmem_internal_my_pe == 0;
+    if (profile)
+        __atomic_fetch_add(&ctx->atomic_profile_calls, 1, __ATOMIC_RELAXED);
     if (ctx->atomic_ctx == NULL)
         return ctx;
 
-    shmem_transport_put_quiet(ctx);
-    shmem_transport_get_wait(ctx);
+    if (shmem_internal_params.OFI_ATOMIC_PRE_QUIET) {
+        double start = 0, middle;
+        if (profile)
+            start = shmem_internal_wtime();
+        shmem_transport_put_quiet(ctx);
+        if (profile)
+            middle = shmem_internal_wtime();
+        shmem_transport_get_wait(ctx);
+        if (profile) {
+            double end = shmem_internal_wtime();
+            __atomic_fetch_add(&ctx->atomic_profile_parent_put_ns,
+                               (uint64_t) ((middle - start) * 1.0e9), __ATOMIC_RELAXED);
+            __atomic_fetch_add(&ctx->atomic_profile_parent_get_ns,
+                               (uint64_t) ((end - middle) * 1.0e9), __ATOMIC_RELAXED);
+        }
+    }
     return ctx->atomic_ctx;
 }
 
@@ -637,6 +675,11 @@ int shmem_transport_fence(shmem_transport_ctx_t* ctx)
     /* Communication is unordered; must wait for puts and buffered (injected)
      * non-fetching atomics to be completed in order to ensure ordering. */
     shmem_transport_put_quiet(ctx);
+#else
+    /* A fence on the public context must also order prior parent puts before
+     * later operations on the paired atomic endpoint. */
+    if (ctx->atomic_ctx && !shmem_internal_params.OFI_ATOMIC_PRE_QUIET)
+        shmem_transport_put_quiet(ctx);
 #endif
     /* Complete fetching ops; needed to support nonblocking fetch-atomics */
     shmem_transport_get_wait(ctx);

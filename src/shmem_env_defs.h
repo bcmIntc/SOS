@@ -144,6 +144,19 @@ SHMEM_INTERNAL_ENV_DEF(OFI_ATOMIC_CONTEXT, bool, false, SHMEM_INTERNAL_ENV_CAT_T
 SHMEM_INTERNAL_ENV_DEF(OFI_ATOMIC_TCLASS, string, "unspec", SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Traffic class for public atomic contexts; non-unspec implies "
                        "OFI_ATOMIC_CONTEXT, unspec inherits OFI_TCLASS")
+SHMEM_INTERNAL_ENV_DEF(OFI_MERGE_COLL_ATOMIC_CONTEXT, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Share the hierarchical barrier's transmit endpoint with the default "
+                       "OpenSHMEM context's atomic companion; requires both contexts and "
+                       "matching traffic classes. User-created contexts remain independent")
+SHMEM_INTERNAL_ENV_DEF(OFI_ATOMIC_PRE_QUIET, bool, true, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Complete the caller context before each public atomic on its paired endpoint; "
+                       "0 allows earlier puts to overlap (fence and quiet still synchronize)")
+SHMEM_INTERNAL_ENV_DEF(OFI_ATOMIC_POST_HANDOFF, bool, true, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Drain the paired atomic endpoint before later ordinary operations; "
+                       "0 defers completion until explicit fence, quiet, or destruction")
+SHMEM_INTERNAL_ENV_DEF(OFI_ATOMIC_PROFILE, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Report PE 0's public atomic calls and context handoff wait times "
+                       "at finalize (diagnostic; changes timing)")
 #endif
 
 #ifdef USE_UCX

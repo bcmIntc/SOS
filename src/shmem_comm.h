@@ -51,7 +51,8 @@ static inline void
 shmem_internal_atomic_handoff(shmem_ctx_t ctx)
 {
 #ifdef USE_OFI
-    shmem_transport_atomic_handoff((shmem_transport_ctx_t *) ctx);
+    if (shmem_internal_params.OFI_ATOMIC_POST_HANDOFF)
+        shmem_transport_atomic_handoff((shmem_transport_ctx_t *) ctx);
 #else
     (void) ctx;
 #endif

@@ -276,10 +276,9 @@ static inline int coll_ctx_ppn_ok(void)
     return min_ppn <= 0 || shmem_runtime_get_node_size() >= min_ppn;
 }
 
-/* Does the dedicated collective context exist.  Distinct from having been asked
- * for, and it is this that teardown and every post-creation check must test: a
- * startup that returned early leaves the context a zeroed global, whose stx_idx
- * of 0 reads as a valid pool index. */
+/* Has a separate or merged barrier transmit context been enabled?  A startup
+ * that returned early leaves the separate context a zeroed global, whose
+ * stx_idx of 0 reads as a valid pool index. */
 static inline int coll_ctx_created(void)
 {
     return shmem_internal_coll_ctx != (shmem_ctx_t) &shmem_transport_ctx_default;
@@ -2334,14 +2333,18 @@ static int shmem_transport_ofi_atomic_ctx_init(shmem_transport_ctx_t *parent,
     if (atomic == NULL)
         RAISE_ERROR_STR("Out of memory when allocating OFI atomic context");
 
-    atomic->id = SHMEM_TRANSPORT_CTX_ATOMIC_ID;
+    /* The shared endpoint needs the barrier's WAW transmit-order request. */
+    int id = (parent == &shmem_transport_ctx_default &&
+              shmem_internal_params.OFI_MERGE_COLL_ATOMIC_CONTEXT)
+           ? SHMEM_TRANSPORT_CTX_COLL_ID : SHMEM_TRANSPORT_CTX_ATOMIC_ID;
+    atomic->id = id;
     atomic->stx_idx = -1;
     atomic->team = parent->team;
     atomic->options = parent->options & ~SHMEMX_CTX_BOUNCE_BUFFER;
     atomic->tclass = shmem_transport_ofi_atomic_tclass != FI_TC_UNSPEC
                    ? shmem_transport_ofi_atomic_tclass : parent->tclass;
 
-    int ret = shmem_transport_ofi_ctx_init(atomic, SHMEM_TRANSPORT_CTX_ATOMIC_ID);
+    int ret = shmem_transport_ofi_ctx_init(atomic, id);
     if (ret != 0) {
         RAISE_WARN_MSG("Dedicated atomic context creation failed for context %d (%d)\n",
                        parent->id, ret);
@@ -2416,6 +2419,24 @@ int shmem_transport_init(void)
         shmem_transport_ofi_atomic_tclass == FI_TC_UNSPEC)
         RAISE_ERROR_MSG("Invalid SHMEM_OFI_ATOMIC_TCLASS '%s'\n",
                         shmem_internal_params.OFI_ATOMIC_TCLASS);
+
+    if (shmem_internal_params.OFI_MERGE_COLL_ATOMIC_CONTEXT) {
+        if (!coll_ctx_requested() ||
+            (!shmem_internal_params.OFI_ATOMIC_CONTEXT &&
+             shmem_transport_ofi_atomic_tclass == FI_TC_UNSPEC))
+            RAISE_ERROR_STR("SHMEM_OFI_MERGE_COLL_ATOMIC_CONTEXT requires both the "
+                            "collective and atomic contexts");
+        uint32_t coll_class = shmem_transport_ofi_coll_tclass != FI_TC_UNSPEC
+                            ? shmem_transport_ofi_coll_tclass : shmem_transport_ofi_tclass;
+        uint32_t atomic_class = shmem_transport_ofi_atomic_tclass != FI_TC_UNSPEC
+                              ? shmem_transport_ofi_atomic_tclass : shmem_transport_ofi_tclass;
+        if (coll_class != atomic_class)
+            RAISE_ERROR_STR("Merged collective and atomic contexts require matching "
+                            "effective traffic classes");
+        if (shmem_internal_params.OFI_COLL_CTX_EP_PROBE)
+            RAISE_ERROR_STR("SHMEM_OFI_COLL_CTX_EP_PROBE cannot alter a shared "
+                            "collective and atomic endpoint");
+    }
 
     ret = query_for_fabric(&shmem_transport_ofi_info);
     if (ret != 0) return ret;
@@ -2531,6 +2552,12 @@ int shmem_transport_startup(void)
         DEBUG_MSG("Auto-set STX max to %ld\n", shmem_transport_ofi_stx_max);
     }
 
+    if (shmem_internal_params.OFI_MERGE_COLL_ATOMIC_CONTEXT && !coll_ctx_ppn_ok())
+        RAISE_ERROR_MSG("SHMEM_OFI_MERGE_COLL_ATOMIC_CONTEXT requires this node's PE count "
+                        "to reach SHMEM_OFI_COLL_CTX_THRESHOLD=%ld; set the threshold to 0 "
+                        "to enable merging at any node size\n",
+                        shmem_internal_params.OFI_COLL_CTX_THRESHOLD);
+
     ret = shmem_transport_ofi_stx_pool_init();
     if (ret != 0) return ret;
 
@@ -2555,8 +2582,16 @@ int shmem_transport_startup(void)
      * their domain, and its STX, where the provider has any, comes from the pool
      * sized above. */
     if (coll_ctx_requested() && coll_ctx_ppn_ok()) {
-        ret = shmem_transport_ofi_coll_ctx_init();
-        if (ret != 0) return ret;
+        if (shmem_internal_params.OFI_MERGE_COLL_ATOMIC_CONTEXT) {
+            shmem_internal_assert(shmem_transport_ctx_default.atomic_ctx != NULL);
+            shmem_internal_coll_ctx = (shmem_ctx_t) shmem_transport_ctx_default.atomic_ctx;
+            if (shmem_internal_my_pe == 0)
+                DEBUG_MSG("Hierarchical barrier and default-context atomics share one "
+                          "transmit endpoint on the requested traffic class\n");
+        } else {
+            ret = shmem_transport_ofi_coll_ctx_init();
+            if (ret != 0) return ret;
+        }
     } else if (coll_ctx_requested() && shmem_internal_my_pe == 0) {
         RAISE_WARN_MSG("This node runs %d PEs, below SHMEM_OFI_COLL_CTX_THRESHOLD=%ld, so the "
                        "dedicated collective context is NOT created and SHMEM_OFI_COLL_TCLASS, "
@@ -2585,7 +2620,8 @@ int shmem_transport_startup(void)
      * and the STX warning below therefore cannot fire here.  So the two endpoints really
      * are separate queues in both configurations.  A warning does not need the
      * mechanism; it needs the reader to measure rather than assume. */
-    if (coll_ctx_created() && shmem_internal_params.OFI_DISABLE_SINGLE_EP &&
+    if (coll_ctx_created() && !shmem_internal_params.OFI_MERGE_COLL_ATOMIC_CONTEXT &&
+        shmem_internal_params.OFI_DISABLE_SINGLE_EP &&
         shmem_internal_my_pe == 0) {
         RAISE_WARN_STR("SHMEM_OFI_COLL_CONTEXT and SHMEM_OFI_DISABLE_SINGLE_EP are both "
                        "set, and what that combination is worth differs by machine.  "
@@ -2603,9 +2639,10 @@ int shmem_transport_startup(void)
 
     /* Here rather than in coll_ctx_init, because it compares against the default
      * context's STX. */
+    shmem_transport_ctx_t *coll_ctx = (shmem_transport_ctx_t *) shmem_internal_coll_ctx;
     if (coll_ctx_created() && shmem_internal_my_pe == 0 &&
-        shmem_transport_ctx_coll.stx_idx >= 0 &&
-        shmem_transport_ctx_coll.stx_idx == shmem_transport_ctx_default.stx_idx) {
+        coll_ctx->stx_idx >= 0 &&
+        coll_ctx->stx_idx == shmem_transport_ctx_default.stx_idx) {
         char buf[32];
         RAISE_WARN_MSG("The dedicated collective context (traffic class '%s') shares one "
                        "transmit context (STX %d) with the default context on this "
@@ -2614,8 +2651,8 @@ int shmem_transport_startup(void)
                        "happen.  If the provider also binds the traffic class to the STX "
                        "rather than the endpoint, both carry a single class.  Confirm the "
                        "split from the fabric counters before reading a result\n",
-                       tclass_str(shmem_transport_ctx_coll.tclass, buf, sizeof(buf)),
-                       shmem_transport_ctx_coll.stx_idx);
+                       tclass_str(coll_ctx->tclass, buf, sizeof(buf)),
+                       coll_ctx->stx_idx);
     }
 
     ret = atomic_limitations_check();
@@ -2725,6 +2762,32 @@ void shmem_transport_ctx_destroy(shmem_transport_ctx_t *ctx)
 
     if (ctx == NULL)
         return;
+
+    if (shmem_internal_params.OFI_ATOMIC_PROFILE && shmem_internal_my_pe == 0 &&
+        ctx->id != SHMEM_TRANSPORT_CTX_ATOMIC_ID &&
+        ctx->id != SHMEM_TRANSPORT_CTX_COLL_ID) {
+        fprintf(stderr,
+                "[%04d] ATOMIC_PROFILE ctx=%d enabled=%d pre_quiet=%d post_handoff=%d routing_calls=%" PRIu64
+                " parent_puts=%" PRIu64 " parent_gets=%" PRIu64
+                " atomic_puts=%" PRIu64 " atomic_gets=%" PRIu64
+                " handoff_checks=%" PRIu64 " handoff_drains=%" PRIu64
+                " pre_put_wait_s=%.6f pre_get_wait_s=%.6f"
+                " post_put_wait_s=%.6f post_get_wait_s=%.6f\n",
+                shmem_internal_my_pe, ctx->id, ctx->atomic_ctx != NULL,
+                shmem_internal_params.OFI_ATOMIC_PRE_QUIET,
+                shmem_internal_params.OFI_ATOMIC_POST_HANDOFF,
+                __atomic_load_n(&ctx->atomic_profile_calls, __ATOMIC_RELAXED),
+                SHMEM_TRANSPORT_OFI_CNTR_READ(&ctx->pending_put_cntr),
+                SHMEM_TRANSPORT_OFI_CNTR_READ(&ctx->pending_get_cntr),
+                ctx->atomic_ctx ? SHMEM_TRANSPORT_OFI_CNTR_READ(&ctx->atomic_ctx->pending_put_cntr) : 0,
+                ctx->atomic_ctx ? SHMEM_TRANSPORT_OFI_CNTR_READ(&ctx->atomic_ctx->pending_get_cntr) : 0,
+                __atomic_load_n(&ctx->atomic_profile_handoff_checks, __ATOMIC_RELAXED),
+                __atomic_load_n(&ctx->atomic_profile_handoff_drains, __ATOMIC_RELAXED),
+                __atomic_load_n(&ctx->atomic_profile_parent_put_ns, __ATOMIC_RELAXED) / 1.0e9,
+                __atomic_load_n(&ctx->atomic_profile_parent_get_ns, __ATOMIC_RELAXED) / 1.0e9,
+                __atomic_load_n(&ctx->atomic_profile_handoff_put_ns, __ATOMIC_RELAXED) / 1.0e9,
+                __atomic_load_n(&ctx->atomic_profile_handoff_get_ns, __ATOMIC_RELAXED) / 1.0e9);
+    }
 
     if (ctx->atomic_ctx) {
         shmem_transport_ctx_t *atomic = ctx->atomic_ctx;
@@ -2842,14 +2905,13 @@ int shmem_transport_fini(void)
     shmem_transport_ofi_stx_kvs_t* e;
     int stx_len = 0;
 
-    /* The dedicated collective context, like the default, is not in any team's
-     * contexts array, so it is torn down here.  It owns its own endpoint, CQ and
-     * counters (its id is not the default id), so ctx_destroy closes them all in
-     * place; nothing about it is deferred to the target-endpoint teardown below. */
-    if (coll_ctx_created()) {
+    /* A separate collective context owns its endpoint, CQ, and counters.
+     * When merged, the default context owns the shared atomic companion. */
+    if (shmem_internal_coll_ctx == (shmem_ctx_t) &shmem_transport_ctx_coll) {
         shmem_transport_quiet(&shmem_transport_ctx_coll);
         shmem_transport_ctx_destroy(&shmem_transport_ctx_coll);
     }
+    shmem_internal_coll_ctx = (shmem_ctx_t) &shmem_transport_ctx_default;
 
     /* The default context is not inserted into the list of contexts on
      * SHMEM_TEAM_WORLD, so it must be destroyed here */

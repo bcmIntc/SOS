@@ -317,6 +317,9 @@ options.
         and 32 is not located, so the default is the lowest count measured to
         gain.  Set to 0 to create the context at any node size.  The count is
         this node's, not the job's smallest node.
+        When sharing the barrier and atomic endpoint is explicitly requested,
+        failing this threshold is an error rather than silently leaving them
+        unmerged.
 
     SHMEM_OFI_COLL_CTX_UNRESTRICTED (default: on)
         Request write-after-write ordering on the dedicated collective context
@@ -344,13 +347,40 @@ options.
         the resource cost can be significant.  Endpoint-creation failures
         fail initialization or context creation rather than being ignored.
 
-        Before routing a public atomic, SOS completes earlier operations on
-        its caller context.  Before subsequent operations on that context,
-        fence, quiet or destruction, it completes outstanding atomics from
-        the paired endpoint.  Consecutive nonblocking atomic fetches can stay
-        in flight until quiet.  These ordering handoffs can cost more than
-        queue separation saves; this is an experimental opt-in, not a new
-        default.  No atomic performance benefit has yet been established.
+        By default, before routing a public atomic SOS completes earlier
+        operations on its caller context.  This conservative pre-atomic
+        drain can be disabled with SHMEM_OFI_ATOMIC_PRE_QUIET=0.  Before
+        subsequent operations on that context, SOS normally completes
+        outstanding atomics from the paired endpoint; this eager handoff
+        can be disabled with SHMEM_OFI_ATOMIC_POST_HANDOFF=0.  Fence, quiet
+        and destruction continue to synchronize both endpoints.  Consecutive
+        nonblocking atomic fetches can stay in flight until quiet.  These
+        handoffs can cost more than queue separation saves; this is an
+        experimental opt-in, not a new default.
+
+    SHMEM_OFI_MERGE_COLL_ATOMIC_CONTEXT (default: off)
+        Share the hierarchical barrier's internode transmit endpoint with the
+        default OpenSHMEM context's atomic companion.  User-created OpenSHMEM
+        contexts keep their own atomic companions and their own quiet, fence
+        and lifetime semantics.  When both contexts would otherwise exist,
+        this saves one OFI endpoint, CQ and pair of completion counters per PE
+        (104 of each per node at 104 PPN).  The normal separate-endpoint mode
+        remains the default.
+
+        Both contexts must be requested, their effective traffic classes must
+        match, and the node must meet SHMEM_OFI_COLL_CTX_THRESHOLD.  Mismatches
+        and the collective-endpoint diagnostic probe fail initialization rather
+        than claiming to share an endpoint.  For the CXI comparison, set
+        SHMEM_OFI_ATOMIC_CONTEXT=1, SHMEM_OFI_ATOMIC_TCLASS=low_latency,
+        SHMEM_OFI_COLL_CONTEXT=1 and SHMEM_OFI_COLL_TCLASS=low_latency; change
+        only SHMEM_OFI_MERGE_COLL_ATOMIC_CONTEXT between 0 and 1.
+        The merged endpoint requests the collective context's write-after-write
+        ordering (when SHMEM_OFI_COLL_CTX_UNRESTRICTED=1), which can change the
+        atomic path as well as sharing the queue.  Verify class grants and
+        performance independently; this is an opt-in experiment.  On Borealis,
+        four same-allocation NAIL repeats at 416 PEs (104 PPN) found no clear
+        speedup over separate endpoints.  A two-node CXI counter probe confirmed
+        that merged barrier puts still reached the low-latency wire class.
 
     SHMEM_OFI_ATOMIC_TCLASS (default: unspec)
         Traffic class for the public atomic endpoints, using the same values
@@ -368,6 +398,60 @@ options.
         `SHMEM_OFI_ATOMIC_CONTEXT=1 oshrun -n 4 ./atomic_context`.
         Run it once with the knob unset as a control, then on separate nodes
         for the OFI path; an all-local run checks the shared-memory path.
+
+    SHMEM_OFI_ATOMIC_PRE_QUIET (default: on)
+        With atomic contexts enabled, 1 completes all outstanding operations
+        on the parent context before each public atomic; 0 skips this
+        pre-atomic drain so prior puts can overlap the atomic, including
+        puts to other PEs.  Explicit fence still orders earlier operations
+        to each PE before later operations on either endpoint.  Quiet and
+        context destruction still complete both endpoints.  A nonzero class
+        or an enabled atomic context is required for this knob to matter.
+        To isolate the pre-drain cost, keep SHMEM_OFI_ATOMIC_CONTEXT=1 and
+        SHMEM_OFI_ATOMIC_TCLASS=unspec in both runs; compare
+        SHMEM_OFI_ATOMIC_PRE_QUIET=1 (legacy) against 0 (overlap).
+        Keep all other settings and PE placement identical.
+        Without an explicit fence, consecutive puts (and mixed put/atomic
+        updates to the same location) must not rely on implicit delivery
+        ordering.
+
+    SHMEM_OFI_ATOMIC_POST_HANDOFF (default: on)
+        With atomic contexts enabled, 1 drains newly issued atomic
+        operations before later ordinary RMA and atomic operations on the
+        parent context; 0 skips this eager handoff.  Blocking fetching
+        atomics already complete before returning, but nonblocking and
+        non-fetching atomics may still be outstanding.  An explicit fence
+        still orders operations on both endpoints; quiet and context
+        destruction still complete both.  For a controlled comparison,
+        keep SHMEM_OFI_ATOMIC_CONTEXT=1 and
+        SHMEM_OFI_ATOMIC_PRE_QUIET=0 in both runs, changing only
+        SHMEM_OFI_ATOMIC_POST_HANDOFF between 1 and 0.
+
+    SHMEM_OFI_ATOMIC_PROFILE (default: off)
+        Diagnostic for comparing atomic-context runs with a feature-off
+        baseline.  Set to 1 in both runs and keep SHMEM_DEBUG=0.  PE 0
+        prints one ATOMIC_PROFILE line per user context at destruction;
+        ctx=-1 is the default context.  routing_calls counts entries into
+        the public atomic routing helper (one per C atomic API call).
+        pre_quiet and post_handoff report the selected handoff modes.
+        parent_puts/gets and atomic_puts/gets count issued OFI operations.
+        handoff_checks counts attempts before subsequent operations and
+        explicit synchronizations, while handoff_drains counts attempts
+        that found new atomic operations.  With POST_HANDOFF=0, explicit
+        synchronizations can still contribute to both counts.
+        pre_put_wait_s and pre_get_wait_s total time waiting on the parent
+        endpoint before atomics; post_put_wait_s and post_get_wait_s total
+        time waiting on the atomic endpoint before later operations.  With
+        the context disabled, routing_calls are still reported and handoff
+        waits remain zero.  The timer and counter updates add overhead to
+        PE 0's hot path, so use separate runs without profiling for
+        definitive performance numbers.  Totals cover the entire job,
+        not individual message sizes; use a single-size run for attribution.
+
+        To compare, run with SHMEM_OFI_ATOMIC_PROFILE=1 and
+        SHMEM_OFI_ATOMIC_TCLASS=unspec in both arms, setting
+        SHMEM_OFI_ATOMIC_CONTEXT=0 for baseline and 1 for the dedicated
+        endpoint.  Find the summaries with `grep ATOMIC_PROFILE <job-stderr>`.
 
   Team Environment variables:
 
