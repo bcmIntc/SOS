@@ -347,16 +347,14 @@ options.
         the resource cost can be significant.  Endpoint-creation failures
         fail initialization or context creation rather than being ignored.
 
-        By default, before routing a public atomic SOS completes earlier
-        operations on its caller context.  This conservative pre-atomic
-        drain can be disabled with SHMEM_OFI_ATOMIC_PRE_QUIET=0.  Before
-        subsequent operations on that context, SOS normally completes
-        outstanding atomics from the paired endpoint; this eager handoff
-        can be disabled with SHMEM_OFI_ATOMIC_POST_HANDOFF=0.  Fence, quiet
-        and destruction continue to synchronize both endpoints.  Consecutive
-        nonblocking atomic fetches can stay in flight until quiet.  These
-        handoffs can cost more than queue separation saves; this is an
-        experimental opt-in, not a new default.
+        There are no pre-atomic or post-atomic endpoint drains by default.
+        SHMEM_OFI_ATOMIC_PRE_QUIET=1 completes the caller context before
+        each public atomic; SHMEM_OFI_ATOMIC_POST_HANDOFF=1 drains the atomic
+        endpoint before subsequent ordinary operations.  Fence, quiet and
+        destruction synchronize both endpoints.  Without an explicit fence,
+        mixed put/atomic updates must not rely on cross-endpoint ordering.
+        These waits can cost more than queue separation saves, so each is
+        independently opt-in.
 
     SHMEM_OFI_MERGE_COLL_ATOMIC_CONTEXT (default: off)
         Share the hierarchical barrier's internode transmit endpoint with the
@@ -399,7 +397,7 @@ options.
         Run it once with the knob unset as a control, then on separate nodes
         for the OFI path; an all-local run checks the shared-memory path.
 
-    SHMEM_OFI_ATOMIC_PRE_QUIET (default: on)
+    SHMEM_OFI_ATOMIC_PRE_QUIET (default: off)
         With atomic contexts enabled, 1 completes all outstanding operations
         on the parent context before each public atomic; 0 skips this
         pre-atomic drain so prior puts can overlap the atomic, including
@@ -415,7 +413,7 @@ options.
         updates to the same location) must not rely on implicit delivery
         ordering.
 
-    SHMEM_OFI_ATOMIC_POST_HANDOFF (default: on)
+    SHMEM_OFI_ATOMIC_POST_HANDOFF (default: off)
         With atomic contexts enabled, 1 drains newly issued atomic
         operations before later ordinary RMA and atomic operations on the
         parent context; 0 skips this eager handoff.  Blocking fetching

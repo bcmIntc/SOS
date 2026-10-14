@@ -148,10 +148,10 @@ SHMEM_INTERNAL_ENV_DEF(OFI_MERGE_COLL_ATOMIC_CONTEXT, bool, false, SHMEM_INTERNA
                        "Share the hierarchical barrier's transmit endpoint with the default "
                        "OpenSHMEM context's atomic companion; requires both contexts and "
                        "matching traffic classes. User-created contexts remain independent")
-SHMEM_INTERNAL_ENV_DEF(OFI_ATOMIC_PRE_QUIET, bool, true, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+SHMEM_INTERNAL_ENV_DEF(OFI_ATOMIC_PRE_QUIET, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Complete the caller context before each public atomic on its paired endpoint; "
                        "0 allows earlier puts to overlap (fence and quiet still synchronize)")
-SHMEM_INTERNAL_ENV_DEF(OFI_ATOMIC_POST_HANDOFF, bool, true, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+SHMEM_INTERNAL_ENV_DEF(OFI_ATOMIC_POST_HANDOFF, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Drain the paired atomic endpoint before later ordinary operations; "
                        "0 defers completion until explicit fence, quiet, or destruction")
 SHMEM_INTERNAL_ENV_DEF(OFI_ATOMIC_PROFILE, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
