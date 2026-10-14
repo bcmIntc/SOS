@@ -126,7 +126,9 @@ static uint32_t shmem_transport_ofi_tclass;
  * carries whatever SHMEM_OFI_TCLASS carries. */
 static uint32_t shmem_transport_ofi_coll_tclass;
 static uint32_t shmem_transport_ofi_atomic_tclass;
+static uint32_t shmem_transport_ofi_small_put_tclass;
 shmem_transport_ctx_t *shmem_transport_ofi_atomic_contexts;
+shmem_transport_ctx_t *shmem_transport_ofi_small_put_contexts;
 pthread_mutex_t shmem_transport_ofi_atomic_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #ifdef ENABLE_OFI_CXI_PCIE_AMO
@@ -243,6 +245,7 @@ shmem_ctx_t SHMEM_CTX_DEFAULT = (shmem_ctx_t) &shmem_transport_ctx_default;
  * dedicated one, so collective code can route through it with no branch. */
 #define SHMEM_TRANSPORT_CTX_COLL_ID -2
 #define SHMEM_TRANSPORT_CTX_ATOMIC_ID -3
+#define SHMEM_TRANSPORT_CTX_SMALL_PUT_ID -4
 shmem_transport_ctx_t shmem_transport_ctx_coll;
 shmem_ctx_t shmem_internal_coll_ctx = (shmem_ctx_t) &shmem_transport_ctx_default;
 
@@ -2142,7 +2145,9 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
         uint64_t msg_order = info->p_info->tx_attr->msg_order;
         int want_waw = (id == SHMEM_TRANSPORT_CTX_COLL_ID &&
                         shmem_transport_ofi_coll_tclass != FI_TC_UNSPEC &&
-                        shmem_internal_params.OFI_COLL_CTX_UNRESTRICTED);
+                        shmem_internal_params.OFI_COLL_CTX_UNRESTRICTED) ||
+                       (id == SHMEM_TRANSPORT_CTX_SMALL_PUT_ID &&
+                        shmem_transport_ofi_small_put_tclass != FI_TC_UNSPEC);
 
         if (want_waw)
             info->p_info->tx_attr->msg_order = msg_order | FI_ORDER_RMA_WAW;
@@ -2154,10 +2159,12 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
             info->p_info->tx_attr->msg_order = msg_order;
             if (shmem_internal_my_pe == 0) {
                 RAISE_WARN_MSG("This provider refused write-after-write ordering on the "
-                               "collective context (%s); opening it without.  On CXI that "
+                               "%s context (%s); opening it without.  On CXI that "
                                "ordering is what makes the traffic class ask for the pair the "
                                "job grants, so confirm from the fabric counters that the "
-                               "collective class carried traffic\n", fi_strerror(-ret));
+                               "requested class carried traffic\n",
+                               id == SHMEM_TRANSPORT_CTX_COLL_ID ? "collective" : "small-put",
+                               fi_strerror(-ret));
             }
             ret = fi_endpoint(shmem_transport_ofi_domainfd,
                               info->p_info, &ctx->ep, NULL);
@@ -2360,6 +2367,37 @@ static int shmem_transport_ofi_atomic_ctx_init(shmem_transport_ctx_t *parent,
     return 0;
 }
 
+static int shmem_transport_ofi_small_put_ctx_init(shmem_transport_ctx_t *parent,
+                                                  shmem_transport_ctx_t **failed)
+{
+    *failed = NULL;
+    shmem_transport_ctx_t *small = calloc(1, sizeof(*small));
+    if (small == NULL)
+        RAISE_ERROR_STR("Out of memory when allocating OFI small-put context");
+
+    small->id = SHMEM_TRANSPORT_CTX_SMALL_PUT_ID;
+    small->stx_idx = -1;
+    small->team = parent->team;
+    small->options = parent->options;
+    small->tclass = shmem_transport_ofi_small_put_tclass != FI_TC_UNSPEC
+                  ? shmem_transport_ofi_small_put_tclass : parent->tclass;
+
+    int ret = shmem_transport_ofi_ctx_init(small, small->id);
+    if (ret != 0) {
+        RAISE_WARN_MSG("Dedicated small-put context creation failed for context %d (%d)\n",
+                       parent->id, ret);
+        *failed = small;
+        return ret;
+    }
+
+    pthread_mutex_lock(&shmem_transport_ofi_atomic_lock);
+    small->small_put_next = shmem_transport_ofi_small_put_contexts;
+    shmem_transport_ofi_small_put_contexts = small;
+    pthread_mutex_unlock(&shmem_transport_ofi_atomic_lock);
+    parent->small_put_ctx = small;
+    return 0;
+}
+
 
 int shmem_transport_init(void)
 {
@@ -2419,7 +2457,12 @@ int shmem_transport_init(void)
         shmem_transport_ofi_atomic_tclass == FI_TC_UNSPEC)
         RAISE_ERROR_MSG("Invalid SHMEM_OFI_ATOMIC_TCLASS '%s'\n",
                         shmem_internal_params.OFI_ATOMIC_TCLASS);
-
+    shmem_transport_ofi_small_put_tclass =
+        parse_tclass(shmem_internal_params.OFI_SMALL_PUT_TCLASS);
+    if (strcmp(shmem_internal_params.OFI_SMALL_PUT_TCLASS, "unspec") != 0 &&
+        shmem_transport_ofi_small_put_tclass == FI_TC_UNSPEC)
+        RAISE_ERROR_MSG("Invalid SHMEM_OFI_SMALL_PUT_TCLASS '%s'\n",
+                        shmem_internal_params.OFI_SMALL_PUT_TCLASS);
     if (shmem_internal_params.OFI_MERGE_COLL_ATOMIC_CONTEXT) {
         if (!coll_ctx_requested() ||
             (!shmem_internal_params.OFI_ATOMIC_CONTEXT &&
@@ -2566,6 +2609,17 @@ int shmem_transport_startup(void)
 
     ret = shmem_transport_ofi_ctx_init(&shmem_transport_ctx_default, SHMEM_TRANSPORT_CTX_DEFAULT_ID);
     if (ret != 0) return ret;
+
+    if (shmem_internal_params.OFI_SMALL_PUT_CONTEXT ||
+        shmem_transport_ofi_small_put_tclass != FI_TC_UNSPEC) {
+        shmem_transport_ctx_t *failed = NULL;
+        ret = shmem_transport_ofi_small_put_ctx_init(&shmem_transport_ctx_default, &failed);
+        if (ret != 0) {
+            shmem_transport_ctx_destroy(failed);
+            free(failed);
+            return ret;
+        }
+    }
 
     if (shmem_internal_params.OFI_ATOMIC_CONTEXT ||
         shmem_transport_ofi_atomic_tclass != FI_TC_UNSPEC) {
@@ -2736,13 +2790,18 @@ int shmem_transport_ctx_create(struct shmem_internal_team_t *team, long options,
     ret = shmem_transport_ofi_ctx_init(ctxp, id);
 
     shmem_transport_ctx_t *failed_atomic = NULL;
+    shmem_transport_ctx_t *failed_small = NULL;
     if (!ret && shmem_transport_ctx_default.atomic_ctx)
         ret = shmem_transport_ofi_atomic_ctx_init(ctxp, &failed_atomic);
+    if (!ret && shmem_transport_ctx_default.small_put_ctx)
+        ret = shmem_transport_ofi_small_put_ctx_init(ctxp, &failed_small);
 
     if (ret) {
         SHMEM_MUTEX_UNLOCK(shmem_transport_ofi_lock);
         shmem_transport_ctx_destroy(failed_atomic);
         free(failed_atomic);
+        shmem_transport_ctx_destroy(failed_small);
+        free(failed_small);
         shmem_transport_ctx_destroy(ctxp);
         return ret;
     } else {
@@ -2765,6 +2824,7 @@ void shmem_transport_ctx_destroy(shmem_transport_ctx_t *ctx)
 
     if (shmem_internal_params.OFI_ATOMIC_PROFILE && shmem_internal_my_pe == 0 &&
         ctx->id != SHMEM_TRANSPORT_CTX_ATOMIC_ID &&
+        ctx->id != SHMEM_TRANSPORT_CTX_SMALL_PUT_ID &&
         ctx->id != SHMEM_TRANSPORT_CTX_COLL_ID) {
         fprintf(stderr,
                 "[%04d] ATOMIC_PROFILE ctx=%d enabled=%d pre_quiet=%d post_handoff=%d routing_calls=%" PRIu64
@@ -2802,6 +2862,21 @@ void shmem_transport_ctx_destroy(shmem_transport_ctx_t *ctx)
         pthread_mutex_unlock(&shmem_transport_ofi_atomic_lock);
         shmem_transport_ctx_destroy(atomic);
         free(atomic);
+    }
+
+    if (ctx->small_put_ctx) {
+        shmem_transport_ctx_t *small = ctx->small_put_ctx;
+        ctx->small_put_ctx = NULL;
+        shmem_transport_quiet(small);
+        pthread_mutex_lock(&shmem_transport_ofi_atomic_lock);
+        shmem_transport_ctx_t **next = &shmem_transport_ofi_small_put_contexts;
+        while (*next && *next != small)
+            next = &(*next)->small_put_next;
+        if (*next == small)
+            *next = small->small_put_next;
+        pthread_mutex_unlock(&shmem_transport_ofi_atomic_lock);
+        shmem_transport_ctx_destroy(small);
+        free(small);
     }
 
     if(shmem_internal_params.DEBUG) {
@@ -2894,7 +2969,8 @@ void shmem_transport_ctx_destroy(shmem_transport_ctx_t *ctx)
     }
     else if (ctx->id != SHMEM_TRANSPORT_CTX_DEFAULT_ID &&
              ctx->id != SHMEM_TRANSPORT_CTX_COLL_ID &&
-             ctx->id != SHMEM_TRANSPORT_CTX_ATOMIC_ID) {
+             ctx->id != SHMEM_TRANSPORT_CTX_ATOMIC_ID &&
+             ctx->id != SHMEM_TRANSPORT_CTX_SMALL_PUT_ID) {
         RAISE_ERROR_MSG("Attempted to destroy an invalid context (%d)\n", ctx->id);
     }
 }

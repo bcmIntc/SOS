@@ -347,16 +347,46 @@ options.
         the resource cost can be significant.  Endpoint-creation failures
         fail initialization or context creation rather than being ignored.
 
-        By default, before routing a public atomic SOS completes earlier
-        operations on its caller context.  This conservative pre-atomic
-        drain can be disabled with SHMEM_OFI_ATOMIC_PRE_QUIET=0.  Before
-        subsequent operations on that context, SOS normally completes
-        outstanding atomics from the paired endpoint; this eager handoff
-        can be disabled with SHMEM_OFI_ATOMIC_POST_HANDOFF=0.  Fence, quiet
-        and destruction continue to synchronize both endpoints.  Consecutive
-        nonblocking atomic fetches can stay in flight until quiet.  These
-        handoffs can cost more than queue separation saves; this is an
-        experimental opt-in, not a new default.
+        There are no pre-atomic or post-atomic endpoint drains by default.
+        SHMEM_OFI_ATOMIC_PRE_QUIET=1 completes the caller context before
+        each public atomic; SHMEM_OFI_ATOMIC_POST_HANDOFF=1 drains the atomic
+        endpoint before subsequent ordinary operations.  Fence, quiet and
+        destruction synchronize both endpoints.  Without an explicit fence,
+        mixed put/atomic updates must not rely on cross-endpoint ordering.
+        These waits can cost more than queue separation saves, so each is
+        independently opt-in.
+
+    SHMEM_OFI_SMALL_PUT_CONTEXT (default: off)
+        Experimental OFI-only routing of remote scalar, blocking, and
+        nonblocking puts of 1-1024 bytes through a dedicated transmit endpoint
+        for each OpenSHMEM context.  Shared-memory puts, put-with-signal,
+        atomics, and completion-counter puts keep their existing paths.
+        Other sizes use the original endpoint.  The companion inherits its
+        parent's bounce-buffer setting and traffic class unless overridden.
+        Blocking puts larger than the inject/bounce limit wait for local
+        completion on the companion before returning.
+
+        Ordinary operations and size transitions do not drain the small-put
+        endpoint: mixed traffic can overlap.  Fence drains both endpoints so
+        later operations cannot overtake earlier ones across them; quiet and
+        destruction also drain the companion.  Use fence when mixed-size puts
+        must arrive in order at overlapping remote addresses.  Put-with-signal
+        stays on the parent and orders its own data before its signal; fence
+        first if it must follow an earlier small put.
+        Each created OpenSHMEM context costs an extra endpoint, CQ, and two
+        counters; budget this at 104+ PEs per node.
+
+    SHMEM_OFI_SMALL_PUT_TCLASS (default: unspec)
+        Traffic class for the dedicated small-put endpoint.  An explicit class
+        enables the context; unspec inherits SHMEM_OFI_TCLASS.  Accepts the
+        values of SHMEM_OFI_TCLASS.  For a non-default class, requests
+        FI_ORDER_RMA_WAW to access the unrestricted class/type pair on CXI;
+        if the provider rejects the ordering request, SOS warns and retries
+        without it.  Compare context-only runs first before changing class.
+        After building and installing this branch, compile and run the
+        ordering probe with, for example,
+        oshcc examples/small_put_context.c -o small_put_context
+        SHMEM_OFI_SMALL_PUT_CONTEXT=1 oshrun -n 2 ./small_put_context
 
     SHMEM_OFI_MERGE_COLL_ATOMIC_CONTEXT (default: off)
         Share the hierarchical barrier's internode transmit endpoint with the
@@ -399,7 +429,7 @@ options.
         Run it once with the knob unset as a control, then on separate nodes
         for the OFI path; an all-local run checks the shared-memory path.
 
-    SHMEM_OFI_ATOMIC_PRE_QUIET (default: on)
+    SHMEM_OFI_ATOMIC_PRE_QUIET (default: off)
         With atomic contexts enabled, 1 completes all outstanding operations
         on the parent context before each public atomic; 0 skips this
         pre-atomic drain so prior puts can overlap the atomic, including
@@ -415,7 +445,7 @@ options.
         updates to the same location) must not rely on implicit delivery
         ordering.
 
-    SHMEM_OFI_ATOMIC_POST_HANDOFF (default: on)
+    SHMEM_OFI_ATOMIC_POST_HANDOFF (default: off)
         With atomic contexts enabled, 1 drains newly issued atomic
         operations before later ordinary RMA and atomic operations on the
         parent context; 0 skips this eager handoff.  Blocking fetching

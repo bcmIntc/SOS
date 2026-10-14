@@ -58,6 +58,20 @@ shmem_internal_atomic_handoff(shmem_ctx_t ctx)
 #endif
 }
 
+static inline shmem_transport_ctx_t *
+shmem_internal_small_put_ctx(shmem_ctx_t ctx, size_t len)
+{
+#ifdef USE_OFI
+    shmem_transport_ctx_t *parent = (shmem_transport_ctx_t *) ctx;
+    shmem_internal_atomic_handoff(ctx);
+    return shmem_transport_small_put_ctx(parent, len);
+#else
+    (void) len;
+    shmem_internal_atomic_handoff(ctx);
+    return (shmem_transport_ctx_t *) ctx;
+#endif
+}
+
 static inline
 void
 shmem_internal_put_nb(shmem_ctx_t ctx, void *target, const void *source, size_t len, int pe,
@@ -66,11 +80,16 @@ shmem_internal_put_nb(shmem_ctx_t ctx, void *target, const void *source, size_t 
     if (len == 0)
         return;
 
-    shmem_internal_atomic_handoff(ctx);
     if (shmem_shr_transport_use_write(ctx, target, source, len, pe)) {
+        shmem_internal_atomic_handoff(ctx);
         shmem_shr_transport_put(ctx, target, source, len, pe);
     } else {
-        shmem_transport_put_nb((shmem_transport_ctx_t *)ctx, target, source, len, pe, completion);
+        shmem_transport_ctx_t *put_ctx = shmem_internal_small_put_ctx(ctx, len);
+        shmem_transport_put_nb(put_ctx, target, source, len, pe, completion);
+#ifdef USE_OFI
+        if (put_ctx != (shmem_transport_ctx_t *) ctx && *completion > 0)
+            shmem_transport_put_wait(put_ctx, completion);
+#endif
     }
 }
 
@@ -90,16 +109,17 @@ shmem_internal_put_scalar(shmem_ctx_t ctx, void *target, const void *source, siz
 {
     shmem_internal_assert(len > 0);
 
-    shmem_internal_atomic_handoff(ctx);
     if (shmem_shr_transport_use_write(ctx, target, source, len, pe)) {
+        shmem_internal_atomic_handoff(ctx);
         shmem_shr_transport_put_scalar(ctx, target, source, len, pe);
     } else {
+        shmem_transport_ctx_t *put_ctx = shmem_internal_small_put_ctx(ctx, len);
 #ifndef DISABLE_OFI_INJECT
-        shmem_transport_put_scalar((shmem_transport_ctx_t *)ctx, target, source, len, pe);
+        shmem_transport_put_scalar(put_ctx, target, source, len, pe);
 #else
         long completion = 0;
-        shmem_transport_put_nb((shmem_transport_ctx_t *)ctx, target, source, len, pe, &completion);
-	shmem_internal_put_wait(ctx, &completion);
+        shmem_transport_put_nb(put_ctx, target, source, len, pe, &completion);
+        shmem_transport_put_wait(put_ctx, &completion);
 #endif
     }
 }
@@ -150,11 +170,12 @@ shmem_internal_put_nbi(shmem_ctx_t ctx, void *target, const void *source, size_t
 {
     if (len == 0) return;
 
-    shmem_internal_atomic_handoff(ctx);
     if (shmem_shr_transport_use_write(ctx, target, source, len, pe)) {
+        shmem_internal_atomic_handoff(ctx);
         shmem_shr_transport_put(ctx, target, source, len, pe);
     } else {
-        shmem_transport_put_nbi((shmem_transport_ctx_t *)ctx, target, source, len, pe);
+        shmem_transport_put_nbi(shmem_internal_small_put_ctx(ctx, len),
+                                target, source, len, pe);
     }
 }
 

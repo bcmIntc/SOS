@@ -86,6 +86,8 @@ extern bool shmem_transport_ofi_pcie_cxi;
 #define MIN(a,b) (((a)<(b))?(a):(b))
 #endif
 
+#define SHMEM_TRANSPORT_SMALL_PUT_MAX 1024
+
 #define OFI_CHECK_ERROR(ret)                                                    \
     do {                                                                        \
         if (ret) {                                                              \
@@ -372,6 +374,8 @@ struct shmem_transport_ctx_t {
     uint32_t                        tclass;
     struct shmem_transport_ctx_t   *atomic_ctx;
     struct shmem_transport_ctx_t   *atomic_next;
+    struct shmem_transport_ctx_t   *small_put_ctx;
+    struct shmem_transport_ctx_t   *small_put_next;
     uint64_t                        atomic_last_put;
     uint64_t                        atomic_last_get;
     uint64_t                        atomic_profile_calls;
@@ -391,6 +395,7 @@ extern shmem_transport_ctx_t shmem_transport_ctx_default;
  * shmem_comm.h points at the default context's atomic companion instead. */
 extern shmem_transport_ctx_t shmem_transport_ctx_coll;
 extern shmem_transport_ctx_t *shmem_transport_ofi_atomic_contexts;
+extern shmem_transport_ctx_t *shmem_transport_ofi_small_put_contexts;
 extern pthread_mutex_t shmem_transport_ofi_atomic_lock;
 
 static inline void shmem_transport_atomic_handoff(shmem_transport_ctx_t *ctx);
@@ -462,6 +467,9 @@ void shmem_transport_probe(void)
         for (shmem_transport_ctx_t *atomic = shmem_transport_ofi_atomic_contexts;
              atomic != NULL; atomic = atomic->atomic_next)
             fi_cq_read(atomic->cq, (void *)&buf, 0);
+        for (shmem_transport_ctx_t *small = shmem_transport_ofi_small_put_contexts;
+             small != NULL; small = small->small_put_next)
+            fi_cq_read(small->cq, (void *)&buf, 0);
         pthread_mutex_unlock(&shmem_transport_ofi_atomic_lock);
 #  ifdef USE_THREAD_COMPLETION
         pthread_mutex_unlock(&shmem_transport_ofi_progress_lock);
@@ -597,9 +605,18 @@ int shmem_transport_quiet(shmem_transport_ctx_t* ctx)
 
     shmem_transport_put_quiet(ctx);
     shmem_transport_get_wait(ctx);
+    if (ctx->small_put_ctx)
+        shmem_transport_put_quiet(ctx->small_put_ctx);
     shmem_transport_atomic_handoff(ctx);
 
     return 0;
+}
+
+static inline shmem_transport_ctx_t *
+shmem_transport_small_put_ctx(shmem_transport_ctx_t *ctx, size_t len)
+{
+    return ctx->small_put_ctx && len <= SHMEM_TRANSPORT_SMALL_PUT_MAX
+         ? ctx->small_put_ctx : ctx;
 }
 
 static inline void
@@ -670,15 +687,18 @@ shmem_transport_user_atomic_ctx(shmem_transport_ctx_t *ctx)
 static inline
 int shmem_transport_fence(shmem_transport_ctx_t* ctx)
 {
+    if (ctx->small_put_ctx)
+        shmem_transport_put_quiet(ctx->small_put_ctx);
     shmem_transport_atomic_handoff(ctx);
 #if WANT_TOTAL_DATA_ORDERING == 0
     /* Communication is unordered; must wait for puts and buffered (injected)
      * non-fetching atomics to be completed in order to ensure ordering. */
     shmem_transport_put_quiet(ctx);
 #else
-    /* A fence on the public context must also order prior parent puts before
-     * later operations on the paired atomic endpoint. */
-    if (ctx->atomic_ctx && !shmem_internal_params.OFI_ATOMIC_PRE_QUIET)
+    /* The small-put endpoint must not overtake earlier parent puts after a
+     * fence, even when the provider orders writes on each endpoint. */
+    if (ctx->small_put_ctx ||
+        (ctx->atomic_ctx && !shmem_internal_params.OFI_ATOMIC_PRE_QUIET))
         shmem_transport_put_quiet(ctx);
 #endif
     /* Complete fetching ops; needed to support nonblocking fetch-atomics */

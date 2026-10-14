@@ -148,15 +148,21 @@ SHMEM_INTERNAL_ENV_DEF(OFI_MERGE_COLL_ATOMIC_CONTEXT, bool, false, SHMEM_INTERNA
                        "Share the hierarchical barrier's transmit endpoint with the default "
                        "OpenSHMEM context's atomic companion; requires both contexts and "
                        "matching traffic classes. User-created contexts remain independent")
-SHMEM_INTERNAL_ENV_DEF(OFI_ATOMIC_PRE_QUIET, bool, true, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+SHMEM_INTERNAL_ENV_DEF(OFI_ATOMIC_PRE_QUIET, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Complete the caller context before each public atomic on its paired endpoint; "
                        "0 allows earlier puts to overlap (fence and quiet still synchronize)")
-SHMEM_INTERNAL_ENV_DEF(OFI_ATOMIC_POST_HANDOFF, bool, true, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+SHMEM_INTERNAL_ENV_DEF(OFI_ATOMIC_POST_HANDOFF, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Drain the paired atomic endpoint before later ordinary operations; "
                        "0 defers completion until explicit fence, quiet, or destruction")
 SHMEM_INTERNAL_ENV_DEF(OFI_ATOMIC_PROFILE, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Report PE 0's public atomic calls and context handoff wait times "
                        "at finalize (diagnostic; changes timing)")
+SHMEM_INTERNAL_ENV_DEF(OFI_SMALL_PUT_CONTEXT, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Route remote puts of at most 1024 bytes through a dedicated transmit "
+                       "endpoint per OpenSHMEM context; cross-endpoint handoffs wait for completion")
+SHMEM_INTERNAL_ENV_DEF(OFI_SMALL_PUT_TCLASS, string, "unspec", SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Traffic class for small-put endpoints; non-unspec enables the context, "
+                       "unspec inherits the parent context's class")
 #endif
 
 #ifdef USE_UCX
