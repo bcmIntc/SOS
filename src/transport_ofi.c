@@ -856,6 +856,24 @@ int allocate_recv_cntr_mr(void)
     return ret;
 }
 
+/* Diagnostic decoding matches the CXI 1.22 provider key layout.  Client keys
+ * depend on provider configuration, so their optimization is not inferred. */
+static inline
+const char *ofi_mr_key_optimization(uint64_t key)
+{
+    const char *provider =
+        shmem_transport_ofi_info.p_info->fabric_attr->prov_name;
+
+    if (provider == NULL || strcmp(provider, "cxi") != 0)
+        return "n/a (non-CXI)";
+
+    if (!(key & (UINT64_C(1) << 63)))
+        return "unknown (CXI client key)";
+
+    return (key & (UINT64_C(1) << 61)) ?
+        "yes (CXI provider key)" : "no (CXI provider key)";
+}
+
 #ifdef USE_FI_HMEM
 static
 int publish_external_mr_info(void)
@@ -868,6 +886,9 @@ int publish_external_mr_info(void)
     } else {
         ext_heap_key = 2;
     }
+
+    DEBUG_MSG("OFI external heap MR key=0x%016" PRIx64 ", optimized=%s\n",
+              ext_heap_key, ofi_mr_key_optimization(ext_heap_key));
 
     err = shmem_runtime_put("fi_ext_heap_key", &ext_heap_key, sizeof(uint64_t));
     if (err) {
@@ -908,6 +929,11 @@ int publish_mr_info(void)
             heap_key = 1;
             data_key = 0;
         }
+
+        DEBUG_MSG("OFI enabled MR keys: heap=0x%016" PRIx64
+                  " optimized=%s; data=0x%016" PRIx64 " optimized=%s\n",
+                  heap_key, ofi_mr_key_optimization(heap_key),
+                  data_key, ofi_mr_key_optimization(data_key));
 
         err = shmem_runtime_put("fi_heap_key", &heap_key, sizeof(uint64_t));
         if (err) {
@@ -953,6 +979,21 @@ int publish_mr_info(void)
         }
     }
 #endif /* ENABLE_REMOTE_VIRTUAL_ADDRESSING */
+#else
+    {
+#ifdef ENABLE_REMOTE_VIRTUAL_ADDRESSING
+        uint64_t key = fi_mr_key(shmem_transport_ofi_target_mrfd);
+        DEBUG_MSG("OFI enabled all-memory MR key=0x%016" PRIx64
+                  ", optimized=%s\n", key, ofi_mr_key_optimization(key));
+#else
+        uint64_t heap_key = fi_mr_key(shmem_transport_ofi_target_heap_mrfd);
+        uint64_t data_key = fi_mr_key(shmem_transport_ofi_target_data_mrfd);
+        DEBUG_MSG("OFI enabled MR keys: heap=0x%016" PRIx64
+                  " optimized=%s; data=0x%016" PRIx64 " optimized=%s\n",
+                  heap_key, ofi_mr_key_optimization(heap_key),
+                  data_key, ofi_mr_key_optimization(data_key));
+#endif
+    }
 #endif /* !ENABLE_MR_SCALABLE */
 
 #ifdef USE_FI_HMEM
