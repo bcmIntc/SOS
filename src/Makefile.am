@@ -199,17 +199,42 @@ AM_V_SED = $(am__v_SED_@AM_V@)
 am__v_SED_ = $(am__v_SED_@AM_DEFAULT_V@)
 am__v_SED_0 = @echo "  SED     " $@;
 
-build_info.h: $(top_builddir)/config.status
-	$(AM_V_GEN) echo "#ifndef BUILD_INFO_H" > $@
-	@echo "#define BUILD_INFO_H" >> $@
-	@if [ -e $(top_srcdir)/.git ]; then \
-	     echo "#define SOS_GIT_VERSION \"$(shell git -C $(top_srcdir) describe --abbrev=8 --dirty --always --tags) ($(shell git -C $(top_srcdir) rev-parse --abbrev-ref HEAD))\"" >> $@; \
-	fi;
-	@echo "#define SOS_CONFIGURE_ARGS \"$(shell $(top_builddir)/config.status --config)\"" >> $@;
-	@echo "#define SOS_BUILD_DATE \"$(shell date)\"" >> $@;
-	@echo "#define SOS_BUILD_CC \"$(CC)\"" >> $@;
-	@echo "#define SOS_BUILD_CFLAGS \"$(CFLAGS)\"" >> $@;
-	@echo "#endif" >> $@
+# Recheck Git on every build, including linked worktrees and branch changes.
+# Replace the header only when metadata changes, so unchanged builds do not
+# recompile init.c merely because the build date was sampled again.
+.PHONY: sos-build-info-force
+sos-build-info-force:
+
+# Keep the embedded metadata current even with --disable-dependency-tracking.
+init.lo: build_info.h
+
+build_info.h: $(top_builddir)/config.status Makefile sos-build-info-force
+	$(AM_V_GEN)set -e; \
+	trap 'rm -f "$@.tmp" "$@.old" "$@.new"' 0 1 2 15; \
+	{ \
+	    printf '%s\n' '#ifndef BUILD_INFO_H' '#define BUILD_INFO_H'; \
+	    if test -e "$(top_srcdir)/.git" && \
+	       git_commit=$$(git -C "$(top_srcdir)" rev-parse --verify HEAD 2>/dev/null); then \
+	        git_version=$$(git -C "$(top_srcdir)" describe --abbrev=8 --dirty --always --tags); \
+	        git_branch=$$(git -C "$(top_srcdir)" rev-parse --abbrev-ref HEAD); \
+	        git_version=$$(printf '%s (%s)' "$$git_version" "$$git_branch" | \
+	            sed 's/\\/\\\\/g; s/"/\\"/g'); \
+	        printf '#define SOS_GIT_COMMIT "%s"\n' "$$git_commit"; \
+	        printf '#define SOS_GIT_VERSION "%s"\n' "$$git_version"; \
+	    fi; \
+	    echo "#define SOS_CONFIGURE_ARGS \"$(shell $(top_builddir)/config.status --config)\""; \
+	    printf '#define SOS_BUILD_DATE "%s"\n' "$$(date)"; \
+	    echo "#define SOS_BUILD_CC \"$(CC)\""; \
+	    echo "#define SOS_BUILD_CFLAGS \"$(CFLAGS)\""; \
+	    printf '%s\n' '#endif'; \
+	} > "$@.tmp"; \
+	sed '/^#define SOS_BUILD_DATE /d' "$@.tmp" > "$@.new"; \
+	if test -f "$@"; then \
+	    sed '/^#define SOS_BUILD_DATE /d' "$@" > "$@.old"; \
+	    if cmp -s "$@.old" "$@.new"; then exit 0; fi; \
+	fi; \
+	mv -f "$@.tmp" "$@"; \
+	printf 'SOS Git commit: %s\n' "$${git_commit:-unavailable}"
 
 oshcc: shmem_compiler_script.in Makefile
 	$(AM_V_SED)$(do_subst) -e 's|[@]LANG[@]|C|g' < $(srcdir)/shmem_compiler_script.in > oshcc

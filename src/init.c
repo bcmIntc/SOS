@@ -257,6 +257,9 @@ shmem_internal_heap_preinit(int tl_requested, int *tl_provided)
 #else
             printf("%-23s %d.%d\n", "  Build Version", SHMEM_MAJOR_VERSION, SHMEM_MINOR_VERSION);
 #endif
+#ifdef SOS_GIT_COMMIT
+            printf("%-23s %s\n", "  Git Commit", SOS_GIT_COMMIT);
+#endif
         }
 
         if (shmem_internal_params.DEBUG || shmem_internal_params.INFO) {
