@@ -115,6 +115,19 @@ AC_DEFUN([OPAL_CHECK_OFI],[
 
     AS_IF([test $opal_ofi_happy = yes],
           [AC_CHECK_HEADERS([rdma/fi_ext.h])
+           AC_CHECK_HEADERS([rdma/fi_cxi_ext.h],
+                            [AC_CHECK_MEMBERS([struct fi_cxi_dom_ops.enable_hybrid_mr_desc],
+                                              [], [],
+                                              [[#include <stdbool.h>
+#include <time.h>
+#include <rdma/fabric.h>
+#include <rdma/fi_eq.h>
+#include <rdma/fi_cxi_ext.h>]])],
+                            [],
+                            [[#include <stdbool.h>
+#include <time.h>
+#include <rdma/fabric.h>
+#include <rdma/fi_eq.h>]])
 
            AC_CHECK_MEMBER([struct fi_info.nic],
                            [opal_check_fi_info_pci=1],

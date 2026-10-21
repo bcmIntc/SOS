@@ -101,6 +101,14 @@ SHMEM_INTERNAL_ENV_DEF(OFI_TX_POLL_LIMIT, long, DEFAULT_POLL_LIMIT, SHMEM_INTERN
                        "Put completion poll limit")
 SHMEM_INTERNAL_ENV_DEF(OFI_RX_POLL_LIMIT, long, DEFAULT_POLL_LIMIT, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Get completion poll limit")
+SHMEM_INTERNAL_ENV_DEF(OFI_CQ_BATCH_SIZE, size, 1, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Maximum OFI CQ entries per read (1-32); does not change event generation")
+SHMEM_INTERNAL_ENV_DEF(OFI_BOUNCE_LOCAL_MR, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Preregister default-context host bounce sources using CXI hybrid descriptors")
+SHMEM_INTERNAL_ENV_DEF(OFI_BOUNCE_COUNTER_RETIRE, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Retire default bounce puts at a full delivery-counter snapshot; requires local MRs, SHMEM_THREAD_SINGLE and OFI_STX_MAX=0")
+SHMEM_INTERNAL_ENV_DEF(OFI_PUT_BATCH_STATS, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Print PE 0 default-context immediate bounce source-ownership statistics at shutdown")
 SHMEM_INTERNAL_ENV_DEF(OFI_STX_MAX, long, 1, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Maximum number of STX contexts per PE")
 SHMEM_INTERNAL_ENV_DEF(OFI_STX_AUTO, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,

@@ -1,0 +1,99 @@
+#!/bin/sh
+# Explicit future cluster launcher; never invoked by the default make check.
+# Usage: sh run-ofi-immediate-matrix.sh /abs/path/ofi_immediate BYTES launcher args...
+set -eu
+if [ "$#" -lt 3 ]; then
+    echo "usage: $0 /abs/path/ofi_immediate BYTES launcher args..." >&2
+    exit 2
+fi
+binary=$1
+bytes=$2
+shift 2
+case "$binary" in /*) ;; *) echo "test binary must be an absolute path" >&2; exit 2 ;; esac
+case "$bytes" in ''|*[!0-9]*) echo "BYTES must be a positive integer" >&2; exit 2 ;; esac
+if [ "$bytes" -lt 1 ] || [ "$bytes" -gt 8192 ]; then
+    echo "choose BYTES above negotiated injection and at/below 8192" >&2
+    exit 2
+fi
+log_dir=${SOS_OFI_LOG_DIR:-./ofi-immediate-logs}
+mkdir -p "$log_dir"
+export SHMEM_INFO=1 SHMEM_DEBUG=0 SHMEM_BOUNCE_SIZE=8192
+export SHMEM_OFI_PROVIDER=cxi SHMEM_OFI_STX_MAX=0
+export SHMEM_OFI_STX_AUTO=0 SHMEM_BOUNCE_SHEAP=1
+export SHMEM_OFI_BOUNCE_LOCAL_MR=1 SHMEM_OFI_PUT_BATCH_STATS=1
+# These historical mechanisms are not part of this port.
+unset SHMEM_OFI_PUT_PIGGYBACK SMA_OFI_PUT_PIGGYBACK
+unset SHMEM_OFI_BOUNCE_ARENA SMA_OFI_BOUNCE_ARENA
+for pool in 1 2 128; do
+    export SHMEM_MAX_BOUNCE_BUFFERS=$pool
+    for cq in 1 8; do
+        export SHMEM_OFI_CQ_BATCH_SIZE=$cq
+        for arm in 0 1; do
+            export SHMEM_OFI_BOUNCE_COUNTER_RETIRE=$arm
+            log=$log_dir/pool-$pool-cq-$cq-counter-$arm.log
+            # Preserve launcher argument boundaries; no eval or shell command string.
+            if timeout "${SOS_OFI_TEST_TIMEOUT:-120s}" "$@" "$binary" "$bytes" >"$log" 2>&1; then
+                :
+            else
+                status=$?
+                echo "FAIL/INVALID: $log (exit $status); no timing qualification" >&2
+                exit 1
+            fi
+            # Require actual PE 0 bounce traffic, correct owner, and complete
+            # counter reclamation. A skipped/inactive path is not a passing arm.
+            if ! awk -v arm="$arm" -v cq="$cq" '
+                /OFI immediate bounce:/ {
+                    delete v
+                    for (i=1; i<=NF; i++) {
+                        n=split($i,a,"=")
+                        if (n==2) v[a[1]]=a[2]
+                    }
+                    seen++
+                    if (v["local_mr"] != 1 || v["cq_batch"] != cq ||
+                        v["bounce_puts"]+0 <= 0) bad=1
+                    if (arm==1) {
+                        if (v["retirement"] != "counter" ||
+                            v["counter_puts"] != v["bounce_puts"] ||
+                            v["reclaimed"] != v["counter_puts"] ||
+                            v["cq_puts"] != 0 || v["groups"]+0 <= 0) bad=1
+                    } else if (v["retirement"] != "cq" ||
+                               v["counter_puts"] != 0 ||
+                               v["cq_puts"] != v["bounce_puts"] ||
+                               v["reclaimed"] != 0) bad=1
+                }
+                END { exit !(seen==1 && !bad) }
+            ' "$log"; then
+                echo "FAIL/INVALID: $log lacks valid bounce ownership evidence" >&2
+                exit 1
+            fi
+            echo "payload/source-lifetime case completed: $log"
+        done
+    done
+done
+
+init_binary=${binary%/*}/ofi_counter_init
+export SHMEM_OFI_BOUNCE_COUNTER_RETIRE=1
+for invalid in local-mr-off shared-stx multiple; do
+    export SHMEM_OFI_BOUNCE_LOCAL_MR=1 SHMEM_OFI_STX_MAX=0
+    case "$invalid" in
+        local-mr-off) export SHMEM_OFI_BOUNCE_LOCAL_MR=0; reason='requires OFI_BOUNCE_LOCAL_MR=1' ;;
+        shared-stx) export SHMEM_OFI_STX_MAX=1; reason='exclusive default TX queue' ;;
+        multiple) reason='requires SHMEM_THREAD_SINGLE' ;;
+    esac
+    log=$log_dir/reject-$invalid.log
+    status=0
+    if [ "$invalid" = multiple ]; then
+        timeout "${SOS_OFI_TEST_TIMEOUT:-120s}" "$@" "$init_binary" multiple >"$log" 2>&1 || status=$?
+    else
+        timeout "${SOS_OFI_TEST_TIMEOUT:-120s}" "$@" "$init_binary" >"$log" 2>&1 || status=$?
+    fi
+    if [ "$invalid" = multiple ] && [ "$status" = 77 ]; then
+        echo "SKIP: MULTIPLE rejection case inapplicable; build provided SINGLE: $log"
+        continue
+    fi
+    if [ "$status" = 0 ] || [ "$status" = 124 ] || ! grep -q "$reason" "$log"; then
+        echo "FAIL: invalid configuration was not promptly rejected: $log" >&2
+        exit 1
+    fi
+    echo "invalid configuration rejected: $log"
+done

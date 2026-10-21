@@ -48,6 +48,9 @@
 #include "shmem_internal.h"
 #include "shmem_comm.h"
 #include "transport_ofi.h"
+#ifdef HAVE_RDMA_FI_CXI_EXT_H
+#include <rdma/fi_cxi_ext.h>
+#endif
 #include <unistd.h>
 #include "runtime.h"
 #include "uthash.h"
@@ -595,9 +598,98 @@ void shmem_transport_ofi_stx_allocate(shmem_transport_ctx_t *ctx)
 static
 void init_bounce_buffer(shmem_free_list_item_t *item)
 {
-    shmem_transport_ofi_frag_t *frag =
-        (shmem_transport_ofi_frag_t*) item;
-    frag->mytype = SHMEM_TRANSPORT_OFI_TYPE_BOUNCE;
+    shmem_transport_ofi_bounce_buffer_t *buff =
+        (shmem_transport_ofi_bounce_buffer_t *) item;
+    buff->frag.mytype = SHMEM_TRANSPORT_OFI_TYPE_BOUNCE;
+    buff->local_desc = NULL;
+    buff->counter_next = NULL;
+}
+
+static void
+enable_bounce_local_mr(struct fabric_info *info)
+{
+    if (shmem_internal_params.OFI_BOUNCE_COUNTER_RETIRE) {
+        if (!shmem_internal_params.OFI_BOUNCE_LOCAL_MR)
+            RAISE_ERROR_STR("OFI_BOUNCE_COUNTER_RETIRE requires OFI_BOUNCE_LOCAL_MR=1");
+        if (shmem_internal_thread_level != SHMEM_THREAD_SINGLE)
+            RAISE_ERROR_STR("OFI_BOUNCE_COUNTER_RETIRE requires SHMEM_THREAD_SINGLE");
+    }
+    if (!shmem_internal_params.OFI_BOUNCE_LOCAL_MR)
+        return;
+    if (!info->p_info->fabric_attr->prov_name ||
+        strcmp(info->p_info->fabric_attr->prov_name, "cxi"))
+        RAISE_ERROR_STR("OFI_BOUNCE_LOCAL_MR requires the CXI provider");
+#ifdef USE_FI_HMEM
+    RAISE_ERROR_STR("OFI_BOUNCE_LOCAL_MR requires a host-only OFI build");
+#elif defined(HAVE_STRUCT_FI_CXI_DOM_OPS_ENABLE_HYBRID_MR_DESC) && defined(FI_CXI_DOM_OPS_3)
+    struct fi_cxi_dom_ops *ops = NULL;
+    int ret = fi_open_ops(&shmem_transport_ofi_domainfd->fid,
+                          FI_CXI_DOM_OPS_3, 0, (void **) &ops, NULL);
+    OFI_CHECK_ERROR_MSG(ret, "CXI hybrid MR operations unavailable (%s)\n",
+                        fi_strerror(-ret));
+    if (!ops || !ops->enable_hybrid_mr_desc)
+        RAISE_ERROR_STR("CXI hybrid MR descriptor operation unavailable");
+    ret = ops->enable_hybrid_mr_desc(&shmem_transport_ofi_domainfd->fid, true);
+    OFI_CHECK_ERROR_MSG(ret, "CXI hybrid MR descriptor enable failed (%s)\n",
+                        fi_strerror(-ret));
+#else
+    RAISE_ERROR_STR("OFI_BOUNCE_LOCAL_MR requires CXI hybrid descriptor headers; regenerate configure and reconfigure");
+#endif
+}
+
+static void *
+register_bounce_local_mr(shmem_transport_ctx_t *ctx, void *base, size_t bytes)
+{
+    shmem_transport_ofi_bounce_mr_t *entry = malloc(sizeof(*entry));
+    if (!entry)
+        RAISE_ERROR_STR("OFI local MR metadata allocation failed");
+    int ret = fi_mr_reg(shmem_transport_ofi_domainfd, base, bytes,
+                        FI_WRITE, 0, 0, 0, &entry->mr, NULL);
+    OFI_CHECK_ERROR_MSG(ret, "OFI bounce local MR registration failed (%s)\n",
+                        fi_strerror(-ret));
+    void *desc = fi_mr_desc(entry->mr);
+    if (!desc)
+        RAISE_ERROR_STR("OFI bounce local MR returned a null descriptor");
+    entry->next = ctx->bounce_local_mrs;
+    ctx->bounce_local_mrs = entry;
+    return desc;
+}
+
+/* Symmetric pools share one MR; malloc pools register each backing chunk.
+ * Attach descriptors before publication, with no registration while posting. */
+static void
+init_bounce_local_mrs(shmem_transport_ctx_t *ctx)
+{
+    if (!shmem_internal_params.OFI_BOUNCE_LOCAL_MR ||
+        ctx->id != SHMEM_TRANSPORT_CTX_DEFAULT_ID)
+        return;
+    if (!ctx->bounce_buffers)
+        RAISE_ERROR_STR("OFI_BOUNCE_LOCAL_MR requires default-context bounce buffers");
+    shmem_free_list_t *fl = ctx->bounce_buffers;
+    if (!fl->pool) {
+        size_t chunks = shmem_transport_ofi_max_bounce_buffers / SHMEM_FREE_LIST_NUM_ELEMENTS +
+                        (shmem_transport_ofi_max_bounce_buffers % SHMEM_FREE_LIST_NUM_ELEMENTS != 0);
+        for (size_t i = 1; i < chunks; i++)
+            if (shmem_free_list_more(fl))
+                RAISE_ERROR_STR("OFI local MR bounce pool preallocation failed");
+    } else {
+        /* Populate every reserved chunk so all future items have descriptors. */
+        while (fl->pool_ofs < fl->pool_size)
+            if (shmem_free_list_more(fl))
+                RAISE_ERROR_STR("OFI local MR bounce pool initialization failed");
+    }
+    void *pool_desc = fl->pool ?
+        register_bounce_local_mr(ctx, fl->pool, fl->pool_size) : NULL;
+    for (shmem_free_list_alloc_t *chunk = fl->allocs; chunk; chunk = chunk->next) {
+        void *desc = pool_desc ? pool_desc :
+            register_bounce_local_mr(ctx, chunk, fl->alloc_size);
+        char *first = (char *) (chunk + 1);
+        for (size_t i = 0; i < SHMEM_FREE_LIST_NUM_ELEMENTS; i++) {
+            shmem_transport_ofi_bounce_buffer_t *buff =
+                (shmem_transport_ofi_bounce_buffer_t *) (first + i * fl->element_size);
+            buff->local_desc = desc;
+        }
+    }
 }
 
 
@@ -1389,6 +1481,7 @@ int allocate_fabric_resources(struct fabric_info *info)
     ret = fi_domain(shmem_transport_ofi_fabfd, info->p_info,
                     &shmem_transport_ofi_domainfd,NULL);
     OFI_CHECK_RETURN_STR(ret, "domain initialization failed");
+    enable_bounce_local_mr(info);
 
     /* AV table set-up for PE mapping */
 
@@ -1811,6 +1904,11 @@ static int shmem_transport_ofi_target_ep_init(void)
 static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
 {
     int ret = 0;
+    ctx->bounce_local_mrs = NULL;
+    ctx->bounce_counter_head = NULL;
+    ctx->bounce_counter_retire = false;
+    ctx->bounce_puts = ctx->bounce_counter_puts = 0;
+    ctx->bounce_counter_reclaimed = ctx->bounce_counter_groups = 0;
 
     /* Allow provider to choose CQ size, since we are using FI_RM_ENABLED.
      * Context format is used to return bounce buffer pointers in the event
@@ -1883,10 +1981,19 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
                                  shmem_transport_ofi_bounce_buffer_size,
                                  init_bounce_buffer,
                                  max_bb_pool_cnt);
+        if (!ctx->bounce_buffers)
+            RAISE_ERROR_STR("OFI bounce pool allocation failed");
     }
     else {
         ctx->options &= ~SHMEMX_CTX_BOUNCE_BUFFER;
         ctx->bounce_buffers = NULL;
+    }
+    init_bounce_local_mrs(ctx);
+    if (id == SHMEM_TRANSPORT_CTX_DEFAULT_ID &&
+        shmem_internal_params.OFI_BOUNCE_COUNTER_RETIRE) {
+        if (ctx->stx_idx >= 0 || !ctx->bounce_buffers || !ctx->bounce_local_mrs)
+            RAISE_ERROR_STR("OFI_BOUNCE_COUNTER_RETIRE requires registered bounce buffers and an exclusive default TX queue (OFI_STX_MAX=0)");
+        ctx->bounce_counter_retire = true;
     }
 
     return 0;
@@ -1896,6 +2003,9 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
 int shmem_transport_init(void)
 {
     int ret = 0;
+    if (shmem_internal_params.OFI_CQ_BATCH_SIZE < 1 ||
+        shmem_internal_params.OFI_CQ_BATCH_SIZE > 32)
+        RAISE_ERROR_STR("OFI_CQ_BATCH_SIZE must be between 1 and 32");
 
     SHMEM_MUTEX_INIT(shmem_transport_ofi_lock);
 
@@ -2175,6 +2285,17 @@ void shmem_transport_ctx_destroy(shmem_transport_ctx_t *ctx)
 
     if (ctx == NULL)
         return;
+    shmem_internal_assert(ctx->bounce_counter_head == NULL);
+    if (ctx->id == SHMEM_TRANSPORT_CTX_DEFAULT_ID &&
+        shmem_internal_my_pe == 0 && shmem_internal_params.OFI_PUT_BATCH_STATS) {
+        fprintf(stderr, "[0000] OFI immediate bounce: local_mr=%d retirement=%s cq_batch=%zu"
+                " bounce_puts=%"PRIu64" counter_puts=%"PRIu64" cq_puts=%"PRIu64
+                " reclaimed=%"PRIu64" groups=%"PRIu64"\n",
+                ctx->bounce_local_mrs != NULL, ctx->bounce_counter_retire ? "counter" : "cq",
+                shmem_internal_params.OFI_CQ_BATCH_SIZE, ctx->bounce_puts,
+                ctx->bounce_counter_puts, ctx->bounce_puts - ctx->bounce_counter_puts,
+                ctx->bounce_counter_reclaimed, ctx->bounce_counter_groups);
+    }
 
     if(shmem_internal_params.DEBUG) {
         SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
@@ -2207,6 +2328,13 @@ void shmem_transport_ctx_destroy(shmem_transport_ctx_t *ctx)
         OFI_CHECK_ERROR_MSG(ret, "Context endpoint close failed (%s)\n", fi_strerror(errno));
     }
 
+    while (ctx->bounce_local_mrs) {
+        shmem_transport_ofi_bounce_mr_t *entry = ctx->bounce_local_mrs;
+        ctx->bounce_local_mrs = entry->next;
+        ret = fi_close(&entry->mr->fid);
+        OFI_CHECK_ERROR_MSG(ret, "OFI local MR close failed (%s)\n", fi_strerror(-ret));
+        free(entry);
+    }
     if (ctx->bounce_buffers) {
         shmem_free_list_destroy(ctx->bounce_buffers);
     }

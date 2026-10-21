@@ -301,10 +301,17 @@ typedef struct shmem_transport_ofi_frag_t shmem_transport_ofi_frag_t;
 
 struct shmem_transport_ofi_bounce_buffer_t {
     shmem_transport_ofi_frag_t frag;
+    void *local_desc;
+    struct shmem_transport_ofi_bounce_buffer_t *counter_next;
     uint8_t data[];
 };
 
 typedef struct shmem_transport_ofi_bounce_buffer_t shmem_transport_ofi_bounce_buffer_t;
+
+typedef struct shmem_transport_ofi_bounce_mr_t {
+    struct fid_mr *mr;
+    struct shmem_transport_ofi_bounce_mr_t *next;
+} shmem_transport_ofi_bounce_mr_t;
 
 /* How much symmetric heap one context's bounce-buffer pool will take.
  *
@@ -382,6 +389,13 @@ struct shmem_transport_ctx_t {
     uint64_t                        pending_bb_cntr;
     uint64_t                        completed_bb_cntr;
     shmem_free_list_t              *bounce_buffers;
+    shmem_transport_ofi_bounce_mr_t *bounce_local_mrs;
+    shmem_transport_ofi_bounce_buffer_t *bounce_counter_head;
+    bool                            bounce_counter_retire;
+    uint64_t                        bounce_puts;
+    uint64_t                        bounce_counter_puts;
+    uint64_t                        bounce_counter_reclaimed;
+    uint64_t                        bounce_counter_groups;
     int                             stx_idx;
     struct shmem_internal_tid       tid;
     struct shmem_internal_team_t   *team;
@@ -511,30 +525,33 @@ static inline
 void shmem_transport_ofi_drain_cq(shmem_transport_ctx_t *ctx)
 {
     ssize_t ret = 0;
-    struct fi_cq_entry buf;
+    struct fi_cq_entry buf[32];
+    size_t batch = shmem_internal_params.OFI_CQ_BATCH_SIZE;
 
     for (;;) {
-        ret = fi_cq_read(ctx->cq, (void *)&buf, 1);
+        ret = fi_cq_read(ctx->cq, (void *)buf, batch);
 
         if (ret == -FI_EAGAIN) break; /* No events */
 
-        else if (ret == 1) {
-            if (buf.op_context == &ctx->put_epoch_context) {
-                ctx->put_epoch_complete = true;
-                continue;
-            }
-            shmem_transport_ofi_frag_t *frag =
-                (shmem_transport_ofi_frag_t *) buf.op_context;
+        else if (ret > 0 && (size_t) ret <= batch) {
+            for (ssize_t i = 0; i < ret; i++) {
+                if (buf[i].op_context == &ctx->put_epoch_context) {
+                    ctx->put_epoch_complete = true;
+                    continue;
+                }
+                shmem_transport_ofi_frag_t *frag =
+                    (shmem_transport_ofi_frag_t *) buf[i].op_context;
 
-            if (frag == NULL)
-                RAISE_ERROR_STR("CQ completion has no operation context");
+                if (frag == NULL)
+                    RAISE_ERROR_STR("CQ completion has no operation context");
 
-            if (SHMEM_TRANSPORT_OFI_TYPE_BOUNCE == frag->mytype) {
-                shmem_free_list_free(ctx->bounce_buffers,
-                                     (shmem_transport_ofi_bounce_buffer_t *) frag);
-                ctx->completed_bb_cntr++;
-            } else {
-                RAISE_ERROR_MSG("[%d] Unrecognized completion object %p %x mtofs %p\n", shmem_internal_my_pe, frag, frag->mytype, &frag->mytype);
+                if (SHMEM_TRANSPORT_OFI_TYPE_BOUNCE == frag->mytype) {
+                    shmem_free_list_free(ctx->bounce_buffers,
+                                         (shmem_transport_ofi_bounce_buffer_t *) frag);
+                    ctx->completed_bb_cntr++;
+                } else {
+                    RAISE_ERROR_MSG("[%d] Unrecognized completion object %p %x mtofs %p\n", shmem_internal_my_pe, frag, frag->mytype, &frag->mytype);
+                }
             }
         }
 
@@ -546,6 +563,33 @@ void shmem_transport_ofi_drain_cq(shmem_transport_ctx_t *ctx)
             RAISE_ERROR_MSG("fi_cq_read returned invalid event count (%zd)\n", ret);
         }
     }
+}
+
+/* Caller holds the context lock at a safe boundary, before counting a new
+ * unaccepted write. A counter increment does not identify a particular source:
+ * wait for ALL issued writes, then recycle the entire counter-owned list.
+ * Never call from an EAGAIN retry, whose pending count includes its new post. */
+static inline
+void shmem_transport_ofi_wait_counter_sources(shmem_transport_ctx_t *ctx)
+{
+    if (!ctx->bounce_counter_head)
+        return;
+    shmem_internal_assert(ctx->bounce_counter_retire);
+    ssize_t ret = fi_cntr_wait(ctx->put_cntr, ctx->put_cntr_pending, -1);
+    OFI_CTX_CHECK_ERROR(ctx, ret);
+    SHMEM_TRANSPORT_OFI_CTX_BB_LOCK(ctx);
+    while (ctx->bounce_counter_head) {
+        shmem_transport_ofi_bounce_buffer_t *buff = ctx->bounce_counter_head;
+        ctx->bounce_counter_head = buff->counter_next;
+        buff->counter_next = NULL;
+        shmem_free_list_free(ctx->bounce_buffers, buff);
+        ctx->completed_bb_cntr++;
+        if (shmem_internal_params.OFI_PUT_BATCH_STATS)
+            ctx->bounce_counter_reclaimed++;
+    }
+    if (shmem_internal_params.OFI_PUT_BATCH_STATS)
+        ctx->bounce_counter_groups++;
+    SHMEM_TRANSPORT_OFI_CTX_BB_UNLOCK(ctx);
 }
 
 static inline
@@ -560,6 +604,11 @@ shmem_transport_ofi_bounce_buffer_t * create_bounce_buffer(shmem_transport_ctx_t
     shmem_internal_assert(shmem_transport_ofi_max_bounce_buffers > 0);
 
     while (ctx->bounce_buffers->nalloc >= (uint64_t) shmem_transport_ofi_max_bounce_buffers) {
+        if (ctx->bounce_counter_head) {
+            SHMEM_TRANSPORT_OFI_CTX_BB_UNLOCK(ctx);
+            shmem_transport_ofi_wait_counter_sources(ctx);
+            SHMEM_TRANSPORT_OFI_CTX_BB_LOCK(ctx);
+        }
         shmem_transport_ofi_drain_cq(ctx);
     }
 
@@ -589,6 +638,8 @@ static inline
 void shmem_transport_put_quiet(shmem_transport_ctx_t* ctx)
 {
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
+
+    shmem_transport_ofi_wait_counter_sources(ctx);
 
     /* Reclaim bounce buffers using their delivery completions. */
     if (ctx->bounce_buffers) {
@@ -866,28 +917,40 @@ void shmem_transport_ofi_put_nb_chunk(shmem_transport_ctx_t* ctx, void *target,
 
         SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
         shmem_transport_ofi_begin_put(ctx, epoch);
-        shmem_transport_ofi_record_put(ctx, pe);
         shmem_transport_ofi_get_mr(target, pe, &addr, &key);
 
         shmem_transport_ofi_bounce_buffer_t *buff =
             create_bounce_buffer(ctx, source, len);
+        /* Pool-pressure retirement above must not wait for this unposted put. */
+        shmem_transport_ofi_record_put(ctx, pe);
         polled = 0;
 
         const struct iovec      msg_iov = { .iov_base = buff->data, .iov_len = len };
         const struct fi_rma_iov rma_iov = { .addr = (uint64_t) addr, .len = len, .key = key };
         const struct fi_msg_rma msg     = {
                                             .msg_iov       = &msg_iov,
-                                            .desc          = GET_MR_DESC_ADDR(shmem_transport_ofi_get_mr_desc_index(source)),
+                                            .desc          = buff->local_desc ? &buff->local_desc :
+                                                             GET_MR_DESC_ADDR(shmem_transport_ofi_get_mr_desc_index(buff->data)),
                                             .iov_count     = 1,
                                             .addr          = GET_DEST(dst),
                                             .rma_iov       = &rma_iov,
                                             .rma_iov_count = 1,
-                                            .context       = buff,
+                                            .context       = ctx->bounce_counter_retire ? NULL : buff,
                                             .data          = 0
                                           };
         do {
-            ret = fi_writemsg(ctx->ep, &msg, FI_COMPLETION | FI_DELIVERY_COMPLETE);
+            ret = fi_writemsg(ctx->ep, &msg, FI_DELIVERY_COMPLETE |
+                             (ctx->bounce_counter_retire ? 0 : FI_COMPLETION));
         } while (try_again(ctx, ret, &polled));
+        if (ctx->bounce_counter_retire) {
+            buff->counter_next = ctx->bounce_counter_head;
+            ctx->bounce_counter_head = buff;
+        }
+        if (shmem_internal_params.OFI_PUT_BATCH_STATS) {
+            ctx->bounce_puts++;
+            if (ctx->bounce_counter_retire)
+                ctx->bounce_counter_puts++;
+        }
         SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
 
     } else {
@@ -1377,7 +1440,8 @@ void shmem_transport_atomicv(shmem_transport_ctx_t* ctx, void *target, const voi
         const struct fi_rma_ioc    rma_iov = { .addr = (uint64_t) addr, .count = len, .key = key };
         const struct fi_msg_atomic msg     = {
                                                .msg_iov       = &msg_iov,
-                                               .desc          = GET_MR_DESC_ADDR(shmem_transport_ofi_get_mr_desc_index(source)),
+                                               .desc          = buff->local_desc ? &buff->local_desc :
+                                                                GET_MR_DESC_ADDR(shmem_transport_ofi_get_mr_desc_index(buff->data)),
                                                .iov_count     = 1,
                                                .addr          = GET_DEST(dst),
                                                .rma_iov       = &rma_iov,
