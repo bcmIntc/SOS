@@ -16,4 +16,4 @@ NPROCS ?= 2
 LOG_COMPILER = $(TEST_RUNNER)
 endif
 
-EXTRA_DIST = run-ofi-immediate-matrix.sh
+EXTRA_DIST = run-ofi-immediate-matrix.sh test_ofi_immediate_matrix.py

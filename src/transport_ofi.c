@@ -2290,11 +2290,12 @@ void shmem_transport_ctx_destroy(shmem_transport_ctx_t *ctx)
         shmem_internal_my_pe == 0 && shmem_internal_params.OFI_PUT_BATCH_STATS) {
         fprintf(stderr, "[0000] OFI immediate bounce: local_mr=%d retirement=%s cq_batch=%zu"
                 " bounce_puts=%"PRIu64" counter_puts=%"PRIu64" cq_puts=%"PRIu64
-                " reclaimed=%"PRIu64" groups=%"PRIu64"\n",
+                " reclaimed=%"PRIu64" groups=%"PRIu64" stx_max=%ld stx_idx=%d\n",
                 ctx->bounce_local_mrs != NULL, ctx->bounce_counter_retire ? "counter" : "cq",
                 shmem_internal_params.OFI_CQ_BATCH_SIZE, ctx->bounce_puts,
                 ctx->bounce_counter_puts, ctx->bounce_puts - ctx->bounce_counter_puts,
-                ctx->bounce_counter_reclaimed, ctx->bounce_counter_groups);
+                ctx->bounce_counter_reclaimed, ctx->bounce_counter_groups,
+                shmem_transport_ofi_stx_max, ctx->stx_idx);
     }
 
     if(shmem_internal_params.DEBUG) {

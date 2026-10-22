@@ -87,6 +87,28 @@ for invalid in local-mr-off shared-stx multiple; do
     else
         timeout "${SOS_OFI_TEST_TIMEOUT:-120s}" "$@" "$init_binary" >"$log" 2>&1 || status=$?
     fi
+    # STX_MAX is a request: providers without STX support disable the pool.
+    # Successful initialization is inapplicable only with explicit evidence
+    # that the effective pool is disabled and the default queue is exclusive.
+    if [ "$invalid" = shared-stx ] && [ "$status" = 0 ]; then
+        if awk '
+            /OFI immediate bounce:/ {
+                delete v
+                for (i=1; i<=NF; i++) {
+                    n=split($i,a,"=")
+                    if (n==2) v[a[1]]=a[2]
+                }
+                seen++
+                if (v["local_mr"] != 1 || v["retirement"] != "counter" ||
+                    !("stx_max" in v) || v["stx_max"] != 0 ||
+                    !("stx_idx" in v) || v["stx_idx"] != -1) bad=1
+            }
+            END { exit !(seen==1 && !bad) }
+        ' "$log"; then
+            echo "SKIP: shared-STX rejection case inapplicable; effective STX pool disabled and default TX queue exclusive: $log"
+            continue
+        fi
+    fi
     if [ "$invalid" = multiple ] && [ "$status" = 77 ]; then
         echo "SKIP: MULTIPLE rejection case inapplicable; build provided SINGLE: $log"
         continue
