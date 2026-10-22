@@ -67,7 +67,8 @@ class CounterHardwareRunnerTests(unittest.TestCase):
         env.update(SOS_OFI_LOG_DIR=str(self.logs), SOS_COUNTER_MOCK_MODE=mode)
         return subprocess.run(
             ["sh", str(self.runner), str(self.binary), str(self.launcher)],
-            env=env, text=True, capture_output=True, timeout=10,
+            env=env, universal_newlines=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
         )
 
     def test_all_five_cases_and_build_record_are_saved(self):

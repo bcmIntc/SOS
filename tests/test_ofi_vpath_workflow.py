@@ -85,7 +85,8 @@ class VpathWorkflowTests(unittest.TestCase):
             result = subprocess.run(
                 command,
                 cwd=root, env=env,
-                text=True, capture_output=True, timeout=30)
+                universal_newlines=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
             calls = [json.loads(line) for line in trace.read_text().splitlines()
                      ] if trace.exists() else []
             record_path = build / "sos-build-source.txt"
