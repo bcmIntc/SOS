@@ -93,7 +93,7 @@ extern bool shmem_transport_ofi_pcie_cxi;
         }                                                                       \
     } while (0)
 
-#define OFI_CTX_CHECK_ERROR(ctx, /* ssize_t */ err)                             \
+#define OFI_CTX_CHECK_ERROR(ctx, /* int or ssize_t */ err)                      \
     do {                                                                        \
         if ((err) == -FI_EAVAIL) {                                              \
             struct fi_cq_err_entry e = {0};                                     \
@@ -106,7 +106,8 @@ extern bool shmem_transport_ofi_pcie_cxi;
                 RAISE_ERROR_MSG("Error reading from CQ (%zd)\n", ret);          \
             }                                                                   \
         } else if (err) {                                                       \
-            RAISE_ERROR_MSG("OFI error %zd: %s\n", err, fi_strerror(err));      \
+            RAISE_ERROR_MSG("OFI error %zd: %s\n", (ssize_t) (err),             \
+                            fi_strerror(err));                                 \
         }                                                                       \
     } while (0)
 
