@@ -1,8 +1,9 @@
 #!/bin/bash
 # Build the current checkout and its immediate CQ/counter regression binaries.
 # Run on the cluster with its compiler, MPI and libfabric modules loaded.
-# Default SOS build directory: /home/mfbrown/Code/SOS (source checkout: dev/).
-# Example: bash /home/mfbrown/Code/SOS/dev/scripts/build-ofi-immediate.sh
+# Cluster source directory: /home/mfbrown/Code/SOS.
+# Default SOS build directory: /home/mfbrown/Code/SOS/build.
+# Example: bash /home/mfbrown/Code/SOS/scripts/build-ofi-immediate.sh
 # Pass [build-directory] to override the default.
 set -euo pipefail
 
@@ -23,8 +24,8 @@ if [ -n "$sos_source_status" ]; then
 fi
 
 cd "$sos_source_dir"
-mkdir -p -- "${1:-/home/mfbrown/Code/SOS}"
-sos_build_dir=$(cd -- "${1:-/home/mfbrown/Code/SOS}" && pwd -P)
+mkdir -p -- "${1:-/home/mfbrown/Code/SOS/build}"
+sos_build_dir=$(cd -- "${1:-/home/mfbrown/Code/SOS/build}" && pwd -P)
 if [ "$sos_build_dir" = "$sos_source_dir" ]; then
     echo "use a separate build directory" >&2
     exit 2

@@ -1,9 +1,9 @@
 #!/bin/sh
 # Usage: sh run-ofi-quiet-matrix.sh /abs/ofi_quiet_oracle BYTES|all launcher args...
-# SOS build directory: /home/mfbrown/Code/SOS; binaries are in its tests/.
-# Example from /home/mfbrown/Code/SOS/dev, with a fresh log directory:
+# Cluster source: /home/mfbrown/Code/SOS; build: /home/mfbrown/Code/SOS/build.
+# Binaries are in build/tests/. Example from the source directory:
 # SOS_OFI_LOG_DIR=./logs/quiet-suite-new sh tests/run-ofi-quiet-matrix.sh \
-#   /home/mfbrown/Code/SOS/tests/ofi_quiet_oracle all mpirun -n 2 -ppn 1 -no-vni
+#   /home/mfbrown/Code/SOS/build/tests/ofi_quiet_oracle all mpirun -n 2 -ppn 1 -no-vni
 # "all" validates the local model negative control, then tests 1024/4096/8192.
 # SOS_OFI_QUIET_MODEL may override the sibling ofi_quiet_model binary.
 # Single-size runs require a separately validated local model negative control.

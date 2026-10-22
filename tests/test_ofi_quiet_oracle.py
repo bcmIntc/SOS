@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Run the quiet oracle against a local, test-only delayed-delivery model.
 
-The SOS build directory is /home/mfbrown/Code/SOS; the source checkout is
-/home/mfbrown/Code/SOS/dev. With the model binary already built, run from dev:
-  python3 tests/test_ofi_quiet_oracle.py /home/mfbrown/Code/SOS/tests/ofi_quiet_model
+The cluster source directory is /home/mfbrown/Code/SOS and the build directory
+is /home/mfbrown/Code/SOS/build. With the model binary already built, run from
+the source directory:
+  python3 tests/test_ofi_quiet_oracle.py /home/mfbrown/Code/SOS/build/tests/ofi_quiet_model
 
 This validates the observer/control protocol, not the real CXI transport.
 The early-quiet mutation leaves model-accepted writes undelivered.
