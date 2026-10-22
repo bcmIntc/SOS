@@ -1055,6 +1055,9 @@ AC_CONFIG_FILES([Makefile
   src/Makefile
   src/sandia-openshmem.pc
   tests/Makefile
+  tests/run-ofi-immediate-matrix.sh
+  tests/run-ofi-quiet-matrix.sh
+  scripts/rebuild-ofi.sh
   modules/Makefile
   modules/tests-sos/Makefile
   modules/tests-sos/test/Makefile

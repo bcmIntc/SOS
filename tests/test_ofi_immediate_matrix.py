@@ -13,7 +13,7 @@ import tempfile
 import unittest
 
 
-RUNNER = Path(__file__).with_name("run-ofi-immediate-matrix.sh").resolve()
+RUNNER_TEMPLATE = Path(__file__).with_name("run-ofi-immediate-matrix.sh.in").resolve()
 LAUNCHER = r'''
 import os
 from pathlib import Path
@@ -70,13 +70,18 @@ class MatrixRunnerTests(unittest.TestCase):
     def run_matrix(self, stx, multiple="reject"):
         with tempfile.TemporaryDirectory(prefix="sos-matrix-test-") as tmp:
             root = Path(tmp)
+            runner = root / "run-ofi-immediate-matrix.sh"
+            runner.write_text(
+                RUNNER_TEMPLATE.read_text()
+                .replace("@abs_top_srcdir@", str(RUNNER_TEMPLATE.parents[1]))
+                .replace("@abs_top_builddir@", str(root)))
             launcher = root / "launcher.py"
             launcher.write_text(LAUNCHER)
             env = os.environ.copy()
             env.update(SOS_OFI_LOG_DIR=str(root / "logs"),
                        MATRIX_TEST_STX=stx, MATRIX_TEST_MULTIPLE=multiple)
             result = subprocess.run(
-                ["sh", str(RUNNER), str(root / "ofi_immediate"), "1024",
+                ["sh", str(runner), str(root / "ofi_immediate"), "1024",
                  sys.executable, str(launcher)],
                 env=env, universal_newlines=True,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)

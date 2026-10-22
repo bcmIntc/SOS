@@ -13,7 +13,8 @@
 
 ACLOCAL_AMFLAGS = -I config
 
-EXTRA_DIST = sandia-openshmem.spec autogen.sh pmi-simple
+EXTRA_DIST = sandia-openshmem.spec autogen.sh pmi-simple \
+	scripts/build-ofi-immediate.sh scripts/rebuild-ofi.sh.in
 
 if ENABLE_MANPAGES
 EXTRA_DIST += man
@@ -22,6 +23,21 @@ endif
 dist_doc_DATA = README NEWS LICENSE
 
 SUBDIRS = bindings mpp pmi-simple src modules tests
+
+if USE_OFI
+nodist_noinst_SCRIPTS = scripts/rebuild-ofi.sh
+# Invoke these from the configured build root, including a VPATH build.
+# "all" generates headers and rebuilds libsma before linking the regressions.
+.PHONY: ofi-regressions check-ofi-quiet check-ofi-immediate
+ofi-regressions: all
+	$(MAKE) -C tests ofi-regressions
+
+check-ofi-quiet: ofi-regressions
+	$(MAKE) -C tests check-ofi-quiet
+
+check-ofi-immediate: ofi-regressions
+	$(MAKE) -C tests check-ofi-immediate
+endif
 
 if ENABLE_MANPAGES
 SUBDIRS += man
