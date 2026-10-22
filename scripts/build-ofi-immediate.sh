@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build the current checkout and its immediate/quiet regression binaries and models.
+# Build this checkout's immediate/quiet regressions, models and CXI counter tests.
 # Run on the cluster with its compiler, MPI and libfabric modules loaded.
 # Cluster source directory: /home/mfbrown/Code/SOS.
 # Default SOS build directory: /home/mfbrown/Code/SOS/build.

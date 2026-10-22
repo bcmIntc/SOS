@@ -1057,6 +1057,7 @@ AC_CONFIG_FILES([Makefile
   tests/Makefile
   tests/run-ofi-immediate-matrix.sh
   tests/run-ofi-quiet-matrix.sh
+  tests/run-ofi-counter-hardware.sh
   scripts/rebuild-ofi.sh
   modules/Makefile
   modules/tests-sos/Makefile

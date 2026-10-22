@@ -28,7 +28,7 @@ if USE_OFI
 nodist_noinst_SCRIPTS = scripts/rebuild-ofi.sh
 # Invoke these from the configured build root, including a VPATH build.
 # "all" generates headers and rebuilds libsma before linking the regressions.
-.PHONY: ofi-regressions check-ofi-quiet check-ofi-immediate
+.PHONY: ofi-regressions check-ofi-quiet check-ofi-immediate check-ofi-counter-hardware
 ofi-regressions: all
 	$(MAKE) -C tests ofi-regressions
 
@@ -37,6 +37,9 @@ check-ofi-quiet: ofi-regressions
 
 check-ofi-immediate: ofi-regressions
 	$(MAKE) -C tests check-ofi-immediate
+
+check-ofi-counter-hardware: ofi-regressions
+	$(MAKE) -C tests check-ofi-counter-hardware
 endif
 
 if ENABLE_MANPAGES
