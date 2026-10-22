@@ -363,8 +363,9 @@ struct shmem_transport_ctx_t {
     struct fid_cntr*                get_cntr;
     struct fid_cq*                  cq;
     /* Includes every non-fetching fabric operation, including terminal
-     * writes.  Protected by the context lock, never reset between epochs. */
+     * writes. Protected by the context lock; rebased only after full delivery. */
     uint64_t                        put_cntr_pending;
+    uint64_t                        put_cntr_limit;
     /* Saturates at two logical puts; transport fragments do not count as
      * separate puts.  Atomics alone use counter completion. */
     unsigned int                    put_epoch_puts;
@@ -458,12 +459,18 @@ void shmem_transport_ofi_begin_put(shmem_transport_ctx_t *ctx, uint64_t *epoch)
     if (epoch) *epoch = ctx->put_epoch_id;
 }
 
+static inline
+void shmem_transport_ofi_ensure_put_counter_capacity(shmem_transport_ctx_t *ctx);
+
 /* Called once per non-fetching fabric operation under the context lock.
  * Software statistics exclude terminal writes; the fabric threshold includes
  * them so alternating batch and single-put epochs cannot complete early. */
 static inline
 void shmem_transport_ofi_record_put(shmem_transport_ctx_t *ctx, int pe)
 {
+    /* Before counting an unaccepted write, finish and rebase if necessary.
+     * Retries must never enter this path with that write already counted. */
+    shmem_transport_ofi_ensure_put_counter_capacity(ctx);
     if (!ctx->put_epoch_dirty[pe]) {
         ctx->put_epoch_dirty[pe] = 1;
         ctx->put_epoch_pes[ctx->put_epoch_npes++] = pe;
@@ -565,6 +572,8 @@ void shmem_transport_ofi_drain_cq(shmem_transport_ctx_t *ctx)
     }
 }
 
+#include "transport_ofi_counter.h"
+
 /* Caller holds the context lock at a safe boundary, before counting a new
  * unaccepted write. A counter increment does not identify a particular source:
  * wait for ALL issued writes, then recycle the entire counter-owned list.
@@ -575,8 +584,7 @@ void shmem_transport_ofi_wait_counter_sources(shmem_transport_ctx_t *ctx)
     if (!ctx->bounce_counter_head)
         return;
     shmem_internal_assert(ctx->bounce_counter_retire);
-    ssize_t ret = fi_cntr_wait(ctx->put_cntr, ctx->put_cntr_pending, -1);
-    OFI_CTX_CHECK_ERROR(ctx, ret);
+    shmem_transport_ofi_wait_put_counter(ctx);
     SHMEM_TRANSPORT_OFI_CTX_BB_LOCK(ctx);
     while (ctx->bounce_counter_head) {
         shmem_transport_ofi_bounce_buffer_t *buff = ctx->bounce_counter_head;
@@ -656,8 +664,7 @@ void shmem_transport_put_quiet(shmem_transport_ctx_t* ctx)
      * stays bound; only batched epochs avoid counter reads and waits. */
     if (ctx->put_epoch_puts < 2) {
         if (ctx->put_epoch_npes > 0) {
-            ssize_t ret = fi_cntr_wait(ctx->put_cntr, ctx->put_cntr_pending, -1);
-            OFI_CTX_CHECK_ERROR(ctx, ret);
+            shmem_transport_ofi_wait_put_counter(ctx);
         }
     } else {
         for (size_t i = 0; i < ctx->put_epoch_npes; i++) {
@@ -686,6 +693,7 @@ void shmem_transport_put_quiet(shmem_transport_ctx_t* ctx)
                 .context = &ctx->put_epoch_context
             };
 
+            shmem_transport_ofi_ensure_put_counter_capacity(ctx);
             ctx->put_epoch_complete = false;
             ctx->put_cntr_pending++;
             do {

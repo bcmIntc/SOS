@@ -2,7 +2,7 @@
 if USE_OFI
 # Build the matrix binaries with ordinary make, without installing them.
 noinst_PROGRAMS = ofi_immediate ofi_counter_init ofi_quiet_oracle
-check_PROGRAMS = ofi_quiet_model
+check_PROGRAMS = ofi_quiet_model ofi_counter_wait_model
 TESTS = ofi_immediate
 ofi_immediate_SOURCES = ofi_immediate.c
 ofi_counter_init_SOURCES = ofi_counter_init.c
@@ -11,6 +11,9 @@ ofi_quiet_oracle_SOURCES = ofi_quiet_oracle.c
 ofi_quiet_model_SOURCES = ofi_quiet_oracle.c quiet-model/shmem.c
 ofi_quiet_model_CPPFLAGS = -I$(srcdir)/quiet-model
 ofi_quiet_model_LDADD =
+# Explicit counter-helper model; run directly, without MPI or TEST_RUNNER.
+ofi_counter_wait_model_SOURCES = ofi_counter_wait_model.c
+ofi_counter_wait_model_LDADD =
 
 AM_CPPFLAGS = -I$(top_builddir)/mpp -I$(top_srcdir)/mpp
 AM_LDFLAGS = $(LIBTOOL_WRAPPER_LDFLAGS)

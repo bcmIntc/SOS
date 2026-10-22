@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build the current checkout and its immediate CQ/counter regression binaries.
+# Build the current checkout and its immediate/quiet regression binaries and models.
 # Run on the cluster with its compiler, MPI and libfabric modules loaded.
 # Cluster source directory: /home/mfbrown/Code/SOS.
 # Default SOS build directory: /home/mfbrown/Code/SOS/build.
@@ -50,7 +50,8 @@ CC=${CC:-mpicc} CXX=${CXX:-mpicxx} "$sos_source_dir/configure" \
     --enable-threads --disable-ofi-hmem \
     --disable-libtool-wrapper --enable-hierarchical-barrier
 make -j "${SOS_BUILD_JOBS:-8}"
-make -C tests ofi_immediate ofi_counter_init
+make -C tests ofi_immediate ofi_counter_init ofi_quiet_oracle \
+    ofi_quiet_model ofi_counter_wait_model
 
 printf 'build_completed_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     >> "$sos_build_dir/sos-build-source.txt"

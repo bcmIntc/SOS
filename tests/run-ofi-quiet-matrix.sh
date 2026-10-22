@@ -4,9 +4,11 @@
 # Binaries are in build/tests/. Example from the source directory:
 # SOS_OFI_LOG_DIR=./logs/quiet-suite-new sh tests/run-ofi-quiet-matrix.sh \
 #   /home/mfbrown/Code/SOS/build/tests/ofi_quiet_oracle all mpirun -n 2 -ppn 1 -no-vni
-# "all" validates the local model negative control, then tests 1024/4096/8192.
+# "all" validates the counter-wait model and local model negative control,
+# then tests 1024/4096/8192.
 # SOS_OFI_QUIET_MODEL may override the sibling ofi_quiet_model binary.
-# Single-size runs require a separately validated local model negative control.
+# SOS_OFI_COUNTER_WAIT_MODEL may override the sibling ofi_counter_wait_model.
+# Single-size runs require separately validated counter-wait and negative-control models.
 # Requires two hosts with a TCP control route. No FI_MORE, arena or
 # payload-coalescing qualification. Delivery/accounting review remains separate.
 set -eu
@@ -22,18 +24,26 @@ log_dir=${SOS_OFI_LOG_DIR:-./ofi-quiet-logs}
 if [ "$bytes" = all ]; then
     script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
     model_binary=${SOS_OFI_QUIET_MODEL:-${binary%/*}/ofi_quiet_model}
+    counter_wait_binary=${SOS_OFI_COUNTER_WAIT_MODEL:-${binary%/*}/ofi_counter_wait_model}
     case "$model_binary" in
         /*) ;;
         *) echo "SOS_OFI_QUIET_MODEL must be absolute" >&2; exit 2 ;;
     esac
+    case "$counter_wait_binary" in
+        /*) ;;
+        *) echo "SOS_OFI_COUNTER_WAIT_MODEL must be absolute" >&2; exit 2 ;;
+    esac
     if [ ! -f "$binary" ] || [ ! -x "$binary" ] ||
-       [ ! -f "$model_binary" ] || [ ! -x "$model_binary" ]; then
+       [ ! -f "$model_binary" ] || [ ! -x "$model_binary" ] ||
+       [ ! -f "$counter_wait_binary" ] || [ ! -x "$counter_wait_binary" ]; then
         echo "all requires existing executable oracle and model binaries; no builds are performed" >&2
         exit 2
     fi
     # Reject stale evidence before running the control or any cluster case.
     for evidence in negative-control.log negative-control.exit-status \
                     negative-control-binary.sha256 negative-control-test.sha256 \
+                    counter-wait-model.log counter-wait-model.exit-status \
+                    counter-wait-model-binary.sha256 \
                     matrix-1024 matrix-4096 matrix-8192; do
         if [ -e "$log_dir/$evidence" ]; then
             echo "use a new log directory; $log_dir/$evidence already exists" >&2
@@ -41,6 +51,17 @@ if [ "$bytes" = all ]; then
         fi
     done
     mkdir -p "$log_dir"
+    sha256sum "$counter_wait_binary" >"$log_dir/counter-wait-model-binary.sha256"
+    status=0
+    timeout "${SOS_OFI_TEST_TIMEOUT:-120s}" "$counter_wait_binary" \
+        >"$log_dir/counter-wait-model.log" 2>&1 || status=$?
+    printf '%s\n' "$status" >"$log_dir/counter-wait-model.exit-status"
+    if [ "$status" != 0 ] ||
+       ! grep -Fxq "OFI counter wait and rebase model checks completed" "$log_dir/counter-wait-model.log"; then
+        echo "FAIL/INVALID: $log_dir/counter-wait-model.log (exit $status); no cluster cases run" >&2
+        exit 1
+    fi
+    echo "Counter wait and rebase model checks completed: $log_dir/counter-wait-model.log"
     sha256sum "$model_binary" >"$log_dir/negative-control-binary.sha256"
     sha256sum "$script_dir/test_ofi_quiet_oracle.py" >"$log_dir/negative-control-test.sha256"
     status=0

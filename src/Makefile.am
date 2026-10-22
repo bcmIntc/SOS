@@ -97,6 +97,7 @@ endif
 if USE_OFI
 libsma_la_SOURCES += \
 	transport_ofi.h \
+	transport_ofi_counter.h \
 	transport_ofi.c
 endif
 

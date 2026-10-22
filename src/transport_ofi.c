@@ -1904,6 +1904,10 @@ static int shmem_transport_ofi_target_ep_init(void)
 static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
 {
     int ret = 0;
+    ctx->put_cntr_limit =
+        shmem_transport_ofi_info.p_info->fabric_attr->prov_name &&
+        !strcmp(shmem_transport_ofi_info.p_info->fabric_attr->prov_name, "cxi") ?
+        SHMEM_TRANSPORT_OFI_CXI_PUT_CNTR_MAX : UINT64_MAX;
     ctx->bounce_local_mrs = NULL;
     ctx->bounce_counter_head = NULL;
     ctx->bounce_counter_retire = false;
