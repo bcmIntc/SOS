@@ -1,22 +1,71 @@
 #!/bin/sh
-# Usage: sh run-ofi-quiet-matrix.sh /abs/ofi_quiet_oracle BYTES launcher args...
-# Requires a separately validated local model negative control and two hosts
-# with a TCP control route. No FI_MORE, arena or payload-coalescing qualification.
+# Usage: sh run-ofi-quiet-matrix.sh /abs/ofi_quiet_oracle BYTES|all launcher args...
+# SOS build directory: /home/mfbrown/Code/SOS; binaries are in its tests/.
+# Example from /home/mfbrown/Code/SOS/dev, with a fresh log directory:
+# SOS_OFI_LOG_DIR=./logs/quiet-suite-new sh tests/run-ofi-quiet-matrix.sh \
+#   /home/mfbrown/Code/SOS/tests/ofi_quiet_oracle all mpirun -n 2 -ppn 1 -no-vni
+# "all" validates the local model negative control, then tests 1024/4096/8192.
+# SOS_OFI_QUIET_MODEL may override the sibling ofi_quiet_model binary.
+# Single-size runs require a separately validated local model negative control.
+# Requires two hosts with a TCP control route. No FI_MORE, arena or
+# payload-coalescing qualification. Delivery/accounting review remains separate.
 set -eu
 if [ "$#" -lt 3 ]; then
-    echo "usage: $0 /abs/ofi_quiet_oracle BYTES launcher args..." >&2
+    echo "usage: $0 /abs/ofi_quiet_oracle BYTES|all launcher args..." >&2
     exit 2
 fi
 binary=$1
 bytes=$2
 shift 2
 case "$binary" in /*) ;; *) echo "test binary must be absolute" >&2; exit 2 ;; esac
+log_dir=${SOS_OFI_LOG_DIR:-./ofi-quiet-logs}
+if [ "$bytes" = all ]; then
+    script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+    model_binary=${SOS_OFI_QUIET_MODEL:-${binary%/*}/ofi_quiet_model}
+    case "$model_binary" in
+        /*) ;;
+        *) echo "SOS_OFI_QUIET_MODEL must be absolute" >&2; exit 2 ;;
+    esac
+    if [ ! -f "$binary" ] || [ ! -x "$binary" ] ||
+       [ ! -f "$model_binary" ] || [ ! -x "$model_binary" ]; then
+        echo "all requires existing executable oracle and model binaries; no builds are performed" >&2
+        exit 2
+    fi
+    # Reject stale evidence before running the control or any cluster case.
+    for evidence in negative-control.log negative-control.exit-status \
+                    negative-control-binary.sha256 negative-control-test.sha256 \
+                    matrix-1024 matrix-4096 matrix-8192; do
+        if [ -e "$log_dir/$evidence" ]; then
+            echo "use a new log directory; $log_dir/$evidence already exists" >&2
+            exit 2
+        fi
+    done
+    mkdir -p "$log_dir"
+    sha256sum "$model_binary" >"$log_dir/negative-control-binary.sha256"
+    sha256sum "$script_dir/test_ofi_quiet_oracle.py" >"$log_dir/negative-control-test.sha256"
+    status=0
+    # This driver runs both normal-delivery and early-return cases locally;
+    # the early-return processes must fail with a detected payload mismatch.
+    python3 "$script_dir/test_ofi_quiet_oracle.py" "$model_binary" -v \
+        >"$log_dir/negative-control.log" 2>&1 || status=$?
+    printf '%s\n' "$status" >"$log_dir/negative-control.exit-status"
+    if [ "$status" != 0 ]; then
+        echo "FAIL/INVALID: $log_dir/negative-control.log (exit $status); no cluster cases run" >&2
+        exit 1
+    fi
+    echo "Delayed-delivery model checks completed: $log_dir/negative-control.log"
+    for matrix_bytes in 1024 4096 8192; do
+        SOS_OFI_LOG_DIR="$log_dir/matrix-$matrix_bytes" \
+            sh "$script_dir/run-ofi-quiet-matrix.sh" "$binary" "$matrix_bytes" "$@"
+    done
+    echo "Quiet observation suite completed; delivery/accounting review remains required."
+    exit 0
+fi
 case "$bytes" in ''|*[!0-9]*) echo "BYTES must be an integer in 1-8192" >&2; exit 2 ;; esac
 if [ "$bytes" -lt 1 ] || [ "$bytes" -gt 8192 ]; then
     echo "choose BYTES above negotiated injection and at/below 8192" >&2
     exit 2
 fi
-log_dir=${SOS_OFI_LOG_DIR:-./ofi-quiet-logs}
 mkdir -p "$log_dir"
 if [ -e "$log_dir/matrix-summary.tsv" ]; then
     echo "use a new log directory; matrix-summary.tsv already exists" >&2

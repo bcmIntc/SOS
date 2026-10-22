@@ -1,6 +1,10 @@
 #!/bin/sh
 # Explicit future cluster launcher; never invoked by the default make check.
 # Usage: sh run-ofi-immediate-matrix.sh /abs/path/ofi_immediate BYTES launcher args...
+# SOS build directory: /home/mfbrown/Code/SOS; binaries are in its tests/.
+# Example from /home/mfbrown/Code/SOS/dev:
+# sh tests/run-ofi-immediate-matrix.sh /home/mfbrown/Code/SOS/tests/ofi_immediate \
+#   1024 mpirun -n 2 -ppn 1 -no-vni
 set -eu
 if [ "$#" -lt 3 ]; then
     echo "usage: $0 /abs/path/ofi_immediate BYTES launcher args..." >&2
