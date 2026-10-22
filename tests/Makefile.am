@@ -1,6 +1,7 @@
 # Standalone public-API regressions, independent of the tests-sos submodule.
 if USE_OFI
-check_PROGRAMS = ofi_immediate ofi_counter_init
+# Build the matrix binaries with ordinary make, without installing them.
+noinst_PROGRAMS = ofi_immediate ofi_counter_init
 TESTS = ofi_immediate
 ofi_immediate_SOURCES = ofi_immediate.c
 ofi_counter_init_SOURCES = ofi_counter_init.c
