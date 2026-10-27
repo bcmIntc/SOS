@@ -78,4 +78,4 @@ endif
 EXTRA_DIST = run-ofi-immediate-matrix.sh.in test_ofi_immediate_matrix.py \
              run-ofi-quiet-matrix.sh.in test_ofi_quiet_oracle.py quiet-model/shmem.h \
              test_ofi_vpath_workflow.py run-ofi-counter-hardware.sh.in \
-             test_ofi_counter_hardware_runner.py
+             test_ofi_counter_hardware_runner.py test_osu_shmem_runner.py

@@ -1,0 +1,697 @@
+#!/bin/bash
+# config.status generates this runner in the VPATH build's scripts directory.
+# Two-PE tests use neighboring pairs; scalable tests use every physical core.
+set -euo pipefail
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4))); then
+    printf 'ERROR: this runner requires Bash 4.4 or newer\n' >&2
+    exit 2
+fi
+
+usage() {
+    cat <<'USAGE'
+Usage: bash run-osu-shmem.sh --osu-dir DIR [options]
+
+  --sos-lib-dir DIR       SOS library directory (default: configured build/src/.libs)
+  --baseline-lib-dir DIR  Optional baseline SOS library; adds a third arm
+  --baseline-expect-commit SHA  Optional full baseline commit check
+  --hosts A,B,C          Ordered allocation hosts; neighboring pairs are tested
+  --hostfile FILE        One hostname per line; repeated PBS hosts are deduplicated
+  --nodes N              Use the first N distinct allocation hosts (N >= 2)
+  --cores-per-node N     PEs per node for all-node tests (required; trusted input)
+  --mpirun COMMAND       Launcher executable (default: mpirun)
+  --launcher-style NAME  hydra (default) or openmpi
+  --mpirun-arg ARG       Additional launcher argument; repeat for each argument
+  --tests NAME,NAME      Select discovered osu_oshm_* benchmarks (default: all)
+  --test-arg NAME ARG    Add one argument to a selected benchmark; repeat as needed
+  --test-mode NAME MODE  Optional layout override: pair or all
+  --repeats N            Matched arm sets per benchmark (default: 1)
+  --timeout DURATION     Per-launch GNU timeout duration (default: 120s)
+  --kill-after DURATION  Force KILL after timeout's TERM grace (default: 10s)
+  --log-dir DIR          Fresh output directory (default: build/logs/osu-shmem-DATE)
+  --expect-commit SHA    Expected full SOS commit; otherwise read build record
+  --stop-on-failure      Stop after the first failed benchmark
+  --plan                Print the inventory and fixed launch count; do not launch MPI
+  --help                Show this help
+
+Without --hosts/--hostfile, PBS_NODEFILE is used when present. Otherwise --nodes
+is required and mpirun discovers that many hosts. --plan requires an explicit
+host list/file or PBS_NODEFILE, so it never launches MPI.
+Odd allocation: the final unpaired host is paired with the first host.
+Two-PE point-to-point/atomic tests use pairs. Collective tests use all selected
+hosts, one PE per available physical core. Other names default to pairs.
+--test-mode is optional; use it to override a version-specific requirement.
+All-node tests require --cores-per-node. Explicit node/core counts determine
+MPI process counts; hardware topology and CPU affinity are not queried.
+MPI handles core binding; existing Intel MPI pinning settings are preserved.
+Benchmarks use their default arguments unless --test-arg supplies version-specific
+options. Put/get/atomic benchmarks default to the positional memory selector
+heap; an explicit heap/global --test-arg overrides it. The symmetric heap
+defaults to 1G per PE; an existing SHMEM_SYMMETRIC_SIZE overrides it.
+Installed ELF benchmarks must dynamically link to SOS libsma.so.
+MPI benchmarks such as osu_latency and osu_put_latency are excluded.
+With a baseline, repetitions rotate baseline/control/experimental order.
+Baseline disables local-MR registration and counter retirement. Its selected
+library is verified on every host; older builds need not print commit/stats.
+USAGE
+}
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
+positive_integer() {
+    [[ $1 =~ ^[1-9][0-9]*$ && ${#1} -le 6 ]] || die "$2 must be a positive integer (at most six digits)"
+}
+clean_field() {
+    [[ $1 != *$'\t'* && $1 != *$'\n'* && $1 != *$'\r'* ]] ||
+        die "tabs/newlines are unsupported in $2"
+}
+absolute_directory() { (cd -- "$1" && pwd -P); }
+short_host() { local value=${1,,}; printf '%s' "${value%%.*}"; }
+timestamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+sos_source_dir="@abs_top_srcdir@"
+sos_build_dir="@abs_top_builddir@"
+osu_dir=
+sos_lib_dir="$sos_build_dir/src/.libs"
+baseline_lib_dir=
+baseline_expected_commit=
+baseline_enabled=0
+original_library_path=${LD_LIBRARY_PATH:-}
+host_csv=
+host_file=
+node_limit=
+cores_per_node=
+mpirun_command=mpirun
+launcher_style=hydra
+test_csv=
+repeats=1
+test_timeout=120s
+kill_after=10s
+log_dir=${SOS_OFI_LOG_DIR:-$sos_build_dir/logs/osu-shmem-$(date +%Y%m%d-%H%M%S)}
+expected_commit=
+stop_on_failure=0
+plan_only=0
+launcher_args=()
+argument_names=()
+argument_values=()
+mode_names=()
+mode_values=()
+
+while (($#)); do
+    case $1 in
+        --help|-h) usage; exit 0 ;;
+        --plan) plan_only=1; shift ;;
+        --stop-on-failure) stop_on_failure=1; shift ;;
+        --test-arg)
+            (($# >= 3)) || die "--test-arg requires NAME ARG"
+            argument_names+=("$2"); argument_values+=("$3"); shift 3 ;;
+        --test-mode)
+            (($# >= 3)) || die "--test-mode requires NAME pair|all"
+            [[ $3 == pair || $3 == all ]] || die "--test-mode requires pair or all"
+            mode_names+=("$2"); mode_values+=("$3"); shift 3 ;;
+        --osu-dir|--sos-lib-dir|--baseline-lib-dir|--baseline-expect-commit|--hosts|--hostfile|--nodes|--cores-per-node|--mpirun|--launcher-style|--mpirun-arg|--tests|--repeats|--timeout|--kill-after|--log-dir|--expect-commit)
+            (($# >= 2)) || die "$1 requires a value"
+            case $1 in
+                --osu-dir) osu_dir=$2 ;;
+                --sos-lib-dir) sos_lib_dir=$2 ;;
+                --baseline-lib-dir) baseline_lib_dir=$2 ;;
+                --baseline-expect-commit) baseline_expected_commit=$2 ;;
+                --hosts) host_csv=$2 ;;
+                --hostfile) host_file=$2 ;;
+                --nodes) node_limit=$2 ;;
+                --cores-per-node) cores_per_node=$2 ;;
+                --mpirun) mpirun_command=$2 ;;
+                --launcher-style) launcher_style=$2 ;;
+                --mpirun-arg) launcher_args+=("$2") ;;
+                --tests) test_csv=$2 ;;
+                --repeats) repeats=$2 ;;
+                --timeout) test_timeout=$2 ;;
+                --kill-after) kill_after=$2 ;;
+                --log-dir) log_dir=$2 ;;
+                --expect-commit) expected_commit=$2 ;;
+            esac
+            shift 2 ;;
+        *) die "unknown option: $1 (see --help)" ;;
+    esac
+done
+
+[[ -n $osu_dir && -d $osu_dir ]] || die "--osu-dir must name an existing OSU installation directory"
+[[ -d $sos_lib_dir ]] || die "SOS library directory does not exist: $sos_lib_dir"
+[[ ! ( -n $host_csv && -n $host_file ) ]] || die "choose --hosts or --hostfile"
+[[ $launcher_style == hydra || $launcher_style == openmpi ]] || die "--launcher-style must be hydra or openmpi"
+positive_integer "$repeats" "--repeats"
+[[ -z $cores_per_node ]] || positive_integer "$cores_per_node" "--cores-per-node"
+if [[ -n $node_limit ]]; then
+    positive_integer "$node_limit" "--nodes"
+    ((node_limit >= 2)) || die "--nodes must be at least 2"
+fi
+[[ $test_timeout =~ ^[0-9]+([.][0-9]+)?[smhd]?$ ]] &&
+    [[ $test_timeout =~ [1-9] ]] || die "--timeout must be a nonzero GNU timeout duration"
+[[ $kill_after =~ ^[0-9]+([.][0-9]+)?[smhd]?$ ]] &&
+    [[ $kill_after =~ [1-9] ]] || die "--kill-after must be a nonzero GNU timeout duration"
+osu_dir=$(absolute_directory "$osu_dir")
+sos_lib_dir=$(absolute_directory "$sos_lib_dir")
+[[ -f $sos_lib_dir/libsma.so ]] || die "expected $sos_lib_dir/libsma.so"
+if [[ -n $baseline_lib_dir ]]; then
+    [[ -d $baseline_lib_dir ]] || die "baseline library directory does not exist: $baseline_lib_dir"
+    baseline_lib_dir=$(absolute_directory "$baseline_lib_dir")
+    clean_field "$baseline_lib_dir" "baseline paths"
+    [[ -f $baseline_lib_dir/libsma.so ]] || die "expected $baseline_lib_dir/libsma.so"
+    baseline_enabled=1
+fi
+if [[ -n $baseline_expected_commit ]]; then
+    ((baseline_enabled)) || die "--baseline-expect-commit requires --baseline-lib-dir"
+    [[ $baseline_expected_commit =~ ^[0-9a-fA-F]{40}$ ]] ||
+        die "--baseline-expect-commit must be a full 40-character SHA"
+    baseline_expected_commit=${baseline_expected_commit,,}
+fi
+for field in "$osu_dir" "$sos_lib_dir" "$log_dir"; do clean_field "$field" "paths"; done
+for tool in timeout find sort awk grep sha256sum date; do
+    command -v "$tool" >/dev/null || die "required command is unavailable: $tool"
+done
+[[ -f $mpirun_command && -x $mpirun_command ]] ||
+    command -v "$mpirun_command" >/dev/null || die "launcher is unavailable: $mpirun_command"
+
+build_record="$sos_build_dir/sos-build-source.txt"
+if [[ -z $expected_commit && -f $build_record ]]; then
+    expected_commit=$(awk -F= '/^git_commit=/ {print $2; exit}' "$build_record")
+    grep -Eq '^build_completed_utc=.+$' "$build_record" ||
+        die "build record is incomplete; refresh with scripts/rebuild-ofi.sh"
+fi
+[[ $expected_commit =~ ^[0-9a-fA-F]{40}$ ]] ||
+    die "a full SOS commit is required; use a completed build record or --expect-commit"
+expected_commit=${expected_commit,,}
+
+# Start each arm's loader path from the caller's original environment, so
+# baseline and aggregation library paths do not accumulate across launches.
+arm_environment() {
+    local selected_library=$sos_lib_dir retirement=0 local_mr=1 statistics=1
+    case $1 in
+        baseline) selected_library=$baseline_lib_dir; local_mr=0; statistics=0 ;;
+        control) ;;
+        experimental) retirement=1 ;;
+        *) die "invalid benchmark arm: $1" ;;
+    esac
+    export LD_LIBRARY_PATH="$selected_library${original_library_path:+:$original_library_path}"
+    export SHMEM_OFI_BOUNCE_LOCAL_MR=$local_mr
+    export SHMEM_OFI_BOUNCE_COUNTER_RETIRE=$retirement
+    export SHMEM_OFI_PUT_BATCH_STATS=$statistics
+}
+
+# Do not infer OpenSHMEM from generic MPI one-sided benchmark names.
+# Prune libtool's .libs directory to avoid selecting both a wrapper and its binary.
+if ! discovered=$(find -L "$osu_dir" -type d -name .libs -prune -o \
+    -type f -name 'osu_oshm_*' -perm /111 -print | LC_ALL=C sort); then
+    die "OSU executable discovery failed"
+fi
+[[ -n $discovered ]] || die "no executable osu_oshm_* benchmarks found under $osu_dir"
+declare -A available=()
+while IFS= read -r binary; do
+    clean_field "$binary" "benchmark paths"
+    name=${binary##*/}
+    [[ -z ${available[$name]+present} ]] ||
+        die "duplicate benchmark $name; select a narrower --osu-dir"
+    available[$name]=$binary
+done <<< "$discovered"
+tests=()
+if [[ -n $test_csv ]]; then
+    IFS=, read -r -a tests <<< "$test_csv"
+else
+    mapfile -t tests < <(printf '%s\n' "${!available[@]}" | LC_ALL=C sort)
+fi
+declare -A selected=()
+for name in "${tests[@]}"; do
+    [[ $name == osu_oshm_* && -n ${available[$name]+present} ]] ||
+        die "not a discovered OpenSHMEM benchmark: $name"
+    [[ -z ${selected[$name]+present} ]] || die "duplicate selection: $name"
+    selected[$name]=1
+done
+for name in "${argument_names[@]}"; do
+    [[ -n ${selected[$name]+present} ]] || die "--test-arg names an unselected benchmark: $name"
+done
+declare -A test_mode=()
+for ((index=0; index<${#mode_names[@]}; index++)); do
+    name=${mode_names[index]}
+    [[ -n ${selected[$name]+present} ]] || die "--test-mode names an unselected benchmark: $name"
+    [[ -z ${test_mode[$name]+present} ]] || die "duplicate --test-mode: $name"
+    test_mode[$name]=${mode_values[index]}
+done
+pair_tests=()
+all_tests=()
+for name in "${tests[@]}"; do
+    if [[ -z ${test_mode[$name]+present} ]]; then
+        case ${name#osu_oshm_} in
+            barrier|barrier_*|bcast|bcast_*|broadcast|broadcast_*|\
+            collect|collect_*|fcollect|fcollect_*|alltoall|alltoall_*|\
+            alltoalls|alltoalls_*|reduce|reduce_*|reduction|reduction_*)
+                test_mode[$name]=all ;;
+            put|put_nb|put_nbi|get|get_nb|get_nbi|add|fadd|inc|finc|cswap|swap|fetch|set|\
+            atomic_add|atomic_fadd|atomic_inc|atomic_finc|atomic_cswap|atomic_swap|atomic_fetch|atomic_set)
+                test_mode[$name]=pair ;;
+            *)
+                test_mode[$name]=pair
+                printf 'NOTE: %s defaults to pairs; --test-mode is optional if its documented layout differs.\n' "$name" >&2 ;;
+        esac
+    fi
+    if [[ ${test_mode[$name]} == pair ]]; then pair_tests+=("$name")
+    else all_tests+=("$name"); fi
+done
+
+# Refuse an existing result directory before any optional MPI discovery/probe.
+if ((plan_only == 0)); then
+    [[ ! -e $log_dir ]] || die "use a fresh output directory; already exists: $log_dir"
+fi
+launch_command() {
+    if [[ $launcher_style == hydra ]]; then
+        command=("$mpirun_command" "${launcher_args[@]}" -n "$1" -ppn "$2" -hosts "$3")
+    else
+        # Explicit slots also support --hosts outside scheduler-managed allocations.
+        local host openmpi_hosts=
+        local -a launch_hosts
+        IFS=, read -r -a launch_hosts <<< "$3"
+        for host in "${launch_hosts[@]}"; do
+            openmpi_hosts+="${openmpi_hosts:+,}$host:$2"
+        done
+        command=("$mpirun_command" "${launcher_args[@]}" -np "$1"
+                 --map-by "ppr:$2:node" --bind-to core --nooversubscribe --host "$openmpi_hosts")
+    fi
+}
+
+raw_hosts=()
+if [[ -n $host_csv ]]; then
+    IFS=, read -r -a raw_hosts <<< "$host_csv"
+elif [[ -n $host_file || -n ${PBS_NODEFILE:-} ]]; then
+    host_file=${host_file:-$PBS_NODEFILE}
+    [[ -r $host_file ]] || die "cannot read host file: $host_file"
+    mapfile -t raw_hosts < <(awk '!/^[[:space:]]*(#|$)/ {gsub(/\r/, ""); print $1}' "$host_file")
+else
+    ((plan_only == 0)) || die "--plan needs --hosts, --hostfile, or PBS_NODEFILE"
+    [[ -n $node_limit ]] || die "provide --hosts, --hostfile, PBS_NODEFILE, or --nodes"
+    if [[ $launcher_style == hydra ]]; then
+        discovery_command=("$mpirun_command" "${launcher_args[@]}" -n "$node_limit" -ppn 1 /bin/hostname)
+    else
+        discovery_command=("$mpirun_command" "${launcher_args[@]}" -np "$node_limit"
+                           --map-by ppr:1:node --bind-to core --nooversubscribe /bin/hostname)
+    fi
+    if ! discovered_hosts=$(timeout --kill-after="$kill_after" "$test_timeout" "${discovery_command[@]}"); then
+        die "MPI host discovery failed"
+    fi
+    mapfile -t raw_hosts <<< "$discovered_hosts"
+fi
+hosts=()
+declare -A seen_hosts=()
+for host in "${raw_hosts[@]}"; do
+    [[ $host =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || die "invalid hostname: $host"
+    key=$(short_host "$host")
+    if [[ -z ${seen_hosts[$key]+present} ]]; then
+        hosts+=("$host"); seen_hosts[$key]=1
+    fi
+done
+if [[ -n $node_limit ]]; then
+    ((${#hosts[@]} >= node_limit)) || die "requested $node_limit nodes, found ${#hosts[@]} distinct hosts"
+    hosts=("${hosts[@]:0:node_limit}")
+fi
+((${#hosts[@]} >= 2)) || die "at least two distinct hosts are required"
+pair_left=()
+pair_right=()
+for ((index=0; index<${#hosts[@]}; index+=2)); do
+    pair_left+=("${hosts[index]}")
+    if ((index+1 < ${#hosts[@]})); then pair_right+=("${hosts[index+1]}")
+    else pair_right+=("${hosts[0]}"); fi
+done
+pair_count=${#pair_left[@]}
+host_list=$(IFS=,; printf '%s' "${hosts[*]}")
+
+# User-provided allocation dimensions are authoritative. An MPI-launched
+# probe may legitimately see only its own bound core, not the full node.
+if ((${#all_tests[@]})); then
+    [[ -n $cores_per_node ]] || die "all-node tests require --cores-per-node N"
+fi
+
+# Each scope has its own process count and applicable tests.
+scope_ids=()
+scope_modes=()
+scope_hosts=()
+scope_pes=()
+scope_ppn=()
+if ((${#pair_tests[@]})); then
+    for ((p=0; p<pair_count; p++)); do
+        printf -v scope_id 'pair-%03d' "$((p+1))"
+        scope_ids+=("$scope_id"); scope_modes+=(pair)
+        scope_hosts+=("${pair_left[p]},${pair_right[p]}")
+        scope_pes+=(2); scope_ppn+=(1)
+    done
+fi
+if ((${#all_tests[@]})); then
+    scope_ids+=(all-nodes); scope_modes+=(all)
+    scope_hosts+=("$host_list")
+    scope_pes+=("$((${#hosts[@]} * cores_per_node))")
+    scope_ppn+=("$cores_per_node")
+fi
+scope_count=${#scope_ids[@]}
+arm_count=$((2 + baseline_enabled))
+library_probe_count=$((scope_count * (1 + baseline_enabled)))
+total=$(((pair_count * ${#pair_tests[@]} + ${#all_tests[@]}) * repeats * arm_count))
+printf 'Plan: %d nodes, %d paired tests, %d all-node tests, %d repetition(s).\n' \
+    "${#hosts[@]}" "${#pair_tests[@]}" "${#all_tests[@]}" "$repeats"
+printf '%d benchmark launches, plus %d placement and %d library probes' "$total" "$scope_count" "$library_probe_count"
+printf '.\n'
+printf 'Per-launch timeout: %s; forced-KILL grace: %s.\n' "$test_timeout" "$kill_after"
+printf 'Expected SOS commit: %s\nLibrary: %s\n' "$expected_commit" "$sos_lib_dir/libsma.so"
+if ((baseline_enabled)); then
+    printf 'Baseline library: %s\nBaseline expected commit: %s\n' \
+        "$baseline_lib_dir/libsma.so" "${baseline_expected_commit:-not required; selected library hash verified}"
+fi
+printf 'Put/get/atomic memory default: heap; symmetric heap: %s per PE.\n' \
+    "${SHMEM_SYMMETRIC_SIZE:-1G}"
+for ((p=0; p<scope_count; p++)); do
+    printf '  %s: %s; %d PEs, %d PEs/node\n' \
+        "${scope_ids[p]}" "${scope_hosts[p]}" "${scope_pes[p]}" "${scope_ppn[p]}"
+done
+printf 'Benchmarks:\n'
+for name in "${tests[@]}"; do printf '  %s: %s\n' "$name" "${test_mode[$name]}"; done
+((plan_only == 0)) || exit 0
+[[ ! -e $log_dir ]] || die "use a fresh output directory; already exists: $log_dir"
+mkdir -p -- "$log_dir"
+log_dir=$(absolute_directory "$log_dir")
+
+# Common settings are identical between matched arms. Existing heap settings
+# are retained, and callers may retain their provider device/cache settings.
+export SHMEM_OFI_PROVIDER=cxi SHMEM_OFI_BOUNCE_LOCAL_MR=1
+export SHMEM_OFI_STX_MAX=0 SHMEM_OFI_STX_AUTO=0 SHMEM_BOUNCE_SHEAP=1
+export SHMEM_BOUNCE_SIZE=8192 SHMEM_MAX_BOUNCE_BUFFERS=128
+export SHMEM_OFI_CQ_BATCH_SIZE=1 SHMEM_OFI_PUT_BATCH_STATS=1
+export SHMEM_INFO=1 SHMEM_DEBUG=0
+export SHMEM_SYMMETRIC_SIZE=${SHMEM_SYMMETRIC_SIZE:-1G}
+unset SHMEM_OFI_PUT_PIGGYBACK SMA_OFI_PUT_PIGGYBACK
+unset SHMEM_OFI_BOUNCE_ARENA SMA_OFI_BOUNCE_ARENA
+arm_environment control
+
+printf 'scope\tmode\thosts\tpes\tpes_per_node\tbenchmark\trepetition\tarm\texit_status\tseconds\tresult\tretirement_traffic\tbounce_puts\tcounter_puts\tcq_puts\treclaimed\tgroups\tcommit\tlog\tlibrary_dir\tlibrary_sha256\tgit_version\n' \
+    >"$log_dir/summary.tsv"
+printf 'scope\tbenchmark\trepetition\tarm\tnumeric_output_row\n' >"$log_dir/metrics.tsv"
+sha256sum "$sos_lib_dir/libsma.so" >"$log_dir/sos-library.sha256"
+read -r expected_library_hash _ <"$log_dir/sos-library.sha256"
+aggregation_library_hash=$expected_library_hash
+baseline_library_hash=
+if ((baseline_enabled)); then
+    sha256sum "$baseline_lib_dir/libsma.so" >"$log_dir/baseline-library.sha256"
+    read -r baseline_library_hash _ <"$log_dir/baseline-library.sha256"
+fi
+declare -A expected_binary_hash=()
+selected_binaries=()
+for name in "${tests[@]}"; do
+    selected_binaries+=("${available[$name]}")
+    digest=$(sha256sum "${available[$name]}")
+    expected_binary_hash[$name]=${digest%% *}
+done
+sha256sum "$0" >"$log_dir/runner.sha256"
+for name in "${tests[@]}"; do sha256sum "${available[$name]}"; done >"$log_dir/osu-binaries.sha256"
+printf 'benchmark\tmode\tbinary\n' >"$log_dir/benchmarks.tsv"
+for name in "${tests[@]}"; do
+    printf '%s\t%s\t%s\n' "$name" "${test_mode[$name]}" "${available[$name]}"
+done >>"$log_dir/benchmarks.tsv"
+[[ ! -f $build_record ]] || cp -- "$build_record" "$log_dir/sos-build-source.txt"
+{
+    printf 'started_utc=%s\nsource_directory=%s\nbuild_directory=%s\nexpected_commit=%s\n' \
+        "$(timestamp)" "$sos_source_dir" "$sos_build_dir" "$expected_commit"
+    printf 'nodes=%s\npairs=%s\nbenchmarks=%s\nrepeats=%s\nbenchmark_launches=%s\ntimeout=%s\nkill_after=%s\n' \
+        "${#hosts[@]}" "$pair_count" "${#tests[@]}" "$repeats" "$total" "$test_timeout" "$kill_after"
+    printf 'launcher_style=%s\nmpirun=%s\nLD_LIBRARY_PATH=%s\n' "$launcher_style" "$mpirun_command" "$LD_LIBRARY_PATH"
+    printf 'paired_tests=%s\nall_node_tests=%s\ncores_per_node=%s\nI_MPI_PIN=%s\n' \
+        "${#pair_tests[@]}" "${#all_tests[@]}" "${cores_per_node:-unused}" "${I_MPI_PIN:-launcher-default}"
+    printf 'arms=%s\naggregation_library_dir=%s\nbaseline_library_dir=%s\nbaseline_expected_commit=%s\n' \
+        "$arm_count" "$sos_lib_dir" "${baseline_lib_dir:-disabled}" "${baseline_expected_commit:-not required}"
+    printf 'baseline_local_mr=0\nbaseline_counter_retire=0\nbaseline_stats=0\n'
+    env | LC_ALL=C sort | awk '/^(SHMEM_|SMA_|FI_)/'
+} >"$log_dir/run-config.txt"
+printf '%s\n' "${hosts[@]}" >"$log_dir/hosts.txt"
+finished=0
+failed=0
+trap 'exit_code=$?; printf "Finished %d/%d benchmark launches; failures=%d; exit_status=%d; results: %s\n" "$finished" "$total" "$failed" "$exit_code" "$log_dir"' EXIT
+
+# Verify MPI uses the requested hosts and number of PEs per host.
+for ((p=0; p<scope_count; p++)); do
+    pair_id=${scope_ids[p]}
+    IFS=, read -r -a scope_nodes <<< "${scope_hosts[p]}"
+    launch_command "${scope_pes[p]}" "${scope_ppn[p]}" "${scope_hosts[p]}"
+    placement_args=(/bin/hostname)
+    printf '%q ' "${command[@]}" "${placement_args[@]}" >"$log_dir/$pair_id-placement.command"
+    printf '\n' >>"$log_dir/$pair_id-placement.command"
+    if ! timeout --kill-after="$kill_after" "$test_timeout" "${command[@]}" "${placement_args[@]}" \
+        >"$log_dir/$pair_id-placement.log" 2>"$log_dir/$pair_id-placement.stderr"; then
+        die "$pair_id placement probe failed"
+    fi
+    declare -A placement_counts=() expected_nodes=()
+    for host in "${scope_nodes[@]}"; do expected_nodes[$(short_host "$host")]=1; done
+    while IFS=$'\t' read -r host cpu extra; do
+        key=$(short_host "$host")
+        [[ -n ${expected_nodes[$key]+present} && -z $extra ]] ||
+            die "$pair_id ran on different hosts than requested"
+        placement_counts[$key]=$((${placement_counts[$key]:-0} + 1))
+        [[ -z $cpu ]] || die "$pair_id malformed hostname record"
+    done <"$log_dir/$pair_id-placement.log"
+    for host in "${scope_nodes[@]}"; do
+        [[ ${placement_counts[$(short_host "$host")]:-0} == "${scope_ppn[p]}" ]] ||
+            die "$pair_id incorrect PE count on $host (expected ${scope_ppn[p]})"
+    done
+    unset placement_counts expected_nodes
+done
+
+# The version banner identifies PE 0 only. Check every host's selected files
+# and the loader-resolved SOS dependency of every benchmark before measuring.
+# This code is constant; paths arrive as positional arguments, never via eval.
+verify_code=$(cat <<'VERIFY'
+set -euo pipefail
+host=$(/bin/hostname)
+library=$1
+shift
+digest=$(sha256sum "$library")
+printf '%s\tlibrary\tlibsma.so\t%s\n' "$host" "${digest%% *}"
+for binary in "$@"; do
+    name=${binary##*/}
+    digest=$(sha256sum "$binary")
+    printf '%s\tbenchmark\t%s\t%s\n' "$host" "$name" "${digest%% *}"
+    if ! dependencies=$(LC_ALL=C ldd "$binary" 2>&1); then
+        printf 'Cannot inspect %s on %s; use installed, dynamically linked OSU binaries.\n%s\n' "$binary" "$host" "$dependencies" >&2
+        exit 1
+    fi
+    loaded=$(printf '%s\n' "$dependencies" | sed -n '/^[[:space:]]*libsma[.]so/{
+        s/^[^>]*>[[:space:]]*//
+        s/[[:space:]]*(0x.*$//
+        p
+    }')
+    [[ -n $loaded && -f $loaded ]] || {
+        printf 'No resolved SOS libsma.so dependency for %s on %s.\n%s\n' "$binary" "$host" "$dependencies" >&2
+        exit 1
+    }
+    digest=$(sha256sum "$loaded")
+    printf '%s\tloaded\t%s\t%s\n' "$host" "$name" "${digest%% *}"
+done
+VERIFY
+)
+verification_arms=(control)
+((baseline_enabled == 0)) || verification_arms+=(baseline)
+for ((p=0; p<scope_count; p++)); do
+    IFS=, read -r -a scope_nodes <<< "${scope_hosts[p]}"
+    # Hash inspection needs one process per host, not one per benchmark PE.
+    launch_command "${#scope_nodes[@]}" 1 "${scope_hosts[p]}"
+    for verification_arm in "${verification_arms[@]}"; do
+        pair_id=${scope_ids[p]}
+        selected_library=$sos_lib_dir
+        expected_library_hash=$aggregation_library_hash
+        if [[ $verification_arm == baseline ]]; then
+            pair_id+=-baseline
+            selected_library=$baseline_lib_dir
+            expected_library_hash=$baseline_library_hash
+        fi
+        arm_environment "$verification_arm"
+        printf '%q ' "${command[@]}" /bin/bash -c "$verify_code" sos-osu-verify \
+            "$selected_library/libsma.so" "${selected_binaries[@]}" \
+            >"$log_dir/$pair_id-libraries.command"
+        printf '\n' >>"$log_dir/$pair_id-libraries.command"
+        if ! timeout --kill-after="$kill_after" "$test_timeout" "${command[@]}" \
+            /bin/bash -c "$verify_code" sos-osu-verify "$selected_library/libsma.so" \
+            "${selected_binaries[@]}" >"$log_dir/$pair_id-libraries.tsv" \
+            2>"$log_dir/$pair_id-libraries.stderr"; then
+            die "$pair_id remote library verification failed"
+        fi
+        declare -A verified=() expected_nodes=()
+        for host in "${scope_nodes[@]}"; do expected_nodes[$(short_host "$host")]=1; done
+        while IFS=$'\t' read -r host kind name digest extra; do
+            [[ -n $host && -n $kind && -n $name && $digest =~ ^[0-9a-f]{64}$ && -z $extra ]] ||
+                die "$pair_id malformed library verification record"
+            key=$(short_host "$host")
+            [[ -n ${expected_nodes[$key]+present} ]] ||
+                die "$pair_id library probe returned an unexpected host: $host"
+            [[ -z ${verified[$key:$kind:$name]+present} ]] ||
+                die "$pair_id duplicate library record: $host $kind $name"
+            verified[$key:$kind:$name]=1
+            case $kind in
+                library) [[ $name == libsma.so && $digest == "$expected_library_hash" ]] ||
+                             die "$pair_id selected SOS library differs on $host" ;;
+                benchmark) [[ -n ${expected_binary_hash[$name]+present} &&
+                               $digest == "${expected_binary_hash[$name]}" ]] ||
+                               die "$pair_id OSU benchmark differs on $host: $name" ;;
+                loaded) [[ -n ${selected[$name]+present} && $digest == "$expected_library_hash" ]] ||
+                            die "$pair_id benchmark loads a different SOS library on $host: $name" ;;
+                *) die "$pair_id unknown library verification record: $kind" ;;
+            esac
+        done <"$log_dir/$pair_id-libraries.tsv"
+        for host in "${scope_nodes[@]}"; do
+            key=$(short_host "$host")
+            [[ -n ${verified[$key:library:libsma.so]+present} ]] || die "$pair_id missing library evidence for $host"
+            for name in "${tests[@]}"; do
+                [[ -n ${verified[$key:benchmark:$name]+present} &&
+                   -n ${verified[$key:loaded:$name]+present} ]] ||
+                    die "$pair_id missing benchmark/library evidence for $host: $name"
+            done
+        done
+        unset verified expected_nodes
+    done
+done
+
+for ((p=0; p<scope_count; p++)); do
+    launch_command "${scope_pes[p]}" "${scope_ppn[p]}" "${scope_hosts[p]}"
+    pair_id=${scope_ids[p]}
+    scoped_tests=("${pair_tests[@]}")
+    if [[ ${scope_modes[p]} == all ]]; then scoped_tests=("${all_tests[@]}"); fi
+    for name in "${scoped_tests[@]}"; do
+        benchmark_args=()
+        for ((a=0; a<${#argument_names[@]}; a++)); do
+            [[ ${argument_names[a]} != "$name" ]] || benchmark_args+=("${argument_values[a]}")
+        done
+        # OSU 7.5.2 put/get/atomic families require heap|global positionally.
+        # Keep collective arguments unchanged, even if their layout is overridden.
+        case ${name#osu_oshm_} in
+            put|put_*|get|get_*|atomics|add|fadd|inc|finc|cswap|swap|fetch|set|atomic_*)
+                has_memory_selector=0
+                for argument in "${benchmark_args[@]}"; do
+                    if [[ $argument == heap || $argument == global ]]; then
+                        has_memory_selector=1
+                    fi
+                done
+                if ((has_memory_selector == 0)); then
+                    benchmark_args=(heap "${benchmark_args[@]}")
+                fi ;;
+        esac
+        executable=("${available[$name]}")
+        for ((repeat=1; repeat<=repeats; repeat++)); do
+            # Alternate which arm goes first across repetitions.
+            arms=(control experimental)
+            ((repeat % 2)) || arms=(experimental control)
+            if ((baseline_enabled)); then
+                case $(((repeat - 1) % 3)) in
+                    0) arms=(baseline control experimental) ;;
+                    1) arms=(control experimental baseline) ;;
+                    2) arms=(experimental baseline control) ;;
+                esac
+            fi
+            for arm_name in "${arms[@]}"; do
+                arm_environment "$arm_name"
+                arm=0
+                [[ $arm_name != experimental ]] || arm=1
+                arm_library_dir=$sos_lib_dir
+                arm_library_hash=$aggregation_library_hash
+                arm_expected_commit=$expected_commit
+                if [[ $arm_name == baseline ]]; then
+                    arm_library_dir=$baseline_lib_dir
+                    arm_library_hash=$baseline_library_hash
+                    arm_expected_commit=$baseline_expected_commit
+                fi
+                log="$log_dir/$pair_id-$name-r$repeat-$arm_name.log"
+                printf '[%d/%d] %s %s repetition=%d %s PEs=%d PEs/node=%d\n' \
+                    "$((finished+1))" "$total" "$pair_id" "$name" "$repeat" "$arm_name" "${scope_pes[p]}" "${scope_ppn[p]}"
+                printf '%q ' "${command[@]}" "${executable[@]}" "${benchmark_args[@]}" >"${log%.log}.command"
+                printf '\n' >>"${log%.log}.command"
+                {
+                    printf 'library_dir=%s\nlibrary_sha256=%s\nexpected_commit=%s\nLD_LIBRARY_PATH=%s\n' \
+                        "$arm_library_dir" "$arm_library_hash" "${arm_expected_commit:-not required}" "$LD_LIBRARY_PATH"
+                    env | LC_ALL=C sort | awk '/^(SHMEM_|SMA_|FI_)/'
+                } >"${log%.log}.env"
+                start=$SECONDS
+                status=0
+                timeout --kill-after="$kill_after" "$test_timeout" "${command[@]}" "${executable[@]}" \
+                    "${benchmark_args[@]}" >"$log" 2>&1 || status=$?
+                seconds=$((SECONDS-start))
+                result=PASS
+                traffic=UNAVAILABLE
+                [[ $arm_name != baseline ]] || traffic=NOT_APPLICABLE
+                stats=()
+                actual_commit=$(awk '/^[[:space:]]*Git Commit[[:space:]]/ {print $3}' "$log" | LC_ALL=C sort -u)
+                actual_version=$(awk '/^[[:space:]]*Git Version[[:space:]]/ {
+                    sub(/^[[:space:]]*Git Version[[:space:]]+/, ""); print
+                }' "$log" | LC_ALL=C sort -u)
+                if ((status)); then
+                    result=FAIL_EXIT
+                elif [[ -n $arm_expected_commit && ${actual_commit,,} != "$arm_expected_commit" ]]; then
+                    result=FAIL_LIBRARY
+                elif [[ $arm_name == baseline ]]; then
+                    # Original SOS can lack both new ownership diagnostics and a
+                    # full commit banner. Per-host selected/loaded hashes identify it.
+                    traffic=NOT_APPLICABLE
+                else
+                    # Only PE 0/default-context ownership is reported by SOS.
+                    # Gets, atomics and direct/NBI puts may legitimately have no bounce traffic.
+                    if ! stats_line=$(awk -v arm="$arm" '
+                        /OFI immediate bounce:/ {
+                            seen++
+                            for(i=1;i<=NF;i++) {n=split($i,a,"="); if(n==2) v[a[1]]=a[2]}
+                            split("bounce_puts counter_puts cq_puts reclaimed groups",keys," ")
+                            for(k in keys) if(v[keys[k]] !~ /^(0|[1-9][0-9]*)$/) bad=1
+                            if(v["local_mr"]!=1 || v["cq_batch"]!=1 ||
+                               !("stx_max" in v) || v["stx_max"]!=0 || v["stx_idx"]!=-1) bad=1
+                            if(arm==1) {
+                                if(v["retirement"]!="counter" ||
+                                   ("x" v["counter_puts"])!=("x" v["bounce_puts"]) ||
+                                   ("x" v["reclaimed"])!=("x" v["counter_puts"]) || v["cq_puts"]!=0 ||
+                                   (v["counter_puts"]+0>0 && v["groups"]+0<=0)) bad=1
+                            } else if(v["retirement"]!="cq" ||
+                                      v["counter_puts"]!=0 || ("x" v["cq_puts"])!=("x" v["bounce_puts"]) ||
+                                      v["reclaimed"]!=0 || v["groups"]!=0) bad=1
+                        }
+                        END {
+                            if(seen!=1 || bad) exit 1
+                            print v["bounce_puts"],v["counter_puts"],v["cq_puts"],v["reclaimed"],v["groups"]
+                        }' "$log"); then
+                        result=FAIL_STATS
+                    else
+                        read -r -a stats <<< "$stats_line"
+                        traffic=INACTIVE
+                        if [[ ${stats[0]} != 0 ]]; then
+                            traffic=CONTROL
+                            ((arm == 0)) || traffic=ACTIVE
+                        fi
+                    fi
+                fi
+                # Keep the original numeric columns; OSU APIs report different units.
+                # Rows remain per scope/test/repetition/arm, never pooled across layouts.
+                if [[ $result == PASS ]]; then
+                    awk -v pair="$pair_id" -v name="$name" -v rep="$repeat" -v arm="$arm_name" '
+                        $1 ~ /^[-+]?[0-9]*[.]?[0-9]+([eE][-+]?[0-9]+)?$/ &&
+                        (NF==1 || $2 ~ /^[-+]?[0-9]*[.]?[0-9]+([eE][-+]?[0-9]+)?$/) {
+                            row=$0
+                            gsub(/\t/," ",row)
+                            printf "%s\t%s\t%s\t%s\t%s\n",pair,name,rep,arm,row
+                        }' "$log" >>"$log_dir/metrics.tsv"
+                else
+                    failed=$((failed+1))
+                fi
+                # A missing/multiple commit value must not introduce TSV newlines.
+                actual_commit=${actual_commit//$'\n'/,}
+                actual_version=${actual_version//$'\n'/,}
+                actual_version=${actual_version//$'\t'/ }
+                printf '%s\t%s\t%s\t%d\t%d\t%s\t%d\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                    "$pair_id" "${scope_modes[p]}" "${scope_hosts[p]}" "${scope_pes[p]}" "${scope_ppn[p]}" "$name" "$repeat" \
+                    "$arm_name" "$status" "$seconds" "$result" "$traffic" \
+                    "${stats[0]:-NA}" "${stats[1]:-NA}" "${stats[2]:-NA}" \
+                    "${stats[3]:-NA}" "${stats[4]:-NA}" "${actual_commit:-NA}" "$log" \
+                    "$arm_library_dir" "$arm_library_hash" "${actual_version:-NA}" \
+                    >>"$log_dir/summary.tsv"
+                finished=$((finished+1))
+                printf '  %s retirement_traffic=%s exit=%d; %s\n' "$result" "$traffic" "$status" "$log"
+                if [[ $result != PASS ]] && ((stop_on_failure)); then exit 1; fi
+            done
+        done
+    done
+done
+printf 'completed_utc=%s\n' "$(timestamp)" >>"$log_dir/run-config.txt"
+((failed == 0)) || exit 1

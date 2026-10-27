@@ -14,7 +14,8 @@
 ACLOCAL_AMFLAGS = -I config
 
 EXTRA_DIST = sandia-openshmem.spec autogen.sh pmi-simple \
-	scripts/build-ofi-immediate.sh scripts/rebuild-ofi.sh.in
+	scripts/build-ofi-immediate.sh scripts/rebuild-ofi.sh.in \
+	scripts/run-osu-shmem.sh.in
 
 if ENABLE_MANPAGES
 EXTRA_DIST += man
@@ -25,7 +26,7 @@ dist_doc_DATA = README NEWS LICENSE
 SUBDIRS = bindings mpp pmi-simple src modules tests
 
 if USE_OFI
-nodist_noinst_SCRIPTS = scripts/rebuild-ofi.sh
+nodist_noinst_SCRIPTS = scripts/rebuild-ofi.sh scripts/run-osu-shmem.sh
 # Invoke these from the configured build root, including a VPATH build.
 # "all" generates headers and rebuilds libsma before linking the regressions.
 .PHONY: ofi-regressions check-ofi-quiet check-ofi-immediate check-ofi-counter-hardware
