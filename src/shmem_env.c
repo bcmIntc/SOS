@@ -174,6 +174,10 @@ int shmem_internal_parse_env(void) {
     if (ret) return ret;
 #include "shmem_env_defs.h"
 #undef SHMEM_INTERNAL_ENV_DEF
+#ifndef USE_OFI
+    if (shmem_internal_params.OFI_CXI_CRAY_PUTS)
+        RAISE_ERROR_STR("SHMEM_OFI_CXI_CRAY_PUTS requires an OFI build with the CXI provider");
+#endif
     return 0;
 }
 

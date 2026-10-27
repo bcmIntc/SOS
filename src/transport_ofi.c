@@ -115,6 +115,238 @@ pthread_mutex_t                 shmem_transport_ofi_progress_lock = PTHREAD_MUTE
 #endif /* ENABLE_THREADS */
 
 int shmem_transport_ofi_single_ep;
+bool shmem_transport_ofi_cxi_cray_puts;
+
+#pragma push_macro("uthash_fatal")
+#undef uthash_fatal
+#define uthash_fatal(message) RAISE_ERROR_STR(message)
+
+static void shmem_transport_ofi_cxi_cray_validate(const struct fi_info *selected)
+{
+    if (strcmp(selected->fabric_attr->prov_name, "cxi"))
+        RAISE_ERROR_STR("OFI_CXI_CRAY_PUTS requires the CXI provider");
+    if ((selected->mode | selected->tx_attr->mode | selected->rx_attr->mode) &
+        (FI_CONTEXT | FI_CONTEXT2))
+        RAISE_ERROR_STR("OFI_CXI_CRAY_PUTS does not support FI_CONTEXT or FI_CONTEXT2");
+    if (shmem_internal_thread_level == SHMEM_THREAD_MULTIPLE &&
+        selected->domain_attr->threading != FI_THREAD_SAFE)
+        RAISE_ERROR_STR("OFI_CXI_CRAY_PUTS requires FI_THREAD_SAFE for SHMEM_THREAD_MULTIPLE");
+    uint64_t unsupported_mr = FI_MR_LOCAL;
+#ifdef FI_MR_HMEM
+    unsupported_mr |= FI_MR_HMEM;
+#endif
+    if (selected->domain_attr->mr_mode & unsupported_mr)
+        RAISE_ERROR_STR("OFI_CXI_CRAY_PUTS does not support FI_MR_LOCAL or FI_MR_HMEM");
+#ifdef USE_FI_HMEM
+    RAISE_ERROR_STR("OFI_CXI_CRAY_PUTS does not support HMEM builds");
+#endif
+    if (selected->tx_attr->inject_size < 192 || shmem_transport_ofi_max_msg_size < 8192)
+        RAISE_ERROR_STR("OFI_CXI_CRAY_PUTS requires inject_size >= 192 and max_msg_size >= 8192");
+}
+
+enum shmem_transport_ofi_cxi_cray_kind {
+    SHMEM_OFI_CRAY_SINGLE,
+    SHMEM_OFI_CRAY_FRAGMENTED,
+    SHMEM_OFI_CRAY_LARGE
+};
+
+struct shmem_transport_ofi_cxi_cray_peer {
+    int pe;
+    uint64_t address, key, last_put;
+    enum shmem_transport_ofi_cxi_cray_kind kind;
+    bool kicked;
+    struct shmem_transport_ofi_cxi_cray_peer *fragment_next;
+    UT_hash_handle hh;
+};
+
+static void shmem_transport_ofi_cxi_cray_progress_locked(shmem_transport_ctx_t *ctx)
+{
+    if (ctx->bounce_buffers) SHMEM_TRANSPORT_OFI_CTX_BB_LOCK(ctx);
+    shmem_transport_ofi_drain_cq(ctx);
+    if (ctx->bounce_buffers) SHMEM_TRANSPORT_OFI_CTX_BB_UNLOCK(ctx);
+    shmem_transport_probe();
+    if (fi_cntr_readerr(ctx->put_cntr))
+        RAISE_ERROR_STR("Experimental CXI put counter reports an operation error");
+}
+
+static void shmem_transport_ofi_cxi_cray_wait_locked(shmem_transport_ctx_t *ctx)
+{
+    uint64_t pending = SHMEM_TRANSPORT_OFI_CNTR_READ(&ctx->pending_put_cntr);
+    shmem_transport_ofi_cxi_cray_progress_locked(ctx);
+    ssize_t ret = fi_cntr_wait(ctx->put_cntr, pending, -1);
+    OFI_CTX_CHECK_ERROR(ctx, ret);
+    shmem_transport_ofi_cxi_cray_progress_locked(ctx);
+    ctx->cxi_cray_waited_put_cntr = pending;
+}
+
+static void shmem_transport_ofi_cxi_cray_kick_locked(shmem_transport_ctx_t *ctx,
+                                                    struct shmem_transport_ofi_cxi_cray_peer *peer)
+{
+    uint64_t polled = 0;
+    int ret;
+    SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
+    do {
+        ret = fi_inject_write(ctx->ep, shmem_internal_heap_base, 0,
+                              GET_DEST(peer->pe), peer->address, peer->key);
+    } while (try_again(ctx, ret, &polled));
+}
+
+/* A counter wait is context-wide.  Kick every fragmented stream first, not
+ * just the peer being flushed, so FI_MORE cannot strand another stream. */
+static void shmem_transport_ofi_cxi_cray_kick_fragments_locked(shmem_transport_ctx_t *ctx)
+{
+    struct shmem_transport_ofi_cxi_cray_peer *peer;
+    for (peer = ctx->cxi_cray_fragments; peer; peer = peer->fragment_next) {
+        if (!peer->kicked) {
+            shmem_transport_ofi_cxi_cray_kick_locked(ctx, peer);
+            peer->kicked = true;
+        }
+    }
+}
+
+void shmem_transport_ofi_cxi_cray_drain_locked(shmem_transport_ctx_t *ctx)
+{
+    if (!shmem_transport_ofi_cxi_cray_puts)
+        RAISE_ERROR_STR("Experimental CXI drain called while SHMEM_OFI_CXI_CRAY_PUTS is disabled");
+    struct shmem_transport_ofi_cxi_cray_peer *peer, *next;
+    shmem_transport_ofi_cxi_cray_kick_fragments_locked(ctx);
+    HASH_ITER(hh, ctx->cxi_cray_peers, peer, next) {
+        if (peer->kind != SHMEM_OFI_CRAY_LARGE ||
+            peer->last_put > ctx->cxi_cray_waited_put_cntr)
+            shmem_transport_ofi_cxi_cray_wait_locked(ctx);
+
+        const struct iovec local = { .iov_base = shmem_internal_heap_base, .iov_len = 0 };
+        const struct fi_rma_iov remote = { .addr = peer->address, .len = 0, .key = peer->key };
+        const struct fi_msg_rma msg = {
+            .msg_iov = &local, .iov_count = 1, .addr = GET_DEST(peer->pe),
+            .rma_iov = &remote, .rma_iov_count = 1,
+            .context = &ctx->cxi_cray_flush_frag
+        };
+        uint64_t polled = 0;
+        int ret;
+        ctx->cxi_cray_flush_completed = false;
+        SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
+        do {
+            ret = fi_writemsg(ctx->ep, &msg,
+                              FI_DELIVERY_COMPLETE | FI_MORE | FI_COMPLETION);
+        } while (try_again(ctx, ret, &polled));
+        shmem_transport_ofi_cxi_cray_kick_locked(ctx, peer);
+        shmem_transport_ofi_cxi_cray_wait_locked(ctx);
+        while (!ctx->cxi_cray_flush_completed)
+            shmem_transport_ofi_cxi_cray_progress_locked(ctx);
+        HASH_DEL(ctx->cxi_cray_peers, peer);
+        free(peer);
+    }
+    ctx->cxi_cray_fragments = NULL;
+}
+
+void shmem_transport_ofi_cxi_cray_put_locked(shmem_transport_ctx_t *ctx,
+                                            void *target, const void *source,
+                                            size_t len, int pe, bool source_reuse_wait)
+{
+    if (!shmem_transport_ofi_cxi_cray_puts)
+        RAISE_ERROR_STR("Experimental CXI put called while SHMEM_OFI_CXI_CRAY_PUTS is disabled");
+    if (!len) return;
+    if (len >= 8192 && len > shmem_transport_ofi_max_msg_size)
+        RAISE_ERROR_STR("OFI_CXI_CRAY_PUTS full-width put exceeds provider max_msg_size");
+
+    enum shmem_transport_ofi_cxi_cray_kind kind =
+        len <= 192 ? SHMEM_OFI_CRAY_SINGLE :
+        len < 8192 ? SHMEM_OFI_CRAY_FRAGMENTED : SHMEM_OFI_CRAY_LARGE;
+    struct shmem_transport_ofi_cxi_cray_peer *peer;
+    HASH_FIND_INT(ctx->cxi_cray_peers, &pe, peer);
+    /* Do not overwrite an outstanding peer's quiet recipe on a size-class
+     * transition.  Drain the old epoch before starting the new one. */
+    if (peer && peer->kind != kind) {
+        shmem_transport_ofi_cxi_cray_drain_locked(ctx);
+        peer = NULL;
+    }
+    uint8_t *address;
+    uint64_t key;
+    shmem_transport_ofi_get_mr(target, pe, &address, &key);
+    if (!peer) {
+        peer = calloc(1, sizeof(*peer));
+        if (!peer) RAISE_ERROR_STR("Experimental CXI put peer allocation failed");
+        peer->pe = pe;
+        peer->address = (uint64_t) address;
+        peer->key = key;
+        peer->kind = kind;
+        HASH_ADD_INT(ctx->cxi_cray_peers, pe, peer);
+        if (kind == SHMEM_OFI_CRAY_FRAGMENTED) {
+            peer->fragment_next = ctx->cxi_cray_fragments;
+            ctx->cxi_cray_fragments = peer;
+        }
+    }
+    peer->kicked = false;
+    size_t sent = 0;
+    while (sent < len) {
+        size_t chunk = kind == SHMEM_OFI_CRAY_LARGE ? len : MIN((size_t) 192, len - sent);
+        const struct iovec local = {
+            .iov_base = (void *) ((const uint8_t *) source + sent), .iov_len = chunk
+        };
+        const struct fi_rma_iov remote = {
+            .addr = (uint64_t) address + sent, .len = chunk, .key = key
+        };
+        const struct fi_msg_rma msg = {
+            .msg_iov = &local, .iov_count = 1, .addr = GET_DEST(pe),
+            .rma_iov = &remote, .rma_iov_count = 1
+        };
+        uint64_t flags = FI_TRANSMIT_COMPLETE;
+        if (kind != SHMEM_OFI_CRAY_LARGE) flags |= FI_INJECT;
+        if (sent + chunk < len) flags |= FI_MORE;
+        uint64_t polled = 0;
+        int ret;
+        SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
+        do {
+            ret = fi_writemsg(ctx->ep, &msg, flags);
+        } while (try_again(ctx, ret, &polled));
+        sent += chunk;
+    }
+    peer->last_put = SHMEM_TRANSPORT_OFI_CNTR_READ(&ctx->pending_put_cntr);
+    if (kind == SHMEM_OFI_CRAY_LARGE && source_reuse_wait) {
+        shmem_transport_ofi_cxi_cray_kick_fragments_locked(ctx);
+        shmem_transport_ofi_cxi_cray_wait_locked(ctx);
+    }
+}
+
+/* Blocking signal payloads and scalar controls never use the weak bulk route. */
+void shmem_transport_ofi_put_control(shmem_transport_ctx_t *ctx, void *target,
+                                     const void *source, size_t len, int pe)
+{
+    if (!shmem_transport_ofi_cxi_cray_puts)
+        RAISE_ERROR_STR("Experimental CXI control called while SHMEM_OFI_CXI_CRAY_PUTS is disabled");
+    uint8_t *address;
+    uint64_t key;
+    uint64_t polled = 0;
+    int ret;
+    shmem_transport_ofi_get_mr(target, pe, &address, &key);
+    struct iovec local = { .iov_base = (void *) source, .iov_len = len };
+    struct fi_rma_iov remote = { .addr = (uint64_t) address, .len = len, .key = key };
+    const struct fi_msg_rma msg = {
+        .msg_iov = &local, .iov_count = 1, .addr = GET_DEST(pe),
+        .rma_iov = &remote, .rma_iov_count = 1
+    };
+    SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
+    shmem_transport_ofi_cxi_cray_drain_locked(ctx);
+    size_t sent = 0;
+    while (sent < len) {
+        size_t chunk = MIN(shmem_transport_ofi_max_msg_size, len - sent);
+        local.iov_base = (void *) ((const uint8_t *) source + sent);
+        local.iov_len = chunk;
+        remote.addr = (uint64_t) address + sent;
+        remote.len = chunk;
+        polled = 0;
+        SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
+        do {
+            ret = fi_writemsg(ctx->ep, &msg, FI_DELIVERY_COMPLETE);
+        } while (try_again(ctx, ret, &polled));
+        sent += chunk;
+    }
+    shmem_transport_ofi_cxi_cray_wait_locked(ctx);
+    SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
+}
+
+#pragma pop_macro("uthash_fatal")
 
 #ifdef ENABLE_OFI_CXI_PCIE_AMO
 bool shmem_transport_ofi_is_cxi;
@@ -1700,7 +1932,8 @@ static int shmem_transport_ofi_target_ep_init(void)
 #if ENABLE_TARGET_CNTR
     info->p_info->caps |= FI_RMA_EVENT;
 #endif
-    info->p_info->tx_attr->op_flags = 0;
+    info->p_info->tx_attr->op_flags =
+        shmem_transport_ofi_cxi_cray_puts ? FI_DELIVERY_COMPLETE : 0;
     info->p_info->mode = 0;
     info->p_info->tx_attr->mode = 0;
     info->p_info->rx_attr->mode = 0;
@@ -1716,6 +1949,8 @@ static int shmem_transport_ofi_target_ep_init(void)
     OFI_CHECK_RETURN_STR(ret, "fi_ep_bind AV to target endpoint failed");
 
     struct fi_cq_attr cq_attr = {0};
+    if (shmem_transport_ofi_cxi_cray_puts)
+        cq_attr.format = FI_CQ_FORMAT_CONTEXT;
 
     ret = fi_cq_open(shmem_transport_ofi_domainfd, &cq_attr,
                      &shmem_transport_ofi_target_cq, NULL);
@@ -1777,8 +2012,13 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
     info->p_info->rx_attr->caps = FI_RECV; /* to drive progress on the CQ */;
 
     ctx->id = id;
+    if (shmem_transport_ofi_cxi_cray_puts)
+        ctx->cxi_cray_flush_frag.mytype = SHMEM_TRANSPORT_OFI_TYPE_CRAY_FLUSH;
 #ifdef USE_CTX_LOCK
     SHMEM_MUTEX_INIT(ctx->lock);
+#elif defined(ENABLE_THREADS)
+    if (shmem_transport_ofi_cxi_cray_puts)
+        SHMEM_MUTEX_INIT(ctx->cxi_cray_lock);
 #endif
 
     ret = fi_cntr_open(shmem_transport_ofi_domainfd, &cntr_put_attr,
@@ -1890,6 +2130,13 @@ int shmem_transport_init(void)
 
     ret = query_for_fabric(&shmem_transport_ofi_info);
     if (ret != 0) return ret;
+
+    shmem_transport_ofi_cxi_cray_puts = shmem_internal_params.OFI_CXI_CRAY_PUTS;
+    if (shmem_transport_ofi_cxi_cray_puts) {
+        shmem_transport_ofi_cxi_cray_validate(shmem_transport_ofi_info.p_info);
+        if (shmem_internal_my_pe == 0)
+            RAISE_WARN_STR("Experimental CXI local/stack bulk-put mimic enabled; remote visibility is not qualified");
+    }
 
     ret = allocate_fabric_resources(&shmem_transport_ofi_info);
     if (ret != 0) return ret;
@@ -2122,6 +2369,9 @@ void shmem_transport_ctx_destroy(shmem_transport_ctx_t *ctx)
     if (ctx == NULL)
         return;
 
+    if (shmem_transport_ofi_cxi_cray_puts && ctx->cxi_cray_peers)
+        shmem_transport_put_quiet(ctx);
+
     if(shmem_internal_params.DEBUG) {
         SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
         if (ctx->bounce_buffers) SHMEM_TRANSPORT_OFI_CTX_BB_LOCK(ctx);
@@ -2202,6 +2452,9 @@ void shmem_transport_ctx_destroy(shmem_transport_ctx_t *ctx)
 
 #ifdef USE_CTX_LOCK
     SHMEM_MUTEX_DESTROY(ctx->lock);
+#elif defined(ENABLE_THREADS)
+    if (shmem_transport_ofi_cxi_cray_puts)
+        SHMEM_MUTEX_DESTROY(ctx->cxi_cray_lock);
 #endif
 
     if (ctx->id >= 0) {

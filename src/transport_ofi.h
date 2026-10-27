@@ -274,6 +274,7 @@ typedef enum fi_op       shm_internal_op_t;
 
 #define SHMEM_TRANSPORT_OFI_TYPE_BOUNCE 0x01
 #define SHMEM_TRANSPORT_OFI_TYPE_LONG   0x02
+#define SHMEM_TRANSPORT_OFI_TYPE_CRAY_FLUSH 0x03
 
 
 extern fi_addr_t *addr_table;
@@ -348,6 +349,8 @@ struct shmem_transport_ctx_t {
     int                             id;
 #ifdef USE_CTX_LOCK
     shmem_internal_mutex_t          lock;
+#elif defined(ENABLE_THREADS)
+    shmem_internal_mutex_t          cxi_cray_lock;
 #endif
     long                            options;
     struct fid_ep*                  ep;
@@ -369,10 +372,22 @@ struct shmem_transport_ctx_t {
     int                             stx_idx;
     struct shmem_internal_tid       tid;
     struct shmem_internal_team_t   *team;
+    struct shmem_transport_ofi_cxi_cray_peer *cxi_cray_peers;
+    struct shmem_transport_ofi_cxi_cray_peer *cxi_cray_fragments;
+    uint64_t                        cxi_cray_waited_put_cntr;
+    shmem_transport_ofi_frag_t       cxi_cray_flush_frag;
+    bool                            cxi_cray_flush_completed;
 };
 
 typedef struct shmem_transport_ctx_t shmem_transport_ctx_t;
 extern shmem_transport_ctx_t shmem_transport_ctx_default;
+extern bool shmem_transport_ofi_cxi_cray_puts;
+void shmem_transport_ofi_cxi_cray_put_locked(shmem_transport_ctx_t *ctx,
+                                            void *target, const void *source,
+                                            size_t len, int pe, bool source_reuse_wait);
+void shmem_transport_ofi_cxi_cray_drain_locked(shmem_transport_ctx_t *ctx);
+void shmem_transport_ofi_put_control(shmem_transport_ctx_t *ctx, void *target,
+                                     const void *source, size_t len, int pe);
 
 extern struct fid_ep* shmem_transport_ofi_target_ep;
 
@@ -392,6 +407,21 @@ extern struct fid_ep* shmem_transport_ofi_target_ep;
 #define SHMEM_TRANSPORT_OFI_CNTR_READ(cntr) *(cntr)
 #define SHMEM_TRANSPORT_OFI_CNTR_INC(cntr) (*(cntr))++
 
+#elif defined(ENABLE_THREADS)
+#define SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx)                                      \
+    do {                                                                      \
+        if (shmem_transport_ofi_cxi_cray_puts &&                               \
+            !((ctx)->options & (SHMEM_CTX_PRIVATE | SHMEM_CTX_SERIALIZED)))    \
+            SHMEM_MUTEX_LOCK((ctx)->cxi_cray_lock);                            \
+    } while (0)
+#define SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx)                                    \
+    do {                                                                      \
+        if (shmem_transport_ofi_cxi_cray_puts &&                               \
+            !((ctx)->options & (SHMEM_CTX_PRIVATE | SHMEM_CTX_SERIALIZED)))    \
+            SHMEM_MUTEX_UNLOCK((ctx)->cxi_cray_lock);                          \
+    } while (0)
+#define SHMEM_TRANSPORT_OFI_CNTR_READ(cntr) shmem_internal_cntr_read(cntr)
+#define SHMEM_TRANSPORT_OFI_CNTR_INC(cntr) shmem_internal_cntr_inc(cntr)
 #else
 #define SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx)
 #define SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx)
@@ -463,12 +493,17 @@ void shmem_transport_ofi_drain_cq(shmem_transport_ctx_t *ctx)
             shmem_transport_ofi_frag_t *frag =
                 (shmem_transport_ofi_frag_t *) buf.op_context;
 
-            if (SHMEM_TRANSPORT_OFI_TYPE_BOUNCE == frag->mytype) {
+            if (shmem_transport_ofi_cxi_cray_puts &&
+                frag == &ctx->cxi_cray_flush_frag &&
+                frag->mytype == SHMEM_TRANSPORT_OFI_TYPE_CRAY_FLUSH) {
+                ctx->cxi_cray_flush_completed = true;
+            } else if (frag && SHMEM_TRANSPORT_OFI_TYPE_BOUNCE == frag->mytype) {
                 shmem_free_list_free(ctx->bounce_buffers,
                                      (shmem_transport_ofi_bounce_buffer_t *) frag);
                 ctx->completed_bb_cntr++;
             } else {
-                RAISE_ERROR_MSG("[%d] Unrecognized completion object %p %x mtofs %p\n", shmem_internal_my_pe, frag, frag->mytype, &frag->mytype);
+                RAISE_ERROR_MSG("[%d] Unrecognized completion object %p\n",
+                                shmem_internal_my_pe, frag);
             }
         }
 
@@ -520,6 +555,9 @@ static inline
 void shmem_transport_put_quiet(shmem_transport_ctx_t* ctx)
 {
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
+    bool cray_pending = shmem_transport_ofi_cxi_cray_puts && ctx->cxi_cray_peers;
+    if (shmem_transport_ofi_cxi_cray_puts)
+        shmem_transport_ofi_cxi_cray_drain_locked(ctx);
 
     /* Wait for bounce buffered operations to complete */
     if (ctx->bounce_buffers) {
@@ -530,6 +568,11 @@ void shmem_transport_put_quiet(shmem_transport_ctx_t* ctx)
         }
 
         SHMEM_TRANSPORT_OFI_CTX_BB_UNLOCK(ctx);
+    }
+
+    if (cray_pending) {
+        SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
+        return;
     }
 
     /* wait for put counter to meet outstanding count value */
@@ -572,6 +615,9 @@ int shmem_transport_fence(shmem_transport_ctx_t* ctx)
     /* Communication is unordered; must wait for puts and buffered (injected)
      * non-fetching atomics to be completed in order to ensure ordering. */
     shmem_transport_put_quiet(ctx);
+#else
+    if (shmem_transport_ofi_cxi_cray_puts)
+        shmem_transport_put_quiet(ctx);
 #endif
     /* Complete fetching ops; needed to support nonblocking fetch-atomics */
     shmem_transport_get_wait(ctx);
@@ -631,6 +677,11 @@ static inline
 void shmem_transport_put_scalar(shmem_transport_ctx_t* ctx, void *target, const
                                void *source, size_t len, int pe)
 {
+    if (shmem_transport_ofi_cxi_cray_puts) {
+        shmem_transport_ofi_put_control(ctx, target, source, len, pe);
+        return;
+    }
+
     int ret = 0;
     uint64_t dst = (uint64_t) pe;
     uint64_t polled = 0;
@@ -676,6 +727,8 @@ void shmem_transport_ofi_put_large(shmem_transport_ctx_t* ctx, void *target, con
     /* operation generates counting events and must be completed by
      * quiet. */
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
+    if (shmem_transport_ofi_cxi_cray_puts)
+        shmem_transport_ofi_cxi_cray_drain_locked(ctx);
     while (frag_source < ((uint8_t *) source) + len) {
         frag_len = MIN(shmem_transport_ofi_max_msg_size,
                        (size_t) (((uint8_t *) source) + len - frag_source));
@@ -708,6 +761,13 @@ void shmem_transport_put_nb(shmem_transport_ctx_t* ctx, void *target, const void
     uint8_t *addr;
 
     shmem_internal_assert(completion != NULL);
+
+    if (shmem_transport_ofi_cxi_cray_puts) {
+        SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
+        shmem_transport_ofi_cxi_cray_put_locked(ctx, target, source, len, pe, true);
+        SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
+        return;
+    }
 
     if (len <= shmem_transport_ofi_max_buffered_send) {
 
@@ -762,6 +822,8 @@ void shmem_transport_put_signal_nbi(shmem_transport_ctx_t* ctx, void *target, co
         uint8_t *src_buf = (uint8_t *) source;
 
         SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
+        if (shmem_transport_ofi_cxi_cray_puts)
+            shmem_transport_ofi_cxi_cray_drain_locked(ctx);
         SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
 
         const struct iovec msg_iov = {
@@ -815,6 +877,8 @@ void shmem_transport_put_signal_nbi(shmem_transport_ctx_t* ctx, void *target, co
                                 };
 
         SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
+        if (shmem_transport_ofi_cxi_cray_puts)
+            shmem_transport_ofi_cxi_cray_drain_locked(ctx);
         while (frag_source < (((uint8_t *) source) + len)) {
             frag_len = MIN(shmem_transport_ofi_max_msg_size, 
                           (size_t) (((uint8_t *) source) + len - frag_source));
@@ -858,6 +922,8 @@ void shmem_transport_put_signal_nbi(shmem_transport_ctx_t* ctx, void *target, co
     int atomic_op = (sig_op == SHMEM_SIGNAL_ADD) ? FI_SUM : FI_ATOMIC_WRITE;
 
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
+    if (shmem_transport_ofi_cxi_cray_puts)
+        shmem_transport_ofi_cxi_cray_drain_locked(ctx);
     SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
 
     const struct fi_ioc msg_iov_signal = {
@@ -905,6 +971,13 @@ static inline
 void shmem_transport_put_nbi(shmem_transport_ctx_t* ctx, void *target, const void *source, size_t len,
                              int pe)
 {
+    if (shmem_transport_ofi_cxi_cray_puts) {
+        SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
+        shmem_transport_ofi_cxi_cray_put_locked(ctx, target, source, len, pe, false);
+        SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
+        return;
+    }
+
     if (len <= shmem_transport_ofi_max_buffered_send) {
 
         shmem_transport_put_scalar(ctx, target, source, len, pe);
@@ -928,6 +1001,8 @@ void shmem_transport_get(shmem_transport_ctx_t* ctx, void *target, const void *s
     shmem_transport_ofi_get_mr(source, pe, &addr, &key);
 
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
+    if (shmem_transport_ofi_cxi_cray_puts)
+        shmem_transport_ofi_cxi_cray_drain_locked(ctx);
     if (len <= shmem_transport_ofi_max_msg_size) {
 
         SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_get_cntr);
@@ -1031,6 +1106,8 @@ void shmem_transport_cswap_nbi(shmem_transport_ctx_t* ctx, void *target, const
                                };
 
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
+    if (shmem_transport_ofi_cxi_cray_puts)
+        shmem_transport_ofi_cxi_cray_drain_locked(ctx);
     SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_get_cntr);
 
     do {
@@ -1072,6 +1149,8 @@ void shmem_transport_cswap(shmem_transport_ctx_t* ctx, void *target, const void 
     shmem_internal_assert(SHMEM_Dtsize[SHMEM_TRANSPORT_DTYPE(datatype)] == len);
 
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
+    if (shmem_transport_ofi_cxi_cray_puts)
+        shmem_transport_ofi_cxi_cray_drain_locked(ctx);
     SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_get_cntr);
 
     do {
@@ -1111,6 +1190,8 @@ void shmem_transport_mswap(shmem_transport_ctx_t* ctx, void *target, const void 
     shmem_internal_assert(SHMEM_Dtsize[SHMEM_TRANSPORT_DTYPE(datatype)] == len);
 
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
+    if (shmem_transport_ofi_cxi_cray_puts)
+        shmem_transport_ofi_cxi_cray_drain_locked(ctx);
     SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_get_cntr);
 
     do {
@@ -1134,6 +1215,23 @@ void shmem_transport_mswap(shmem_transport_ctx_t* ctx, void *target, const void 
 
 
 static inline
+int shmem_transport_ofi_atomic_control_locked(shmem_transport_ctx_t *ctx,
+                                             const void *source, size_t count,
+                                             int pe, uint64_t address,
+                                             uint64_t key, int datatype,
+                                             int op, uint64_t flags)
+{
+    const struct fi_ioc local = { .addr = (void *) source, .count = count };
+    const struct fi_rma_ioc remote = { .addr = address, .count = count, .key = key };
+    const struct fi_msg_atomic msg = {
+        .msg_iov = &local, .iov_count = 1, .addr = GET_DEST(pe),
+        .rma_iov = &remote, .rma_iov_count = 1,
+        .datatype = datatype, .op = op
+    };
+    return fi_atomicmsg(ctx->ep, &msg, FI_DELIVERY_COMPLETE | flags);
+}
+
+static inline
 void shmem_transport_atomic(shmem_transport_ctx_t* ctx, void *target, const void *source, size_t len,
                             int pe, int op, int datatype)
 {
@@ -1148,10 +1246,18 @@ void shmem_transport_atomic(shmem_transport_ctx_t* ctx, void *target, const void
     shmem_internal_assert(SHMEM_Dtsize[SHMEM_TRANSPORT_DTYPE(datatype)] == len);
 
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
+    if (shmem_transport_ofi_cxi_cray_puts)
+        shmem_transport_ofi_cxi_cray_drain_locked(ctx);
     SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
 
     do {
-        ret = fi_inject_atomic(ctx->ep,
+        if (shmem_transport_ofi_cxi_cray_puts)
+            ret = shmem_transport_ofi_atomic_control_locked(ctx, source, 1, pe,
+                                                            (uint64_t) addr, key,
+                                                            SHMEM_TRANSPORT_DTYPE(datatype),
+                                                            op, FI_INJECT);
+        else
+            ret = fi_inject_atomic(ctx->ep,
                                source,
                                1,
                                GET_DEST(dst),
@@ -1182,6 +1288,8 @@ void shmem_transport_atomicv(shmem_transport_ctx_t* ctx, void *target, const voi
     shmem_internal_assert(SHMEM_Dtsize[dt] * len == full_len);
 
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
+    if (shmem_transport_ofi_cxi_cray_puts)
+        shmem_transport_ofi_cxi_cray_drain_locked(ctx);
     ret = fi_atomicvalid(ctx->ep, dt, op,
                          &max_atomic_size);
     max_atomic_size = max_atomic_size * SHMEM_Dtsize[dt];
@@ -1202,7 +1310,12 @@ void shmem_transport_atomicv(shmem_transport_ctx_t* ctx, void *target, const voi
         SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
 
         do {
-            ret = fi_inject_atomic(ctx->ep,
+            if (shmem_transport_ofi_cxi_cray_puts)
+                ret = shmem_transport_ofi_atomic_control_locked(ctx, source, len, pe,
+                                                                (uint64_t) addr, key,
+                                                                dt, op, FI_INJECT);
+            else
+                ret = fi_inject_atomic(ctx->ep,
                                    source,
                                    len,
                                    GET_DEST(dst),
@@ -1250,7 +1363,13 @@ void shmem_transport_atomicv(shmem_transport_ctx_t* ctx, void *target, const voi
             polled = 0;
             SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
             do {
-                ret = fi_atomic(ctx->ep,
+                if (shmem_transport_ofi_cxi_cray_puts)
+                    ret = shmem_transport_ofi_atomic_control_locked(ctx,
+                              (const uint8_t *) source + sent * SHMEM_Dtsize[dt],
+                              chunksize, pe, (uint64_t) addr + sent * SHMEM_Dtsize[dt],
+                              key, dt, op, 0);
+                else
+                    ret = fi_atomic(ctx->ep,
                                 (void *)((char *)source +
                                          (sent*SHMEM_Dtsize[dt])),
                                 chunksize,
@@ -1308,6 +1427,8 @@ void shmem_transport_fetch_atomic_nbi(shmem_transport_ctx_t* ctx, void *target,
                                };
 
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
+    if (shmem_transport_ofi_cxi_cray_puts)
+        shmem_transport_ofi_cxi_cray_drain_locked(ctx);
     SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_get_cntr);
 
 #ifdef ENABLE_OFI_CXI_PCIE_AMO
@@ -1352,6 +1473,8 @@ void shmem_transport_fetch_atomic(shmem_transport_ctx_t* ctx, void *target,
     shmem_internal_assert(SHMEM_Dtsize[SHMEM_TRANSPORT_DTYPE(datatype)] == len);
 
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
+    if (shmem_transport_ofi_cxi_cray_puts)
+        shmem_transport_ofi_cxi_cray_drain_locked(ctx);
     SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_get_cntr);
 
     do {

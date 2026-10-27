@@ -30,6 +30,29 @@
 #include "transport.h"
 #include "shr_transport.h"
 
+/* The lock spans shared-memory operations that must follow weak OFI writes. */
+static inline void shmem_internal_ofi_control_lock(shmem_ctx_t ctx)
+{
+#ifdef USE_OFI
+    if (shmem_transport_ofi_cxi_cray_puts) {
+        SHMEM_TRANSPORT_OFI_CTX_LOCK((shmem_transport_ctx_t *) ctx);
+        shmem_transport_ofi_cxi_cray_drain_locked((shmem_transport_ctx_t *) ctx);
+    }
+#else
+    (void) ctx;
+#endif
+}
+
+static inline void shmem_internal_ofi_control_unlock(shmem_ctx_t ctx)
+{
+#ifdef USE_OFI
+    if (shmem_transport_ofi_cxi_cray_puts)
+        SHMEM_TRANSPORT_OFI_CTX_UNLOCK((shmem_transport_ctx_t *) ctx);
+#else
+    (void) ctx;
+#endif
+}
+
 static inline
 void
 shmem_internal_put_nb(shmem_ctx_t ctx, void *target, const void *source, size_t len, int pe,
@@ -39,7 +62,9 @@ shmem_internal_put_nb(shmem_ctx_t ctx, void *target, const void *source, size_t 
         return;
 
     if (shmem_shr_transport_use_write(ctx, target, source, len, pe)) {
+        shmem_internal_ofi_control_lock(ctx);
         shmem_shr_transport_put(ctx, target, source, len, pe);
+        shmem_internal_ofi_control_unlock(ctx);
     } else {
         shmem_transport_put_nb((shmem_transport_ctx_t *)ctx, target, source, len, pe, completion);
     }
@@ -62,16 +87,41 @@ shmem_internal_put_scalar(shmem_ctx_t ctx, void *target, const void *source, siz
     shmem_internal_assert(len > 0);
 
     if (shmem_shr_transport_use_write(ctx, target, source, len, pe)) {
+        shmem_internal_ofi_control_lock(ctx);
         shmem_shr_transport_put_scalar(ctx, target, source, len, pe);
+        shmem_internal_ofi_control_unlock(ctx);
     } else {
 #ifndef DISABLE_OFI_INJECT
         shmem_transport_put_scalar((shmem_transport_ctx_t *)ctx, target, source, len, pe);
 #else
+#ifdef USE_OFI
+        if (shmem_transport_ofi_cxi_cray_puts) {
+            shmem_transport_ofi_put_control((shmem_transport_ctx_t *) ctx,
+                                            target, source, len, pe);
+            return;
+        }
+#endif
         long completion = 0;
         shmem_transport_put_nb((shmem_transport_ctx_t *)ctx, target, source, len, pe, &completion);
 	shmem_internal_put_wait(ctx, &completion);
 #endif
     }
+}
+
+static inline
+void shmem_internal_put_signal_payload_nb(shmem_ctx_t ctx, void *target,
+                                          const void *source, size_t len,
+                                          int pe, long *completion)
+{
+#ifdef USE_OFI
+    if (shmem_transport_ofi_cxi_cray_puts && len &&
+        !shmem_shr_transport_use_write(ctx, target, source, len, pe)) {
+        shmem_transport_ofi_put_control((shmem_transport_ctx_t *) ctx,
+                                        target, source, len, pe);
+        return;
+    }
+#endif
+    shmem_internal_put_nb(ctx, target, source, len, pe, completion);
 }
 
 static inline
@@ -87,19 +137,23 @@ shmem_internal_put_signal_nbi(shmem_ctx_t ctx, void *target, const void *source,
          * case it resolves to CPU atomics, consistent with data puts. */
         if (sig_op == SHMEM_SIGNAL_ADD) {
             if (shmem_shr_transport_use_atomic(ctx, sig_addr, sizeof(uint64_t),
-                                               pe, SHM_INTERNAL_UINT64))
+                                               pe, SHM_INTERNAL_UINT64)) {
+                shmem_internal_ofi_control_lock(ctx);
                 shmem_shr_transport_atomic(ctx, sig_addr, &signal, sizeof(uint64_t),
                                            pe, SHM_INTERNAL_SUM, SHM_INTERNAL_UINT64);
-            else
+                shmem_internal_ofi_control_unlock(ctx);
+            } else
                 shmem_transport_atomic((shmem_transport_ctx_t *) ctx, sig_addr, &signal,
                                        sizeof(uint64_t), pe, SHM_INTERNAL_SUM,
                                        SHM_INTERNAL_UINT64);
         } else {
             if (shmem_shr_transport_use_atomic(ctx, sig_addr, sizeof(uint64_t),
-                                               pe, SHM_INTERNAL_UINT64))
+                                               pe, SHM_INTERNAL_UINT64)) {
+                shmem_internal_ofi_control_lock(ctx);
                 shmem_shr_transport_atomic_set(ctx, sig_addr, &signal, sizeof(uint64_t),
                                                pe, SHM_INTERNAL_UINT64);
-            else
+                shmem_internal_ofi_control_unlock(ctx);
+            } else
                 shmem_transport_atomic_set((shmem_transport_ctx_t *) ctx, sig_addr, &signal,
                                            sizeof(uint64_t), pe, SHM_INTERNAL_UINT64);
         }
@@ -107,6 +161,17 @@ shmem_internal_put_signal_nbi(shmem_ctx_t ctx, void *target, const void *source,
     }
 
     if (shmem_shr_transport_use_write(ctx, target, source, len, pe)) {
+#ifdef USE_OFI
+        if (shmem_transport_ofi_cxi_cray_puts) {
+            shmem_internal_ofi_control_lock(ctx);
+            shmem_shr_transport_put(ctx, target, source, len, pe);
+            shmem_internal_membar_acq_rel();
+            shmem_internal_ofi_control_unlock(ctx);
+            shmem_internal_put_signal_nbi(ctx, target, source, 0, sig_addr,
+                                          signal, sig_op, pe);
+            return;
+        }
+#endif
         shmem_shr_transport_put_signal(ctx, target, source, len, sig_addr, signal, sig_op, pe);
     } else {
         shmem_transport_put_signal_nbi((shmem_transport_ctx_t *) ctx, target, source, len, sig_addr, signal, sig_op, pe);
@@ -120,7 +185,9 @@ shmem_internal_put_nbi(shmem_ctx_t ctx, void *target, const void *source, size_t
     if (len == 0) return;
 
     if (shmem_shr_transport_use_write(ctx, target, source, len, pe)) {
+        shmem_internal_ofi_control_lock(ctx);
         shmem_shr_transport_put(ctx, target, source, len, pe);
+        shmem_internal_ofi_control_unlock(ctx);
     } else {
         shmem_transport_put_nbi((shmem_transport_ctx_t *)ctx, target, source, len, pe);
     }
@@ -145,7 +212,9 @@ shmem_internal_get(shmem_ctx_t ctx, void *target, const void *source, size_t len
     if (len == 0) return;
 
     if (shmem_shr_transport_use_read(ctx, target, source, len, pe)) {
+        shmem_internal_ofi_control_lock(ctx);
         shmem_shr_transport_get(ctx, target, source, len, pe);
+        shmem_internal_ofi_control_unlock(ctx);
     } else {
         shmem_transport_get((shmem_transport_ctx_t *)ctx, target, source, len, pe);
     }
@@ -178,7 +247,9 @@ shmem_internal_swap(shmem_ctx_t ctx, void *target, void *source, void *dest, siz
     shmem_internal_assert(len > 0);
 
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
+        shmem_internal_ofi_control_lock(ctx);
         shmem_shr_transport_swap(ctx, target, source, dest, len, pe, datatype);
+        shmem_internal_ofi_control_unlock(ctx);
     } else {
         shmem_transport_swap((shmem_transport_ctx_t *)ctx, target, source, dest, len, pe, datatype);
     }
@@ -194,7 +265,9 @@ shmem_internal_swap_nbi(shmem_ctx_t ctx, void *target, void *source,
     shmem_internal_assert(len > 0);
 
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
+        shmem_internal_ofi_control_lock(ctx);
         shmem_shr_transport_swap(ctx, target, source, dest, len, pe, datatype);
+        shmem_internal_ofi_control_unlock(ctx);
     } else {
         shmem_transport_swap_nbi((shmem_transport_ctx_t *)ctx, target, source,
                                  dest, len, pe, datatype);
@@ -210,7 +283,9 @@ shmem_internal_cswap(shmem_ctx_t ctx, void *target, void *source, void *dest, vo
     shmem_internal_assert(len > 0);
 
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
+        shmem_internal_ofi_control_lock(ctx);
         shmem_shr_transport_cswap(ctx, target, source, dest, operand, len, pe, datatype);
+        shmem_internal_ofi_control_unlock(ctx);
     } else {
         shmem_transport_cswap((shmem_transport_ctx_t *)ctx, target, source,
                               dest, operand, len, pe, datatype);
@@ -227,7 +302,9 @@ shmem_internal_cswap_nbi(shmem_ctx_t ctx, void *target, void *source,
     shmem_internal_assert(len > 0);
 
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
+        shmem_internal_ofi_control_lock(ctx);
         shmem_shr_transport_cswap(ctx, target, source, dest, operand, len, pe, datatype);
+        shmem_internal_ofi_control_unlock(ctx);
     } else {
         shmem_transport_cswap_nbi((shmem_transport_ctx_t *)ctx, target, source,
                                   dest, operand, len, pe, datatype);
@@ -243,7 +320,9 @@ shmem_internal_mswap(shmem_ctx_t ctx, void *target, void *source, void *dest, vo
     shmem_internal_assert(len > 0);
 
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
+        shmem_internal_ofi_control_lock(ctx);
         shmem_shr_transport_mswap(ctx, target, source, dest, mask, len, pe, datatype);
+        shmem_internal_ofi_control_unlock(ctx);
     } else {
         shmem_transport_mswap((shmem_transport_ctx_t *)ctx, target, source,
                               dest, mask, len, pe, datatype);
@@ -259,7 +338,9 @@ shmem_internal_atomic(shmem_ctx_t ctx, void *target, const void *source, size_t 
     shmem_internal_assert(len > 0);
 
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
+        shmem_internal_ofi_control_lock(ctx);
         shmem_shr_transport_atomic(ctx, target, source, len, pe, op, datatype);
+        shmem_internal_ofi_control_unlock(ctx);
     } else {
 #if defined(DISABLE_NONFETCH_AMO) && defined(USE_OFI)
         /* FIXME: This is a temporary workaround to resolve a known issue with non-fetching AMOs when using
@@ -284,7 +365,9 @@ shmem_internal_atomic_fetch(shmem_ctx_t ctx, void *target, const void *source, s
     shmem_internal_assert(len > 0);
 
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
+        shmem_internal_ofi_control_lock(ctx);
         shmem_shr_transport_atomic_fetch(ctx, target, source, len, pe, datatype);
+        shmem_internal_ofi_control_unlock(ctx);
     } else {
         shmem_transport_atomic_fetch((shmem_transport_ctx_t *)ctx, target,
                                      source, len, pe, datatype);
@@ -299,7 +382,9 @@ shmem_internal_atomic_set(shmem_ctx_t ctx, void *target, const void *source, siz
     shmem_internal_assert(len > 0);
 
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
+        shmem_internal_ofi_control_lock(ctx);
         shmem_shr_transport_atomic_set(ctx, target, source, len, pe, datatype);
+        shmem_internal_ofi_control_unlock(ctx);
     } else {
 #if defined(DISABLE_NONFETCH_AMO) && defined(USE_OFI)
         /* FIXME: This is a temporary workaround to resolve a known issue with non-fetching AMOs when using
@@ -325,8 +410,10 @@ shmem_internal_fetch_atomic(shmem_ctx_t ctx, void *target, void *source, void *d
     shmem_internal_assert(len > 0);
 
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
+        shmem_internal_ofi_control_lock(ctx);
         shmem_shr_transport_fetch_atomic(ctx, target, source, dest, len, pe,
                                          op, datatype);
+        shmem_internal_ofi_control_unlock(ctx);
     } else {
         shmem_transport_fetch_atomic((shmem_transport_ctx_t *)ctx, target,
                                      source, dest, len, pe, op, datatype);
@@ -356,11 +443,13 @@ shmem_internal_atomicv(shmem_ctx_t ctx, void *target, const void *source,
     *completion += 1;
 #else
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
+        shmem_internal_ofi_control_lock(ctx);
         for (size_t i = 0; i < count; i++) {
             shmem_shr_transport_atomic(ctx, ((uint8_t *) target) + (i * type_size),
                                        ((uint8_t *) source) + (i * type_size), type_size,
                                        pe, op, datatype);
         }
+        shmem_internal_ofi_control_unlock(ctx);
     } else {
         shmem_transport_atomicv((shmem_transport_ctx_t *)ctx, target, source, count, type_size,
                                 pe, op, datatype, completion);
@@ -378,8 +467,10 @@ shmem_internal_fetch_atomic_nbi(shmem_ctx_t ctx, void *target, void *source,
     shmem_internal_assert(len > 0);
 
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
+        shmem_internal_ofi_control_lock(ctx);
         shmem_shr_transport_fetch_atomic(ctx, target, source, dest, len, pe,
                                          op, datatype);
+        shmem_internal_ofi_control_unlock(ctx);
     } else {
         shmem_transport_fetch_atomic_nbi((shmem_transport_ctx_t *)ctx, target,
                                          source, dest, len, pe, op, datatype);
@@ -394,7 +485,9 @@ shmem_internal_atomic_fetch_nbi(shmem_ctx_t ctx, void *target, const void *sourc
     shmem_internal_assert(len > 0);
 
     if (shmem_shr_transport_use_atomic(ctx, target, len, pe, datatype)) {
+        shmem_internal_ofi_control_lock(ctx);
         shmem_shr_transport_atomic_fetch(ctx, target, source, len, pe, datatype);
+        shmem_internal_ofi_control_unlock(ctx);
     } else {
         shmem_transport_atomic_fetch_nbi((shmem_transport_ctx_t *)ctx, target,
                                          source, len, pe, datatype);
