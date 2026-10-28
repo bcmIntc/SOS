@@ -234,10 +234,15 @@ void shmem_transport_ofi_cxi_cray_drain_locked(shmem_transport_ctx_t *ctx)
         shmem_transport_ofi_cxi_cray_wait_locked(ctx);
         while (!ctx->cxi_cray_flush_completed)
             shmem_transport_ofi_cxi_cray_progress_locked(ctx);
-        HASH_DEL(ctx->cxi_cray_peers, peer);
-        free(peer);
+        if (ctx->cxi_cray_peers_hashed)
+            HASH_DEL(ctx->cxi_cray_peers, peer);
+        else
+            ctx->cxi_cray_peers = NULL;
+        if (peer != ctx->cxi_cray_peer_cache)
+            free(peer);
     }
     ctx->cxi_cray_fragments = NULL;
+    ctx->cxi_cray_peers_hashed = false;
 }
 
 void shmem_transport_ofi_cxi_cray_put_locked(shmem_transport_ctx_t *ctx,
@@ -254,7 +259,13 @@ void shmem_transport_ofi_cxi_cray_put_locked(shmem_transport_ctx_t *ctx,
         len <= 192 ? SHMEM_OFI_CRAY_SINGLE :
         len < 8192 ? SHMEM_OFI_CRAY_FRAGMENTED : SHMEM_OFI_CRAY_LARGE;
     struct shmem_transport_ofi_cxi_cray_peer *peer;
-    HASH_FIND_INT(ctx->cxi_cray_peers, &pe, peer);
+    if (ctx->cxi_cray_peers_hashed) {
+        HASH_FIND_INT(ctx->cxi_cray_peers, &pe, peer);
+    } else {
+        peer = ctx->cxi_cray_peers;
+        if (peer && peer->pe != pe)
+            peer = NULL;
+    }
     /* Do not overwrite an outstanding peer's quiet recipe on a size-class
      * transition.  Drain the old epoch before starting the new one. */
     if (peer && peer->kind != kind) {
@@ -265,13 +276,35 @@ void shmem_transport_ofi_cxi_cray_put_locked(shmem_transport_ctx_t *ctx,
     uint64_t key;
     shmem_transport_ofi_get_mr(target, pe, &address, &key);
     if (!peer) {
-        peer = calloc(1, sizeof(*peer));
-        if (!peer) RAISE_ERROR_STR("Experimental CXI put peer allocation failed");
+        if (!ctx->cxi_cray_peers) {
+            if (!ctx->cxi_cray_peer_cache) {
+                ctx->cxi_cray_peer_cache = calloc(1, sizeof(*peer));
+                if (!ctx->cxi_cray_peer_cache)
+                    RAISE_ERROR_STR("Experimental CXI put peer allocation failed");
+            } else {
+                memset(ctx->cxi_cray_peer_cache, 0, sizeof(*peer));
+            }
+            peer = ctx->cxi_cray_peer_cache;
+        } else {
+            peer = calloc(1, sizeof(*peer));
+            if (!peer) RAISE_ERROR_STR("Experimental CXI put peer allocation failed");
+        }
         peer->pe = pe;
         peer->address = (uint64_t) address;
         peer->key = key;
         peer->kind = kind;
-        HASH_ADD_INT(ctx->cxi_cray_peers, pe, peer);
+        /* Keep a single pending peer unindexed; build the hash only on fanout. */
+        if (!ctx->cxi_cray_peers) {
+            ctx->cxi_cray_peers = peer;
+        } else {
+            if (!ctx->cxi_cray_peers_hashed) {
+                struct shmem_transport_ofi_cxi_cray_peer *first = ctx->cxi_cray_peers;
+                ctx->cxi_cray_peers = NULL;
+                HASH_ADD_INT(ctx->cxi_cray_peers, pe, first);
+                ctx->cxi_cray_peers_hashed = true;
+            }
+            HASH_ADD_INT(ctx->cxi_cray_peers, pe, peer);
+        }
         if (kind == SHMEM_OFI_CRAY_FRAGMENTED) {
             peer->fragment_next = ctx->cxi_cray_fragments;
             ctx->cxi_cray_fragments = peer;
@@ -2456,6 +2489,11 @@ void shmem_transport_ctx_destroy(shmem_transport_ctx_t *ctx)
     if (shmem_transport_ofi_cxi_cray_puts)
         SHMEM_MUTEX_DESTROY(ctx->cxi_cray_lock);
 #endif
+
+    if (shmem_transport_ofi_cxi_cray_puts) {
+        free(ctx->cxi_cray_peer_cache);
+        ctx->cxi_cray_peer_cache = NULL;
+    }
 
     if (ctx->id >= 0) {
         SHMEM_MUTEX_LOCK(shmem_transport_ofi_lock);

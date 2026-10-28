@@ -1,0 +1,108 @@
+Experimental CXI Cray-like put mode
+==================================
+
+Enable with SHMEM_OFI_CXI_CRAY_PUTS=1. The default is off; unset the
+variable or set it to 0 to retain the existing transport path. This is a
+separate experiment, not a revival of SHMEM_OFI_CXI_DEFERRED_PUTS.
+SHMEM_OFI_CXI_CRAY_PUTS=0 takes precedence over SMA_OFI_CXI_CRAY_PUTS=1.
+
+Requested network bulk-put policy:
+
+* 1..192 B: one fi_writemsg with FI_INJECT | FI_TRANSMIT_COMPLETE.
+* 193..8191 B: injected writes of at most 192 B, with FI_MORE on every
+  non-final chunk and no FI_MORE on the final chunk.
+* 8192 B and above: full-width transmit-complete posting, with a completion
+  wait before a blocking put returns so the caller can reuse its source.
+
+The measured homogeneous blocking-put quiet sequences are W F I W,
+I W F I W, and F I W, respectively. W denotes a counter-completion wait,
+F a zero-byte delivery-complete write with FI_MORE, and I a zero-byte
+injected write terminating the batch. These abbreviations omit CQ polling.
+Posting, flush and termination must use the same context endpoint.
+
+SOS integration:
+
+* The zero-byte F additionally requests FI_COMPLETION and uses an identified
+  CQ marker. Both F and I contribute to the context's issued-write count;
+  provider errors remain fatal rather than being treated as completion.
+* One peer record is allocated lazily per context and reused across drains.
+  A single pending peer needs no hash allocation. A second pending peer
+  promotes the active set to a sparse hash; overflow records and hash storage
+  are freed on drain. The cached record is freed on context destruction.
+  Fragmented peers also form a linked list without additional allocations.
+  Retained idle storage is one record per used context, not a global-PE array.
+* Changing the size class for a pending peer drains the whole context.
+  Before any shared-counter wait, pending fragmented peers are kicked.
+  Mixed peers are flushed individually. These are conservative SOS choices,
+  not measured Cray mixed-workload behavior.
+* Large nonblocking puts do not wait during posting. Their quiet uses
+  W F I W unless an earlier context-wide wait already covered the payload,
+  in which case it uses F I W.
+* Scalar, signal and atomic controls retain delivery-complete behavior.
+  Fence, dependent controls, shared-memory transitions and destruction drain
+  pending experimental writes. Blocking put-with-signal payloads remain on
+  the strong path. On-node operations are not converted to NIC writemsg.
+* Context metadata uses the configured context lock or a feature-only
+  supplemental mutex. SHMEM_THREAD_MULTIPLE additionally requires the
+  provider's FI_THREAD_SAFE contract.
+
+Admission and capacity:
+
+* Requires CXI with inject capacity at least 192 B and maximum message size
+  at least 8192 B. FI_CONTEXT/FI_CONTEXT2, FI_MR_LOCAL and HMEM configurations
+  are rejected. There is no fallback to weaker validation.
+* Enabling this variable on a non-OFI build fails explicitly. Unset or 0
+  remains inactive on every build, with normal SHMEM/SMA alias precedence.
+* A full-width experimental put exceeding the provider maximum message size
+  fails explicitly rather than silently switching to another fragment policy.
+* Mode-enabled shared target CQ configuration and endpoint default flags are
+  adjusted for identified completions and strong control operations. These
+  changes are gated along with payload posting; disabled startup retains the
+  existing setup.
+* Disabled mode does not initialize or inspect experimental flush markers,
+  initialize the supplemental mutex, allocate peer state, issue flush/kick
+  writes, or add control-path drains. Experimental hash-allocation error
+  handling is scoped to the new helpers, not the existing STX allocator.
+  Direct calls to experimental helpers also fail before posting when the
+  runtime switch is off, protecting against future accidental dispatch.
+
+Evidence and limits:
+
+* This policy follows the ordinary local/stack-source ctxmem traces from
+  Borealis CraySHMEM 11.5.6 with libfabric 1.22.0. It is not a universal
+  Cray algorithm: measured symmetric sources used full-width writes by
+  512 B instead. The requested mode deliberately uses the fixed 8192 B
+  boundary regardless of source category.
+* Completed job 971989 measured adjacent 191/192/193 B and 8191/8192 B
+  cells. Its records are under data/cray_put_quiet_sweep/results/;
+  source-controlled-summary.json and results/completed-probe-audit.json
+  retain the API/source distinctions and completion verdicts.
+* The observed Cray F flags were FI_DELIVERY_COMPLETE | FI_MORE, without
+  FI_COMPLETION or FI_FENCE. Any extra identified CQ completion used by SOS
+  is an accounting adaptation, not a measured Cray flag.
+* Mixed sizes, multiple destinations and nonblocking large puts were not
+  qualified by those traces. Their handling must preserve source lifetime,
+  per-context accounting and delivery before dependent controls.
+* Passing callback mocks does not qualify OpenSHMEM quiet visibility.
+  The probe verified after a barrier and records quiet_visibility_proof=0.
+  This mode remains experimental; no default rollout or performance claim
+  follows from reproducing the posting and quiet sequences.
+
+Local regression checks:
+
+* python3.10 -m unittest scripts/test_ofi_cray_transport.py
+* The fixture uses actual OFI transport functions with mocked provider
+  callbacks. It does not run SOS or NAIL on compute nodes.
+* Disabled startup and provider-call traces are compared against the pinned
+  pre-investigation source in both configured and context-lock/no-inject
+  configurations. They cover posting, bounce completion, quiet, fence,
+  scalar/get/atomic/signal controls, shared-memory dispatch and destruction.
+  This establishes local behavioral regression coverage, not a compute-node
+  timeout diagnosis or identical generated machine code.
+* SOS_TEST_M4_SYNTAX=1 python3.10 -m unittest scripts/test_ofi_cray_transport.py
+  also checks fresh generated bindings. That syntax check passed on 23 October;
+  no production library or workload was rebuilt by these checks.
+* SOS configure/build/install remains user-owned. A future compute test
+  requires separate authorization, a newly sealed package, the appropriate
+  recipe, exact loaded-library identity and the usual health, placement,
+  completion and original-governor restoration gates.

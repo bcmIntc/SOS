@@ -374,6 +374,8 @@ struct shmem_transport_ctx_t {
     struct shmem_internal_team_t   *team;
     struct shmem_transport_ofi_cxi_cray_peer *cxi_cray_peers;
     struct shmem_transport_ofi_cxi_cray_peer *cxi_cray_fragments;
+    struct shmem_transport_ofi_cxi_cray_peer *cxi_cray_peer_cache;
+    bool                            cxi_cray_peers_hashed;
     uint64_t                        cxi_cray_waited_put_cntr;
     shmem_transport_ofi_frag_t       cxi_cray_flush_frag;
     bool                            cxi_cray_flush_completed;
