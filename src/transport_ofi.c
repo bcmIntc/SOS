@@ -608,6 +608,14 @@ void init_bounce_buffer(shmem_free_list_item_t *item)
 static void
 enable_bounce_local_mr(struct fabric_info *info)
 {
+    if (shmem_internal_params.OFI_PUT_MORE_BATCH) {
+        if (shmem_internal_params.OFI_PUT_MORE_BATCH > 16)
+            RAISE_ERROR_STR("OFI_PUT_MORE_BATCH must be between 0 and 16");
+        if (!shmem_internal_params.OFI_BOUNCE_LOCAL_MR ||
+            shmem_internal_thread_level != SHMEM_THREAD_SINGLE ||
+            shmem_internal_params.OFI_BOUNCE_COUNTER_RETIRE)
+            RAISE_ERROR_STR("OFI_PUT_MORE_BATCH requires local MRs, SHMEM_THREAD_SINGLE and CQ retirement (counter retirement off)");
+    }
     if (shmem_internal_params.OFI_BOUNCE_COUNTER_RETIRE) {
         if (!shmem_internal_params.OFI_BOUNCE_LOCAL_MR)
             RAISE_ERROR_STR("OFI_BOUNCE_COUNTER_RETIRE requires OFI_BOUNCE_LOCAL_MR=1");
@@ -1913,6 +1921,9 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
     ctx->bounce_counter_retire = false;
     ctx->bounce_puts = ctx->bounce_counter_puts = 0;
     ctx->bounce_counter_reclaimed = ctx->bounce_counter_groups = 0;
+    memset(&ctx->put_more, 0, sizeof(ctx->put_more));
+    ctx->put_more.stats = id == SHMEM_TRANSPORT_CTX_DEFAULT_ID &&
+                         shmem_internal_params.OFI_PUT_BATCH_STATS;
 
     /* Allow provider to choose CQ size, since we are using FI_RM_ENABLED.
      * Context format is used to return bounce buffer pointers in the event
@@ -1993,6 +2004,19 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
         ctx->bounce_buffers = NULL;
     }
     init_bounce_local_mrs(ctx);
+    if (id == SHMEM_TRANSPORT_CTX_DEFAULT_ID &&
+        shmem_internal_params.OFI_PUT_MORE_BATCH) {
+        if (ctx->stx_idx >= 0 || !ctx->bounce_buffers || !ctx->bounce_local_mrs)
+            RAISE_ERROR_STR("OFI_PUT_MORE_BATCH requires registered bounce buffers and an exclusive default TX queue (OFI_STX_MAX=0)");
+        ctx->put_more.limit = shmem_internal_params.OFI_PUT_MORE_BATCH;
+        /* Account every accepted TX operation. Reserve substantial command
+         * and event headroom; this policy cannot guarantee provider admission. */
+        ctx->put_more.budget = MIN(info->p_info->tx_attr->size / 8,
+                                  (size_t)shmem_transport_ofi_max_bounce_buffers);
+        if (ctx->put_more.budget < ctx->put_more.limit + 2 ||
+            shmem_transport_ofi_max_bounce_buffers < ctx->put_more.limit + 1)
+            RAISE_ERROR_STR("OFI_PUT_MORE_BATCH exceeds negotiated TX/pool headroom; increase TX size/pool or reduce the batch");
+    }
     if (id == SHMEM_TRANSPORT_CTX_DEFAULT_ID &&
         shmem_internal_params.OFI_BOUNCE_COUNTER_RETIRE) {
         if (ctx->stx_idx >= 0 || !ctx->bounce_buffers || !ctx->bounce_local_mrs)
@@ -2289,6 +2313,7 @@ void shmem_transport_ctx_destroy(shmem_transport_ctx_t *ctx)
 
     if (ctx == NULL)
         return;
+    shmem_internal_assert(ctx->put_more.count == 0);
     shmem_internal_assert(ctx->bounce_counter_head == NULL);
     if (ctx->id == SHMEM_TRANSPORT_CTX_DEFAULT_ID &&
         shmem_internal_my_pe == 0 && shmem_internal_params.OFI_PUT_BATCH_STATS) {
@@ -2300,6 +2325,25 @@ void shmem_transport_ctx_destroy(shmem_transport_ctx_t *ctx)
                 ctx->bounce_counter_puts, ctx->bounce_puts - ctx->bounce_counter_puts,
                 ctx->bounce_counter_reclaimed, ctx->bounce_counter_groups,
                 shmem_transport_ofi_stx_max, ctx->stx_idx);
+        fprintf(stderr, "[0000] OFI submission: batch_limit=%zu pending=%zu"
+                " puts=%"PRIu64" more=%"PRIu64" batches=%"PRIu64
+                " batched_puts=%"PRIu64" full=%"PRIu64" other=%"PRIu64
+                " flushes=%"PRIu64" quiet=%"PRIu64" fence=%"PRIu64
+                " pool=%"PRIu64" credit=%"PRIu64" retry=%"PRIu64
+                " rebase=%"PRIu64" get_wait=%"PRIu64" probe=%"PRIu64
+                " eagain=%"PRIu64" admission_waits=%"PRIu64
+                " dest_changes=%"PRIu64" avg_batch=%.2f\n",
+                ctx->put_more.limit, ctx->put_more.count,
+                ctx->put_more.puts, ctx->put_more.more, ctx->put_more.batches,
+                ctx->put_more.batched_puts, ctx->put_more.full, ctx->put_more.other,
+                ctx->put_more.flushes, ctx->put_more.ends[OFI_MORE_QUIET],
+                ctx->put_more.ends[OFI_MORE_FENCE], ctx->put_more.ends[OFI_MORE_POOL],
+                ctx->put_more.ends[OFI_MORE_CREDIT], ctx->put_more.ends[OFI_MORE_RETRY],
+                ctx->put_more.ends[OFI_MORE_REBASE], ctx->put_more.ends[OFI_MORE_GET_WAIT],
+                ctx->put_more.ends[OFI_MORE_PROBE], ctx->put_more.retries,
+                ctx->put_more.admission_waits, ctx->put_more.dest_changes,
+                ctx->put_more.batches ?
+                    (double)ctx->put_more.batched_puts / ctx->put_more.batches : 0.0);
     }
 
     if(shmem_internal_params.DEBUG) {

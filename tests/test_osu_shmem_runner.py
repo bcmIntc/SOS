@@ -29,7 +29,7 @@ kind = "placement" if args[-1] == "/bin/hostname" else "verify" if "/bin/bash" i
 if "sos-osu-core" in args:
     sys.exit(97)  # Explicit sizing must not invoke a topology/taskset wrapper.
 with open(os.environ["OSU_TEST_TRACE"], "a") as trace:
-    trace.write(json.dumps({"args": args, "kind": kind, "arm": os.environ.get("SHMEM_OFI_BOUNCE_COUNTER_RETIRE"), "pin": os.environ.get("I_MPI_PIN"), "library_path": os.environ.get("LD_LIBRARY_PATH"), "local_mr": os.environ.get("SHMEM_OFI_BOUNCE_LOCAL_MR")}) + "\n")
+    trace.write(json.dumps({"args": args, "kind": kind, "arm": os.environ.get("SHMEM_OFI_BOUNCE_COUNTER_RETIRE"), "more_batch": os.environ.get("SHMEM_OFI_PUT_MORE_BATCH"), "pin": os.environ.get("I_MPI_PIN"), "library_path": os.environ.get("LD_LIBRARY_PATH"), "local_mr": os.environ.get("SHMEM_OFI_BOUNCE_LOCAL_MR")}) + "\n")
 if kind == "placement":
     if os.environ.get("OSU_TEST_FAULT") == "placement":
         hosts[1] = hosts[0]
@@ -84,6 +84,21 @@ if fault != "missing-stats" and not baseline:
         for field in ["bounce_puts", "counter_puts", "reclaimed"]:
             stats_line = stats_line.replace(field + "=8", field + "=garbage")
     print(stats_line)
+if not baseline and fault != "missing-submission":
+    limit = int(os.environ.get("SHMEM_OFI_PUT_MORE_BATCH", "0"))
+    batching = limit > 1 and fault != "no-deferred"
+    full = bounce // limit if batching else 0
+    partial = bounce % limit if batching else 0
+    deferred = bounce - full if batching else 0
+    groups = full + (1 if partial else 0) if batching else bounce
+    flushes = 1 if partial else 0
+    if fault == "inconsistent-more":
+        deferred, groups, full, flushes = bounce, bounce, 0, 0
+    print("[0000] OFI submission: batch_limit={} pending={} puts={} more={} batches={} batched_puts={} full={} other=0 flushes={} quiet={} fence=0 pool=0 credit=0 retry=0 rebase=0 get_wait=0 probe=0 eagain=0 admission_waits=0 dest_changes=0 avg_batch={:.2f}".format(
+        limit, 1 if fault == "submission-pending" else 0, bounce, deferred,
+        groups, bounce + (1 if fault == "bad-submission" else 0), full,
+        flushes, flushes,
+        bounce / groups if groups else 0))
 print("# OSU OpenSHMEM benchmark")
 if name == "osu_oshm_barrier":
     print("# Average latency (us)")
@@ -178,6 +193,57 @@ class OsuShmemRunnerTests(unittest.TestCase):
         self.assertIn("36 benchmark launches", result.stdout)
         self.assertFalse(self.trace.exists())
         self.assertFalse(self.logs.exists())
+
+    def test_more_experiment_keeps_both_arms_in_cq_retirement(self):
+        result = self.run_runner(["--experiment", "fi-more", "--more-batch", "8",
+                                  "--tests", "osu_oshm_put", "--nodes", "2"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [c for c in self.calls() if c["kind"] == "benchmark"]
+        self.assertEqual([c["arm"] for c in calls], ["0", "0"])
+        self.assertEqual([c["more_batch"] for c in calls], ["0", "8"])
+        self.assertEqual([c["local_mr"] for c in calls], ["1", "1"])
+        self.assertIn("ACTIVE", (self.logs / "submission.tsv").read_text())
+
+    def test_more_experiment_requires_submission_evidence(self):
+        for fault in ["missing-submission", "bad-submission", "submission-pending",
+                      "inconsistent-more"]:
+            with self.subTest(fault=fault):
+                result = self.run_runner(["--experiment", "fi-more",
+                    "--tests", "osu_oshm_put"], fault=fault)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("FAIL_SUBMISSION", (self.logs / "summary.tsv").read_text())
+                self.logs.rename(self.root / ("failed-" + fault))
+
+    def test_more_without_eligible_traffic_is_reported_inactive(self):
+        result = self.run_runner(["--experiment", "fi-more",
+                                  "--tests", "osu_oshm_get"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("INACTIVE", (self.logs / "submission.tsv").read_text())
+
+    def test_more_batch_limits_are_rejected_before_launch(self):
+        for limit in ["0", "1", "17", "garbage"]:
+            result = self.run_runner(["--experiment", "fi-more", "--more-batch", limit])
+            self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.trace.exists())
+
+    def test_more_batch_option_requires_more_experiment(self):
+        result = self.run_runner(["--more-batch", "8"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.trace.exists())
+
+    def test_default_experiment_disables_inherited_more_setting(self):
+        previous = os.environ.get("SHMEM_OFI_PUT_MORE_BATCH")
+        os.environ["SHMEM_OFI_PUT_MORE_BATCH"] = "16"
+        try:
+            result = self.run_runner(["--tests", "osu_oshm_put"])
+        finally:
+            if previous is None:
+                os.environ.pop("SHMEM_OFI_PUT_MORE_BATCH", None)
+            else:
+                os.environ["SHMEM_OFI_PUT_MORE_BATCH"] = previous
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(all(c["more_batch"] == "0" for c in self.calls()
+                            if c["kind"] == "benchmark"))
 
     def test_per_test_arguments_preserve_boundaries(self):
         result = self.run_runner([

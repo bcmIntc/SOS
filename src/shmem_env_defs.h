@@ -107,6 +107,8 @@ SHMEM_INTERNAL_ENV_DEF(OFI_BOUNCE_LOCAL_MR, bool, false, SHMEM_INTERNAL_ENV_CAT_
                        "Preregister default-context host bounce sources using CXI hybrid descriptors")
 SHMEM_INTERNAL_ENV_DEF(OFI_BOUNCE_COUNTER_RETIRE, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Retire default bounce puts at a full delivery-counter snapshot; requires local MRs, SHMEM_THREAD_SINGLE and OFI_STX_MAX=0")
+SHMEM_INTERNAL_ENV_DEF(OFI_PUT_MORE_BATCH, size, 0, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Experiment: FI_MORE for up to 16 registered bounce puts; 0 disables, 1 posts immediately; requires exclusive single-threaded CXI CQ retirement")
 SHMEM_INTERNAL_ENV_DEF(OFI_PUT_BATCH_STATS, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Print PE 0 default-context immediate bounce source-ownership statistics at shutdown")
 SHMEM_INTERNAL_ENV_DEF(OFI_STX_MAX, long, 1, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,

@@ -33,6 +33,9 @@ uint64_t shmem_transport_ofi_read_put_counter(shmem_transport_ctx_t *ctx)
 static inline
 void shmem_transport_ofi_wait_put_counter(shmem_transport_ctx_t *ctx)
 {
+#ifdef SHMEM_TRANSPORT_OFI_COUNTER_FLUSH
+    SHMEM_TRANSPORT_OFI_COUNTER_FLUSH(ctx);
+#endif
     /* Do not use an infinite fi_cntr_wait: some providers only detect errors
      * whose counter value changes after that wait starts. Check all errors on
      * every progress pass, including before accepting a reached threshold. */

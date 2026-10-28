@@ -1,0 +1,68 @@
+#!/bin/sh
+# Three bounded payload/source-lifetime cases. One PE per distinct host, >=3 PEs.
+# Example: bash build/tests/run-ofi-more.sh mpirun -n 3 -ppn 1 -hosts A,B,C
+set -eu
+binary="@abs_top_builddir@/tests/ofi_more"
+if [ "$#" -lt 1 ]; then
+    echo "usage: $0 launcher arguments... (>=3 PEs, one per host)" >&2
+    exit 2
+fi
+log_dir=${SOS_OFI_LOG_DIR:-@abs_top_builddir@/logs/more-smoke-$(date +%Y%m%d-%H%M%S)}
+mkdir -p "$log_dir"
+if [ -e "$log_dir/summary.tsv" ]; then
+    echo "use a fresh log directory" >&2
+    exit 2
+fi
+printf 'batch\tpool\tbytes\texit_status\tlog\n' >"$log_dir/summary.tsv"
+export SHMEM_INFO=1 SHMEM_DEBUG=0 SHMEM_SYMMETRIC_SIZE=${SHMEM_SYMMETRIC_SIZE:-1G}
+export SHMEM_OFI_PROVIDER=cxi SHMEM_OFI_BOUNCE_LOCAL_MR=1
+export SHMEM_OFI_BOUNCE_COUNTER_RETIRE=0 SHMEM_OFI_PUT_BATCH_STATS=1
+export SHMEM_OFI_STX_MAX=0 SHMEM_OFI_STX_AUTO=0 SHMEM_BOUNCE_SHEAP=1
+export SHMEM_BOUNCE_SIZE=8192 SHMEM_OFI_CQ_BATCH_SIZE=1
+export FI_CXI_DEFAULT_TX_SIZE=${FI_CXI_DEFAULT_TX_SIZE:-1024}
+unset SHMEM_OFI_PUT_PIGGYBACK SMA_OFI_PUT_PIGGYBACK
+unset SHMEM_OFI_BOUNCE_ARENA SMA_OFI_BOUNCE_ARENA
+for settings in '16 128 1024' '4 8 1024' '16 128 8192'; do
+    # Split only our fixed numeric configuration, never caller launch arguments.
+    batch=${settings%% *}
+    rest=${settings#* }
+    pool=${rest%% *}
+    bytes=${rest#* }
+    export SHMEM_OFI_PUT_MORE_BATCH=$batch SHMEM_MAX_BOUNCE_BUFFERS=$pool
+    log="$log_dir/batch-$batch-pool-$pool-bytes-$bytes.log"
+    status=0
+    timeout --kill-after=10s "${SOS_OFI_TEST_TIMEOUT:-120s}" \
+        "$@" "$binary" "$bytes" >"$log" 2>&1 || status=$?
+    printf '%s\t%s\t%s\t%s\t%s\n' "$batch" "$pool" "$bytes" "$status" "$log" \
+        >>"$log_dir/summary.tsv"
+    if [ "$status" != 0 ]; then
+        echo "FAIL: $log (exit $status)" >&2
+        exit 1
+    fi
+    if ! grep -Fq "OFI MORE payload check passed: bytes=$bytes phases=4" "$log"; then
+        echo "FAIL: $log lacks the payload/source-reuse result" >&2
+        exit 1
+    fi
+    if ! awk -v batch="$batch" '
+        /OFI immediate bounce:/ {
+            owners++
+            for(i=1;i<=NF;i++) {n=split($i,a,"="); if(n==2) o[a[1]]=a[2]}
+            if(o["local_mr"]!=1 || o["retirement"]!="cq" ||
+               o["cq_batch"]!=1 || o["counter_puts"]!=0 ||
+               o["cq_puts"]!=o["bounce_puts"] || o["stx_idx"]!=-1) bad=1
+        }
+        /OFI submission:/ {
+            submissions++
+            for(i=1;i<=NF;i++) {n=split($i,a,"="); if(n==2) v[a[1]]=a[2]}
+            if(v["batch_limit"]!=batch || v["pending"]!=0 ||
+               v["more"]+0<=0 || v["full"]+0<=0 || v["quiet"]+0<=0 ||
+               v["dest_changes"]+0<=0 || v["admission_waits"]+0<=0 ||
+               v["puts"]!=v["batched_puts"]) bad=1
+        }
+        END { exit !(owners==1 && submissions==1 && !bad) }
+        ' "$log"; then
+        echo "FAIL: $log did not exercise the required CQ/FI_MORE scenarios" >&2
+        exit 1
+    fi
+    echo "PASS: payload and FI_MORE evidence checked: $log"
+done
