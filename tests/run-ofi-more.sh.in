@@ -22,6 +22,8 @@ export SHMEM_BOUNCE_SIZE=8192 SHMEM_OFI_CQ_BATCH_SIZE=1
 export FI_CXI_DEFAULT_TX_SIZE=${FI_CXI_DEFAULT_TX_SIZE:-1024}
 unset SHMEM_OFI_PUT_PIGGYBACK SMA_OFI_PUT_PIGGYBACK
 unset SHMEM_OFI_BOUNCE_ARENA SMA_OFI_BOUNCE_ARENA
+unset SHMEM_OFI_PUT_MORE_MIN SMA_OFI_PUT_MORE_MIN
+unset SHMEM_OFI_PUT_MORE_MAX SMA_OFI_PUT_MORE_MAX
 for settings in '16 128 1024' '4 8 1024' '16 128 8192'; do
     # Split only our fixed numeric configuration, never caller launch arguments.
     batch=${settings%% *}
@@ -56,7 +58,8 @@ for settings in '16 128 1024' '4 8 1024' '16 128 8192'; do
             for(i=1;i<=NF;i++) {n=split($i,a,"="); if(n==2) v[a[1]]=a[2]}
             if(v["batch_limit"]!=batch || v["pending"]!=0 ||
                v["more"]+0<=0 || v["full"]+0<=0 || v["quiet"]+0<=0 ||
-               v["dest_changes"]+0<=0 || v["admission_waits"]+0<=0 ||
+               v["dest_changes"]+0<=0 || v["admission_polls"]+0<=0 ||
+               v["min_bytes"]!=0 || v["max_bytes"]!=0 ||
                v["puts"]!=v["batched_puts"]) bad=1
         }
         END { exit !(owners==1 && submissions==1 && !bad) }

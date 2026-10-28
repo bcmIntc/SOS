@@ -29,7 +29,7 @@ kind = "placement" if args[-1] == "/bin/hostname" else "verify" if "/bin/bash" i
 if "sos-osu-core" in args:
     sys.exit(97)  # Explicit sizing must not invoke a topology/taskset wrapper.
 with open(os.environ["OSU_TEST_TRACE"], "a") as trace:
-    trace.write(json.dumps({"args": args, "kind": kind, "arm": os.environ.get("SHMEM_OFI_BOUNCE_COUNTER_RETIRE"), "more_batch": os.environ.get("SHMEM_OFI_PUT_MORE_BATCH"), "pin": os.environ.get("I_MPI_PIN"), "library_path": os.environ.get("LD_LIBRARY_PATH"), "local_mr": os.environ.get("SHMEM_OFI_BOUNCE_LOCAL_MR")}) + "\n")
+    trace.write(json.dumps({"args": args, "kind": kind, "arm": os.environ.get("SHMEM_OFI_BOUNCE_COUNTER_RETIRE"), "more_batch": os.environ.get("SHMEM_OFI_PUT_MORE_BATCH"), "more_min": os.environ.get("SHMEM_OFI_PUT_MORE_MIN"), "more_max": os.environ.get("SHMEM_OFI_PUT_MORE_MAX"), "pin": os.environ.get("I_MPI_PIN"), "library_path": os.environ.get("LD_LIBRARY_PATH"), "local_mr": os.environ.get("SHMEM_OFI_BOUNCE_LOCAL_MR")}) + "\n")
 if kind == "placement":
     if os.environ.get("OSU_TEST_FAULT") == "placement":
         hosts[1] = hosts[0]
@@ -94,11 +94,13 @@ if not baseline and fault != "missing-submission":
     flushes = 1 if partial else 0
     if fault == "inconsistent-more":
         deferred, groups, full, flushes = bounce, bounce, 0, 0
-    print("[0000] OFI submission: batch_limit={} pending={} puts={} more={} batches={} batched_puts={} full={} other=0 flushes={} quiet={} fence=0 pool=0 credit=0 retry=0 rebase=0 get_wait=0 probe=0 eagain=0 admission_waits=0 dest_changes=0 avg_batch={:.2f}".format(
+    print("[0000] OFI submission: batch_limit={} pending={} puts={} more={} batches={} batched_puts={} full={} other=0 flushes={} quiet={} fence=0 pool=0 credit=0 retry=0 rebase=0 get_wait=0 probe=0 eagain=0 admission_waits=0 dest_changes=0 avg_batch={:.2f} admission_polls=0 min_bytes={} max_bytes={}".format(
         limit, 1 if fault == "submission-pending" else 0, bounce, deferred,
         groups, bounce + (1 if fault == "bad-submission" else 0), full,
         flushes, flushes,
-        bounce / groups if groups else 0))
+        bounce / groups if groups else 0,
+        "garbage" if fault == "bad-size-policy" else os.environ.get("SHMEM_OFI_PUT_MORE_MIN", "0"),
+        "1" if fault == "wrong-size-policy" else os.environ.get("SHMEM_OFI_PUT_MORE_MAX", "0")))
 print("# OSU OpenSHMEM benchmark")
 if name == "osu_oshm_barrier":
     print("# Average latency (us)")
@@ -206,13 +208,35 @@ class OsuShmemRunnerTests(unittest.TestCase):
 
     def test_more_experiment_requires_submission_evidence(self):
         for fault in ["missing-submission", "bad-submission", "submission-pending",
-                      "inconsistent-more"]:
+                      "inconsistent-more", "bad-size-policy", "wrong-size-policy"]:
             with self.subTest(fault=fault):
                 result = self.run_runner(["--experiment", "fi-more",
                     "--tests", "osu_oshm_put"], fault=fault)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("FAIL_SUBMISSION", (self.logs / "summary.tsv").read_text())
                 self.logs.rename(self.root / ("failed-" + fault))
+
+    def test_more_size_policy_is_explicit_and_control_is_unrestricted(self):
+        result = self.run_runner(["--experiment", "fi-more", "--more-batch", "4",
+            "--more-min-bytes", "1024", "--more-max-bytes", "4096",
+            "--tests", "osu_oshm_put", "--nodes", "2"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [c for c in self.calls() if c["kind"] == "benchmark"]
+        self.assertEqual([(c["more_min"], c["more_max"]) for c in calls],
+                         [("0", "0"), ("1024", "4096")])
+        self.assertIn("experimental_more_min_bytes=1024",
+                      (self.logs / "run-config.txt").read_text())
+
+    def test_more_size_policy_rejects_invalid_or_unrelated_options(self):
+        for options in [
+            ["--experiment", "fi-more", "--more-min-bytes", "8193"],
+            ["--experiment", "fi-more", "--more-max-bytes", "garbage"],
+            ["--experiment", "fi-more", "--more-min-bytes", "4096",
+             "--more-max-bytes", "1024"],
+            ["--more-max-bytes", "4096"]]:
+            result = self.run_runner(options)
+            self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.trace.exists())
 
     def test_more_without_eligible_traffic_is_reported_inactive(self):
         result = self.run_runner(["--experiment", "fi-more",
@@ -244,6 +268,23 @@ class OsuShmemRunnerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(all(c["more_batch"] == "0" for c in self.calls()
                             if c["kind"] == "benchmark"))
+
+    def test_default_experiment_clears_inherited_size_bounds(self):
+        previous = {key: os.environ.get(key) for key in
+                    ["SHMEM_OFI_PUT_MORE_MIN", "SHMEM_OFI_PUT_MORE_MAX"]}
+        os.environ.update({"SHMEM_OFI_PUT_MORE_MIN": "1024",
+                           "SHMEM_OFI_PUT_MORE_MAX": "4096"})
+        try:
+            result = self.run_runner(["--tests", "osu_oshm_put"])
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(all(c["more_min"] == "0" and c["more_max"] == "0"
+                            for c in self.calls() if c["kind"] == "benchmark"))
 
     def test_per_test_arguments_preserve_boundaries(self):
         result = self.run_runner([

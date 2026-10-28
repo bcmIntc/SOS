@@ -8,13 +8,21 @@ enum shmem_transport_ofi_more_reason {
     OFI_MORE_GET_WAIT, OFI_MORE_PROBE, OFI_MORE_REASONS
 };
 typedef struct {
-    size_t limit, count, budget;
+    size_t limit, count, budget, min_bytes, max_bytes;
     bool stats, locked, bounce_post;
     uint64_t bounce_flags, tx_posts;
     uint64_t puts, more, batches, batched_puts, full, other, flushes;
-    uint64_t ends[OFI_MORE_REASONS], retries, admission_waits, dest_changes;
+    uint64_t ends[OFI_MORE_REASONS], retries, admission_waits, admission_polls;
+    uint64_t dest_changes;
     uint64_t dest, addr, key;
 } shmem_transport_ofi_more_state_t;
+static inline bool
+shmem_transport_ofi_more_eligible(const shmem_transport_ofi_more_state_t *s,
+                                 size_t bytes)
+{
+    return s->limit && bytes >= s->min_bytes &&
+        (!s->max_bytes || bytes <= s->max_bytes);
+}
 static inline uint64_t
 shmem_transport_ofi_more_flags(const shmem_transport_ofi_more_state_t *s,
                               bool headroom)
@@ -25,7 +33,10 @@ static inline void
 shmem_transport_ofi_more_accept(shmem_transport_ofi_more_state_t *s,
                                bool payload, uint64_t flags, int reason)
 {
-    if (s->limit) s->tx_posts++;
+    /* Upper bound used only within an admitted group. Idle ordinary traffic
+     * follows the existing immediate path; opening reads actual outstanding
+     * counters once, instead of accumulating a lifetime post budget. */
+    if (s->limit && (payload || s->count)) s->tx_posts++;
     if (payload && s->stats) s->puts++;
     if (flags & FI_MORE) {
         s->count++;

@@ -611,6 +611,11 @@ enable_bounce_local_mr(struct fabric_info *info)
     if (shmem_internal_params.OFI_PUT_MORE_BATCH) {
         if (shmem_internal_params.OFI_PUT_MORE_BATCH > 16)
             RAISE_ERROR_STR("OFI_PUT_MORE_BATCH must be between 0 and 16");
+        if (shmem_internal_params.OFI_PUT_MORE_MIN > 8192 ||
+            shmem_internal_params.OFI_PUT_MORE_MAX > 8192 ||
+            (shmem_internal_params.OFI_PUT_MORE_MAX &&
+             shmem_internal_params.OFI_PUT_MORE_MIN > shmem_internal_params.OFI_PUT_MORE_MAX))
+            RAISE_ERROR_STR("OFI_PUT_MORE_MIN/MAX must be 0-8192 with MIN <= nonzero MAX");
         if (!shmem_internal_params.OFI_BOUNCE_LOCAL_MR ||
             shmem_internal_thread_level != SHMEM_THREAD_SINGLE ||
             shmem_internal_params.OFI_BOUNCE_COUNTER_RETIRE)
@@ -2009,8 +2014,11 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
         if (ctx->stx_idx >= 0 || !ctx->bounce_buffers || !ctx->bounce_local_mrs)
             RAISE_ERROR_STR("OFI_PUT_MORE_BATCH requires registered bounce buffers and an exclusive default TX queue (OFI_STX_MAX=0)");
         ctx->put_more.limit = shmem_internal_params.OFI_PUT_MORE_BATCH;
-        /* Account every accepted TX operation. Reserve substantial command
-         * and event headroom; this policy cannot guarantee provider admission. */
+        ctx->put_more.min_bytes = shmem_internal_params.OFI_PUT_MORE_MIN;
+        ctx->put_more.max_bytes = shmem_internal_params.OFI_PUT_MORE_MAX;
+        /* Snapshot all outstanding TX operations when opening a group, then
+         * conservatively account its posts. Reserve command/event headroom;
+         * this policy cannot guarantee provider admission. */
         ctx->put_more.budget = MIN(info->p_info->tx_attr->size / 8,
                                   (size_t)shmem_transport_ofi_max_bounce_buffers);
         if (ctx->put_more.budget < ctx->put_more.limit + 2 ||
@@ -2332,6 +2340,7 @@ void shmem_transport_ctx_destroy(shmem_transport_ctx_t *ctx)
                 " pool=%"PRIu64" credit=%"PRIu64" retry=%"PRIu64
                 " rebase=%"PRIu64" get_wait=%"PRIu64" probe=%"PRIu64
                 " eagain=%"PRIu64" admission_waits=%"PRIu64
+                " admission_polls=%"PRIu64" min_bytes=%zu max_bytes=%zu"
                 " dest_changes=%"PRIu64" avg_batch=%.2f\n",
                 ctx->put_more.limit, ctx->put_more.count,
                 ctx->put_more.puts, ctx->put_more.more, ctx->put_more.batches,
@@ -2341,7 +2350,9 @@ void shmem_transport_ctx_destroy(shmem_transport_ctx_t *ctx)
                 ctx->put_more.ends[OFI_MORE_CREDIT], ctx->put_more.ends[OFI_MORE_RETRY],
                 ctx->put_more.ends[OFI_MORE_REBASE], ctx->put_more.ends[OFI_MORE_GET_WAIT],
                 ctx->put_more.ends[OFI_MORE_PROBE], ctx->put_more.retries,
-                ctx->put_more.admission_waits, ctx->put_more.dest_changes,
+                ctx->put_more.admission_waits, ctx->put_more.admission_polls,
+                ctx->put_more.min_bytes, ctx->put_more.max_bytes,
+                ctx->put_more.dest_changes,
                 ctx->put_more.batches ?
                     (double)ctx->put_more.batched_puts / ctx->put_more.batches : 0.0);
     }

@@ -53,5 +53,22 @@ int main(void)
     assert(shmem_transport_ofi_more_flags(&s, true) == 0);
     shmem_transport_ofi_more_accept(&s, true, 0, OFI_MORE_FULL);
     assert(s.count == 0 && s.more == 0 && s.full == 1);
+
+    /* A size-excluded payload must never acquire FI_MORE, even if a previous
+     * eligible payload opened a group. Bounds include their endpoints. */
+    s = (shmem_transport_ofi_more_state_t){
+        .limit = 4, .stats = true, .min_bytes = 1024, .max_bytes = 4096
+    };
+    assert(!shmem_transport_ofi_more_eligible(&s, 512));
+    assert(shmem_transport_ofi_more_eligible(&s, 1024));
+    assert(shmem_transport_ofi_more_eligible(&s, 4096));
+    assert(!shmem_transport_ofi_more_eligible(&s, 8192));
+    shmem_transport_ofi_more_accept(&s, true, FI_MORE, OFI_MORE_FULL);
+    shmem_transport_ofi_more_accept(&s, true, 0, OFI_MORE_FULL);
+    assert(s.count == 0 && s.more == 1 && s.batched_puts == 2);
+    s.min_bytes = s.max_bytes = 0;
+    assert(shmem_transport_ofi_more_eligible(&s, 8192));
+    s.limit = 0;
+    assert(!shmem_transport_ofi_more_eligible(&s, 1024));
     return 0;
 }

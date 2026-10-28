@@ -16,6 +16,8 @@ Usage: bash run-osu-shmem.sh --osu-dir DIR [options]
   --baseline-expect-commit SHA  Optional full baseline commit check
   --experiment NAME     counter-retirement (default) or fi-more
   --more-batch N        Experimental FI_MORE batch limit, 2-16 (default: 16)
+  --more-min-bytes N    Minimum eligible bounce-put size, inclusive (default: 0)
+  --more-max-bytes N    Maximum eligible size, inclusive; 0 unrestricted (default: 0)
   --hosts A,B,C          Ordered allocation hosts; neighboring pairs are tested
   --hostfile FILE        One hostname per line; repeated PBS hosts are deduplicated
   --nodes N              Use the first N distinct allocation hosts (N >= 2)
@@ -82,6 +84,9 @@ baseline_enabled=0
 experiment=counter-retirement
 more_batch=16
 more_batch_provided=0
+more_min_bytes=0
+more_max_bytes=0
+more_size_provided=0
 original_library_path=${LD_LIBRARY_PATH:-}
 host_csv=
 host_file=
@@ -115,7 +120,7 @@ while (($#)); do
             (($# >= 3)) || die "--test-mode requires NAME pair|all"
             [[ $3 == pair || $3 == all ]] || die "--test-mode requires pair or all"
             mode_names+=("$2"); mode_values+=("$3"); shift 3 ;;
-        --osu-dir|--sos-lib-dir|--baseline-lib-dir|--baseline-expect-commit|--experiment|--more-batch|--hosts|--hostfile|--nodes|--cores-per-node|--mpirun|--launcher-style|--mpirun-arg|--tests|--repeats|--timeout|--kill-after|--log-dir|--expect-commit)
+        --osu-dir|--sos-lib-dir|--baseline-lib-dir|--baseline-expect-commit|--experiment|--more-batch|--more-min-bytes|--more-max-bytes|--hosts|--hostfile|--nodes|--cores-per-node|--mpirun|--launcher-style|--mpirun-arg|--tests|--repeats|--timeout|--kill-after|--log-dir|--expect-commit)
             (($# >= 2)) || die "$1 requires a value"
             case $1 in
                 --osu-dir) osu_dir=$2 ;;
@@ -124,6 +129,8 @@ while (($#)); do
                 --baseline-expect-commit) baseline_expected_commit=$2 ;;
                 --experiment) experiment=$2 ;;
                 --more-batch) more_batch=$2; more_batch_provided=1 ;;
+                --more-min-bytes) more_min_bytes=$2; more_size_provided=1 ;;
+                --more-max-bytes) more_max_bytes=$2; more_size_provided=1 ;;
                 --hosts) host_csv=$2 ;;
                 --hostfile) host_file=$2 ;;
                 --nodes) node_limit=$2 ;;
@@ -153,6 +160,14 @@ positive_integer "$more_batch" "--more-batch"
 ((more_batch >= 2 && more_batch <= 16)) || die "--more-batch must be between 2 and 16"
 ((more_batch_provided == 0)) || [[ $experiment == fi-more ]] ||
     die "--more-batch requires --experiment fi-more"
+for bound in "$more_min_bytes" "$more_max_bytes"; do
+    [[ $bound =~ ^(0|[1-9][0-9]{0,3})$ ]] && ((bound <= 8192)) ||
+        die "--more-min-bytes/--more-max-bytes must be integers in 0-8192"
+done
+((more_max_bytes == 0 || more_min_bytes <= more_max_bytes)) ||
+    die "--more-min-bytes must not exceed a nonzero --more-max-bytes"
+((more_size_provided == 0)) || [[ $experiment == fi-more ]] ||
+    die "FI_MORE size bounds require --experiment fi-more"
 positive_integer "$repeats" "--repeats"
 [[ -z $cores_per_node ]] || positive_integer "$cores_per_node" "--cores-per-node"
 if [[ -n $node_limit ]]; then
@@ -199,12 +214,13 @@ expected_commit=${expected_commit,,}
 # Start each arm's loader path from the caller's original environment, so
 # baseline and aggregation library paths do not accumulate across launches.
 arm_environment() {
-    local selected_library=$sos_lib_dir retirement=0 local_mr=1 statistics=1 submission=0
+    local selected_library=$sos_lib_dir retirement=0 local_mr=1 statistics=1 submission=0 minimum=0 maximum=0
     case $1 in
         baseline) selected_library=$baseline_lib_dir; local_mr=0; statistics=0 ;;
         control) ;;
         experimental)
-            if [[ $experiment == fi-more ]]; then submission=$more_batch
+            if [[ $experiment == fi-more ]]; then
+                submission=$more_batch; minimum=$more_min_bytes; maximum=$more_max_bytes
             else retirement=1; fi ;;
         *) die "invalid benchmark arm: $1" ;;
     esac
@@ -213,6 +229,7 @@ arm_environment() {
     export SHMEM_OFI_BOUNCE_COUNTER_RETIRE=$retirement
     export SHMEM_OFI_PUT_BATCH_STATS=$statistics
     export SHMEM_OFI_PUT_MORE_BATCH=$submission
+    export SHMEM_OFI_PUT_MORE_MIN=$minimum SHMEM_OFI_PUT_MORE_MAX=$maximum
 }
 
 # Do not infer OpenSHMEM from generic MPI one-sided benchmark names.
@@ -369,6 +386,8 @@ scope_count=${#scope_ids[@]}
 arm_count=$((2 + baseline_enabled))
 printf 'Experiment: %s; experimental FI_MORE batch limit: %s\n' \
     "$experiment" "$([[ $experiment == fi-more ]] && printf '%s' "$more_batch" || printf 0)"
+printf 'Experimental FI_MORE size bounds: %s..%s bytes (0 unrestricted).\n' \
+    "$more_min_bytes" "$more_max_bytes"
 library_probe_count=$((scope_count * (1 + baseline_enabled)))
 total=$(((pair_count * ${#pair_tests[@]} + ${#all_tests[@]}) * repeats * arm_count))
 printf 'Plan: %d nodes, %d paired tests, %d all-node tests, %d repetition(s).\n' \
@@ -409,7 +428,7 @@ arm_environment control
 printf 'scope\tmode\thosts\tpes\tpes_per_node\tbenchmark\trepetition\tarm\texit_status\tseconds\tresult\tretirement_traffic\tbounce_puts\tcounter_puts\tcq_puts\treclaimed\tgroups\tcommit\tlog\tlibrary_dir\tlibrary_sha256\tgit_version\n' \
     >"$log_dir/summary.tsv"
 printf 'scope\tbenchmark\trepetition\tarm\tnumeric_output_row\n' >"$log_dir/metrics.tsv"
-printf 'scope\tbenchmark\trepetition\tarm\ttraffic\tbatch_limit\tputs\tmore\tbatches\tbatched_puts\tfull\tother\tflushes\tavg_batch\tquiet\tfence\tpool\tcredit\tretry\trebase\tget_wait\tprobe\teagain\tadmission_waits\tdest_changes\n' \
+printf 'scope\tbenchmark\trepetition\tarm\ttraffic\tbatch_limit\tputs\tmore\tbatches\tbatched_puts\tfull\tother\tflushes\tavg_batch\tquiet\tfence\tpool\tcredit\tretry\trebase\tget_wait\tprobe\teagain\tadmission_waits\tdest_changes\tadmission_polls\tmin_bytes\tmax_bytes\n' \
     >"$log_dir/submission.tsv"
 sha256sum "$sos_lib_dir/libsma.so" >"$log_dir/sos-library.sha256"
 read -r expected_library_hash _ <"$log_dir/sos-library.sha256"
@@ -446,6 +465,8 @@ done >>"$log_dir/benchmarks.tsv"
     printf 'baseline_local_mr=0\nbaseline_counter_retire=0\nbaseline_stats=0\n'
     printf 'experiment=%s\nexperimental_more_batch=%s\n' "$experiment" \
         "$([[ $experiment == fi-more ]] && printf '%s' "$more_batch" || printf 0)"
+    printf 'experimental_more_min_bytes=%s\nexperimental_more_max_bytes=%s\n' \
+        "$more_min_bytes" "$more_max_bytes"
     env | LC_ALL=C sort | awk '/^(SHMEM_|SMA_|FI_)/'
 } >"$log_dir/run-config.txt"
 printf '%s\n' "${hosts[@]}" >"$log_dir/hosts.txt"
@@ -690,7 +711,12 @@ for ((p=0; p<scope_count; p++)); do
                 if [[ $result == PASS && $experiment == fi-more && $arm_name != baseline ]]; then
                     submission_limit=0
                     [[ $arm_name != experimental ]] || submission_limit=$more_batch
+                    submission_min=0; submission_max=0
+                    if [[ $arm_name == experimental ]]; then
+                        submission_min=$more_min_bytes; submission_max=$more_max_bytes
+                    fi
                     if ! submission_fields=$(awk -v expected="$submission_limit" \
+                        -v minimum="$submission_min" -v maximum="$submission_max" \
                         -v owned="${stats[0]}" '
                         # Decimal addition preserves uint64 identities beyond
                         # awk floating-point integer precision.
@@ -705,9 +731,10 @@ for ((p=0; p<scope_count; p++)); do
                         /OFI submission:/ {
                             seen++
                             for(i=1;i<=NF;i++) {n=split($i,a,"="); if(n==2) v[a[1]]=a[2]}
-                            split("batch_limit puts more batches batched_puts full other flushes quiet fence pool credit retry rebase get_wait probe eagain admission_waits dest_changes pending",keys," ")
+                            split("batch_limit puts more batches batched_puts full other flushes quiet fence pool credit retry rebase get_wait probe eagain admission_waits dest_changes pending admission_polls min_bytes max_bytes",keys," ")
                             for(k in keys) if(v[keys[k]] !~ /^(0|[1-9][0-9]*)$/) bad=1
                             if(v["batch_limit"]!=expected || v["pending"]!=0 ||
+                               v["min_bytes"]!=minimum || v["max_bytes"]!=maximum ||
                                ("x" v["puts"])!=("x" owned) ||
                                ("x" v["batched_puts"])!=("x" v["puts"]) ||
                                v["more"]+0>v["puts"]+0 ||
@@ -731,7 +758,8 @@ for ((p=0; p<scope_count; p++)); do
                                   v["batched_puts"],v["full"],v["other"],v["flushes"],v["avg_batch"],
                                   v["quiet"],v["fence"],v["pool"],v["credit"],v["retry"],
                                   v["rebase"],v["get_wait"],v["probe"],v["eagain"],
-                                  v["admission_waits"],v["dest_changes"]
+                                  v["admission_waits"],v["dest_changes"],
+                                  v["admission_polls"],v["min_bytes"],v["max_bytes"]
                         }' "$log"); then
                         result=FAIL_SUBMISSION
                     else

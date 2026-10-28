@@ -93,21 +93,28 @@ extern bool shmem_transport_ofi_pcie_cxi;
         }                                                                       \
     } while (0)
 
-#define OFI_CTX_CHECK_ERROR(ctx, /* int or ssize_t */ err)                      \
+#define OFI_CTX_CHECK_ERROR(ctx, /* int or ssize_t */ ofi_err)                  \
     do {                                                                        \
-        if ((err) == -FI_EAVAIL) {                                              \
+        if ((ofi_err) == -FI_EAVAIL) {                                          \
             struct fi_cq_err_entry e = {0};                                     \
             ssize_t ret = fi_cq_readerr((ctx)->cq, (void *)&e, 0);              \
             if (ret == 1) {                                                     \
                 const char *errmsg = fi_cq_strerror((ctx)->cq, e.prov_errno,    \
                                                     e.err_data, NULL, 0);       \
-                RAISE_ERROR_MSG("Error in operation: %s\n", errmsg);            \
+                RAISE_ERROR_MSG("Error in operation: %s; err=%d prov_errno=%d" \
+                    " flags=%"PRIx64" op_context=%p ctx=%ld"                  \
+                    " fabric_put_pending=%"PRIu64" more_pending=%zu"          \
+                    " bounce_pending=%"PRIu64" bounce_completed=%"PRIu64"\n", \
+                    errmsg, e.err, e.prov_errno, e.flags, e.op_context,         \
+                    (long)(ctx)->id, (ctx)->put_cntr_pending,                   \
+                    (ctx)->put_more.count, (ctx)->pending_bb_cntr,              \
+                    (ctx)->completed_bb_cntr);                                 \
             } else {                                                            \
                 RAISE_ERROR_MSG("Error reading from CQ (%zd)\n", ret);          \
             }                                                                   \
-        } else if (err) {                                                       \
-            RAISE_ERROR_MSG("OFI error %zd: %s\n", (ssize_t) (err),             \
-                            fi_strerror(err));                                 \
+        } else if (ofi_err) {                                                   \
+            RAISE_ERROR_MSG("OFI error %zd: %s\n", (ssize_t) (ofi_err),         \
+                            fi_strerror(ofi_err));                             \
         }                                                                       \
     } while (0)
 
@@ -983,6 +990,7 @@ void shmem_transport_ofi_put_nb_chunk(shmem_transport_ctx_t* ctx, void *target,
         shmem_transport_ofi_bounce_buffer_t *buff =
             create_bounce_buffer(ctx, source, len);
         /* Pool-pressure retirement above must not wait for this unposted put. */
+        bool more_eligible = shmem_transport_ofi_more_prepare(ctx, len);
         shmem_transport_ofi_record_put(ctx, pe);
         polled = 0;
 
@@ -1003,12 +1011,14 @@ void shmem_transport_ofi_put_nb_chunk(shmem_transport_ctx_t* ctx, void *target,
          * Subsequent ordinary operations may submit this group without a
          * marker; destinations need not match on the same exclusive queue. */
         bool headroom = ctx->put_more.count ||
-            (ctx->put_cntr_limit - ctx->put_cntr_pending >= ctx->put_more.limit &&
+            (ctx->put_more.limit &&
+             ctx->put_more.tx_posts <= ctx->put_more.budget - ctx->put_more.limit - 2 &&
+             ctx->put_cntr_limit - ctx->put_cntr_pending >= ctx->put_more.limit &&
              shmem_transport_ofi_max_bounce_buffers -
                  ctx->bounce_buffers->nalloc >= ctx->put_more.limit);
         ctx->put_more.bounce_post = true;
-        ctx->put_more.bounce_flags =
-            shmem_transport_ofi_more_flags(&ctx->put_more, headroom);
+        ctx->put_more.bounce_flags = more_eligible ?
+            shmem_transport_ofi_more_flags(&ctx->put_more, headroom) : 0;
         do {
             ret = fi_writemsg(ctx->ep, &msg, FI_DELIVERY_COMPLETE |
                              (ctx->bounce_counter_retire ? 0 : FI_COMPLETION) |

@@ -42,26 +42,55 @@ shmem_transport_ofi_more_flush(shmem_transport_ctx_t *ctx, int reason)
     RAISE_ERROR_STR("FI_MORE flush could not be submitted after 64 attempts; deferred source buffers remain owned");
 }
 
+/* Safe only before counting a new/unaccepted operation. Counters include all
+ * previous writes, atomics, markers and fetching operations on this queue.
+ * This only admits TX credits: CQ events still own individual payloads. */
+static inline void
+shmem_transport_ofi_more_admit(shmem_transport_ctx_t *ctx, size_t needed)
+{
+    shmem_internal_assert(needed <= ctx->put_more.budget);
+    shmem_transport_ofi_more_flush(ctx, OFI_MORE_CREDIT);
+    bool waited = false;
+    for (;;) {
+        uint64_t puts = shmem_transport_ofi_read_put_counter(ctx);
+        uint64_t gets = fi_cntr_read(ctx->get_cntr);
+        if (fi_cntr_readerr(ctx->get_cntr))
+            RAISE_ERROR_STR("OFI get counter error during FI_MORE admission");
+        uint64_t get_goal = SHMEM_TRANSPORT_OFI_CNTR_READ(&ctx->pending_get_cntr);
+        shmem_internal_assert(puts <= ctx->put_cntr_pending && gets <= get_goal);
+        uint64_t put_remaining = ctx->put_cntr_pending - puts;
+        uint64_t get_remaining = get_goal - gets;
+        size_t available = ctx->put_more.budget - needed;
+        if (ctx->put_more.stats) ctx->put_more.admission_polls++;
+        /* Separate comparisons avoid overflowing a sum of issued counters. */
+        if (put_remaining <= available &&
+            get_remaining <= available - put_remaining) {
+            ctx->put_more.tx_posts = put_remaining + get_remaining;
+            return;
+        }
+        if (!waited && ctx->put_more.stats) ctx->put_more.admission_waits++;
+        waited = true;
+        shmem_transport_ofi_progress_put_counter(ctx);
+    }
+}
+
 static inline void
 shmem_transport_ofi_more_reserve(shmem_transport_ctx_t *ctx)
 {
-    if (!ctx->put_more.limit) return;
-    size_t needed = ctx->put_more.count ? 2 : ctx->put_more.limit + 2;
-    if (ctx->put_more.tx_posts <= ctx->put_more.budget - needed) return;
-    shmem_transport_ofi_more_flush(ctx, OFI_MORE_CREDIT);
-    if (ctx->put_more.stats) ctx->put_more.admission_waits++;
-    /* Called only before incrementing the next operation's issued count.
-     * Snapshot all nonfetching and fetching operations before reusing credits. */
-    shmem_transport_ofi_wait_put_counter(ctx);
-    uint64_t goal = SHMEM_TRANSPORT_OFI_CNTR_READ(&ctx->pending_get_cntr);
-    while (fi_cntr_read(ctx->get_cntr) < goal) {
-        shmem_transport_ofi_progress_put_counter(ctx);
-        if (fi_cntr_readerr(ctx->get_cntr))
-            RAISE_ERROR_STR("OFI get counter error during FI_MORE admission");
-    }
-    if (fi_cntr_readerr(ctx->get_cntr))
-        RAISE_ERROR_STR("OFI get counter error during FI_MORE admission");
-    ctx->put_more.tx_posts = 0;
+    /* No counter reads or waits for injected/direct operations outside a
+     * deferred group. The next eligible bounce put admits its own group. */
+    if (!ctx->put_more.count) return;
+    if (ctx->put_more.tx_posts <= ctx->put_more.budget - 2) return;
+    shmem_transport_ofi_more_admit(ctx, 2);
+}
+
+static inline bool
+shmem_transport_ofi_more_prepare(shmem_transport_ctx_t *ctx, size_t bytes)
+{
+    if (!shmem_transport_ofi_more_eligible(&ctx->put_more, bytes)) return false;
+    if (!ctx->put_more.count)
+        shmem_transport_ofi_more_admit(ctx, ctx->put_more.limit + 2);
+    return true;
 }
 
 #endif

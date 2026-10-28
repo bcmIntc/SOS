@@ -84,12 +84,14 @@ int main(int argc, char **argv)
                             shmem_global_exit(1);
     }
     shmem_barrier_all();
-    if (!me) printf("OFI MORE payload check passed: bytes=%zu phases=4 PEs=%d\n",
-                    bytes, npes);
+    if (!me) fprintf(stderr, "OFI MORE cleanup: freeing allocations\n");
     free(source);
     shmem_free(word);
     shmem_free(target);
     shmem_free(host);
+    if (!me) fprintf(stderr, "OFI MORE cleanup: finalizing\n");
     shmem_finalize();
+    if (!me) printf("OFI MORE payload check passed: bytes=%zu phases=4 PEs=%d\n",
+                    bytes, npes);
     return 0;
 }
