@@ -147,7 +147,7 @@ struct mock {
     uint64_t completed, get_completed;
     uint64_t caps;
     bool delivery_peers[PES], flush_waited;
-    void *flush_context, *rogue_context;
+    void *flush_context, *bounce_context, *rogue_context;
     bool rogue;
     char retry_kind, error_kind;
     bool wait_error, counter_error, cq_error;
@@ -303,9 +303,8 @@ static ssize_t write_message(struct fid_ep *ep, const struct fi_msg_rma *msg,
         queue_data(mock, msg->msg_iov[0].iov_base, len, msg->addr,
                    msg->rma_iov[0].addr, msg->rma_iov[0].key, flags);
         if (flags & FI_COMPLETION) {
-            CHECK(!mock->flush_context);
-            mock->flush_context = msg->context;
-            mock->flush_waited = true;
+            CHECK(!mock->bounce_context);
+            mock->bounce_context = msg->context;
         }
     } else {
         CHECK(flags == (FI_FENCE | FI_DELIVERY_COMPLETE | FI_COMPLETION));
@@ -326,8 +325,12 @@ static ssize_t inject_write(struct fid_ep *ep, const void *source, size_t len,
     record(mock, kind, source, len, destination, address, key, 0);
     ++mock->accepted;
     if (len) {
-        queue_data(mock, source, len, destination, address, key,
-                   FI_DELIVERY_COMPLETE | FI_INJECT);
+        uint64_t flags = FI_DELIVERY_COMPLETE | FI_INJECT;
+#ifndef SOS_MOCK_BASELINE
+        if (shmem_transport_ofi_cxi_tx_complete_puts)
+            flags = FI_TRANSMIT_COMPLETE | FI_INJECT;
+#endif
+        queue_data(mock, source, len, destination, address, key, flags);
     }
     return 0;
 }
@@ -400,13 +403,16 @@ static ssize_t cq_read(struct fid_cq *cq, void *buffer, size_t count)
         ((struct fi_cq_entry *) buffer)->op_context = mock->rogue_context;
         return 1;
     }
+    if (mock->bounce_context) {
+        ((struct fi_cq_entry *) buffer)->op_context = mock->bounce_context;
+        consume_data(mock);
+        mock->bounce_context = NULL;
+        ++mock->cq_successes;
+        return 1;
+    }
     if (!mock->flush_context || !mock->flush_waited)
         return -FI_EAGAIN;
     ((struct fi_cq_entry *) buffer)->op_context = mock->flush_context;
-    /* Bounce completions release their source buffer immediately. */
-    if (((shmem_transport_ofi_frag_t *) mock->flush_context)->mytype ==
-        SHMEM_TRANSPORT_OFI_TYPE_BOUNCE)
-        consume_data(mock);
     mock->flush_context = NULL;
     ++mock->cq_successes;
     return 1;
@@ -461,6 +467,7 @@ static int close_fid(struct fid *fid)
     CHECK(!mock->ctx.cxi_tx_complete_peers && !mock->flush_context);
 #else
     CHECK(!mock->flush_context);
+    CHECK(!mock->bounce_context);
 #endif
     CHECK(mock->completed == mock->accepted);
     ++mock->closes;
@@ -590,18 +597,19 @@ static void boundaries(void)
                 bulk(&mock, 256, source, len, 2, nbi);
                 unsigned pieces = !!len;
                 CHECK(mock.accepted == pieces);
-                CHECK(mock.waits == (unsigned) (len && !nbi));
+                bool inject = len && len <= 192;
+                CHECK(mock.waits == (unsigned) (len && !inject && !nbi));
                 for (unsigned i = 0; i < pieces; ++i) {
                     const struct event *event = &mock.events[i];
-                    CHECK(event->kind == 'P' && event->len == len);
+                    CHECK(event->kind == (inject ? 'S' : 'P') && event->len == len);
                     CHECK(event->source == source);
                     CHECK(event->address == target_address(2, 256));
                     CHECK(event->key == target_key(2) && event->pe == 2);
-                    CHECK(event->flags == FI_TRANSMIT_COMPLETE);
+                    CHECK(event->flags == (inject ? 0 : FI_TRANSMIT_COMPLETE));
                 }
                 /* TX completion permits source reuse but not target visibility.
                  * NBI sources remain live until quiet. */
-                if (!nbi) memset(source, 0xee, len);
+                if (!nbi || inject) memset(source, 0xee, len);
                 if (len) CHECK(remote[2][256] == 0);
                 if (nbi) CHECK(mock.completed == 0);
                 reset_trace(&mock);
@@ -625,6 +633,136 @@ static void boundaries(void)
                 destroy_mock_lock(&mock);
             }
         }
+    }
+}
+
+static void hybrid_window(void)
+{
+    const size_t lengths[] = {
+        1, 192, 193, 512, 1024, 1025, 2048, 4096, 8192, 8193, 16384
+    };
+    const struct {
+        size_t lower, upper, inject;
+        const char *kinds;
+    } policies[] = {
+        {1024, 8192, 192, "SSLLLPPPPLL"},
+        {512, 4096, 192, "SSLLPPPPLLL"},
+        {0, 64, 192, "SSLLLLLLLLL"},
+        {0, 8192, 0, "PPPPPPPPPLL"}
+    };
+    unsigned char source[16384], saved[16384];
+    for (unsigned p = 0; p < sizeof(policies) / sizeof(policies[0]); ++p) {
+        shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS_LOWER_CUTOFF = policies[p].lower;
+        shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS_UPPER_CUTOFF = policies[p].upper;
+        shmem_transport_ofi_max_buffered_send = policies[p].inject;
+        for (int nbi = 0; nbi <= 1; ++nbi) {
+            for (unsigned l = 0; l < sizeof(lengths) / sizeof(lengths[0]); ++l) {
+                struct mock mock;
+                init_mock(&mock);
+                size_t len = lengths[l];
+                char kind = policies[p].kinds[l];
+                memset(source, 0x37, len);
+                memcpy(saved, source, len);
+                memset(remote[2] + 256, 0, len);
+                long completion = 0;
+                if (nbi)
+                    shmem_internal_put_nbi((shmem_ctx_t) &mock.ctx,
+                                           heap + 256, source, len, 2);
+                else {
+                    shmem_internal_put_nb((shmem_ctx_t) &mock.ctx,
+                                          heap + 256, source, len, 2, &completion);
+                    CHECK(completion == (kind == 'L'));
+                    shmem_transport_put_wait(&mock.ctx, &completion);
+                    CHECK(completion == 0);
+                }
+                CHECK(mock.accepted == 1);
+                CHECK(mock.events[0].kind == kind && mock.events[0].len == len);
+                CHECK(mock.events[0].source == source);
+                CHECK(mock.events[0].address == target_address(2, 256));
+                if (kind == 'P') CHECK(mock.events[0].flags == FI_TRANSMIT_COMPLETE);
+                CHECK(mock.waits == (unsigned) (!nbi && kind != 'S'));
+                if (nbi || kind != 'L') CHECK(remote[2][256] == 0);
+                if (!nbi || kind == 'S') memset(source, 0xee, len);
+                reset_trace(&mock);
+                shmem_transport_put_quiet(&mock.ctx);
+                expect_trace(&mock, kind == 'L' ? "W" : "FW");
+                CHECK(!memcmp(remote[2] + 256, saved, len));
+                expect_accounted(&mock);
+                destroy_mock_lock(&mock);
+            }
+        }
+    }
+}
+
+static void hybrid_bounce(void)
+{
+    struct mock mock;
+    init_mock(&mock);
+    shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS_LOWER_CUTOFF = 1024;
+    shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS_UPPER_CUTOFF = 8192;
+    shmem_transport_ofi_bounce_buffer_size = 1024;
+    shmem_transport_ofi_max_bounce_buffers = 1;
+    shmem_transport_ofi_bounce_buffer_t *buffer = calloc(1, sizeof(*buffer) + 1024);
+    CHECK(buffer);
+    buffer->frag.mytype = SHMEM_TRANSPORT_OFI_TYPE_BOUNCE;
+    shmem_free_list_t pool = {0};
+    pool.head = &buffer->frag.item;
+    mock.ctx.bounce_buffers = &pool;
+    unsigned char source[512];
+    memset(source, 0x51, sizeof(source));
+    memset(heap + 32768, 0x6b, 4096);
+    bulk(&mock, 4096, heap + 32768, 4096, 1, true);
+    long completion = 0;
+    shmem_internal_put_nb((shmem_ctx_t) &mock.ctx, heap + 256,
+                          source, sizeof(source), 2, &completion);
+    CHECK(completion == 0 && pool.nalloc == 1 && mock.waits == 0);
+    expect_trace(&mock, "PP");
+    CHECK(mock.events[1].flags == (FI_COMPLETION | FI_DELIVERY_COMPLETE));
+    CHECK(mock.events[1].source == buffer->data);
+    memset(source, 0xee, sizeof(source));
+    shmem_transport_put_quiet(&mock.ctx);
+    expect_trace(&mock, "PPFW");
+    CHECK(pool.nalloc == 0 && remote[2][256] == 0x51);
+    CHECK(!memcmp(remote[1] + 4096, heap + 32768, 4096));
+    expect_accounted(&mock);
+    mock.ctx.bounce_buffers = NULL;
+    free(buffer);
+    destroy_mock_lock(&mock);
+}
+
+static void hybrid_fragmentation(void)
+{
+    for (int nbi = 0; nbi <= 1; ++nbi) {
+        struct mock mock;
+        init_mock(&mock);
+        shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS_LOWER_CUTOFF = 0;
+        shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS_UPPER_CUTOFF = 32768;
+        shmem_transport_ofi_max_msg_size = 1024;
+        memset(heap + 32768, 0x6b, 2049);
+        bulk(&mock, 4096, heap + 32768, 512, 1, true);
+        reset_trace(&mock);
+        long completion = 0;
+        if (nbi)
+            shmem_internal_put_nbi((shmem_ctx_t) &mock.ctx,
+                                   heap + 8192, heap + 32768, 2049, 2);
+        else
+            shmem_internal_put_nb((shmem_ctx_t) &mock.ctx,
+                                  heap + 8192, heap + 32768, 2049, 2, &completion);
+        expect_trace(&mock, "FWLLL");
+        for (unsigned i = 0; i < 3; ++i) {
+            const struct event *event = &mock.events[i + 2];
+            CHECK(event->len == (i == 2 ? 1 : 1024));
+            CHECK(event->source == heap + 32768 + i * 1024);
+            CHECK(event->address == target_address(2, 8192 + i * 1024));
+        }
+        CHECK(completion == !nbi);
+        shmem_transport_put_wait(&mock.ctx, &completion);
+        CHECK(completion == 0);
+        shmem_transport_put_quiet(&mock.ctx);
+        CHECK(!memcmp(remote[2] + 8192, heap + 32768, 2049));
+        CHECK(!memcmp(remote[1] + 4096, heap + 32768, 512));
+        expect_accounted(&mock);
+        destroy_mock_lock(&mock);
     }
 }
 
@@ -1023,12 +1161,7 @@ static void reject_errors(const char *name)
     struct mock mock;
     init_mock(&mock);
     if (!strcmp(name, "error-payload")) mock.error_kind = 'P';
-    if (!strcmp(name, "oversize")) shmem_transport_ofi_max_msg_size = 8191;
-    if (!strcmp(name, "oversize-small")) shmem_transport_ofi_max_msg_size = 192;
-    if (!strcmp(name, "oversize"))
-        bulk(&mock, 256, heap + 32768, 8192, 1, false);
-    else
-        bulk(&mock, 256, heap + 32768, 193, 1, true);
+    bulk(&mock, 256, heap + 32768, 193, 1, true);
     if (!strcmp(name, "error-flush")) mock.error_kind = 'F';
     if (!strcmp(name, "missing-fence")) mock.caps = 0;
     if (!strcmp(name, "error-control")) {
@@ -1294,6 +1427,8 @@ int main(int argc, char **argv)
     shmem_transport_ofi_max_msg_size = 32768;
     shmem_transport_ofi_max_poll = 4;
 #ifndef SOS_MOCK_BASELINE
+    shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS_LOWER_CUTOFF = 0;
+    shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS_UPPER_CUTOFF = 32768;
     if (strncmp(test_case, "disabled", 8))
         shmem_transport_ofi_cxi_tx_complete_puts = true;
 #endif
@@ -1324,6 +1459,9 @@ int main(int argc, char **argv)
              !strcmp(test_case, "disabled-drain-helper") ||
              !strcmp(test_case, "disabled-control-helper")) reject_disabled_helper(test_case);
     else if (!strcmp(test_case, "boundaries")) boundaries();
+    else if (!strcmp(test_case, "hybrid-window")) hybrid_window();
+    else if (!strcmp(test_case, "hybrid-bounce")) hybrid_bounce();
+    else if (!strcmp(test_case, "hybrid-fragmentation")) hybrid_fragmentation();
     else if (!strcmp(test_case, "mixed")) mixed();
     else if (!strcmp(test_case, "peer-cache")) peer_cache();
     else if (!strcmp(test_case, "controls")) controls();

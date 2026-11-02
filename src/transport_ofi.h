@@ -382,6 +382,15 @@ struct shmem_transport_ctx_t {
 typedef struct shmem_transport_ctx_t shmem_transport_ctx_t;
 extern shmem_transport_ctx_t shmem_transport_ctx_default;
 extern bool shmem_transport_ofi_cxi_tx_complete_puts;
+static inline bool shmem_transport_ofi_cxi_tx_complete_use_put(size_t len)
+{
+    return shmem_transport_ofi_cxi_tx_complete_puts &&
+           (len <= shmem_transport_ofi_max_buffered_send ||
+            (len > shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS_LOWER_CUTOFF &&
+             len <= shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS_UPPER_CUTOFF &&
+             len <= shmem_transport_ofi_max_msg_size));
+}
+
 void shmem_transport_ofi_cxi_tx_complete_put_locked(shmem_transport_ctx_t *ctx,
                                             void *target, const void *source,
                                             size_t len, int pe, bool source_reuse_wait);
@@ -762,7 +771,7 @@ void shmem_transport_put_nb(shmem_transport_ctx_t* ctx, void *target, const void
 
     shmem_internal_assert(completion != NULL);
 
-    if (shmem_transport_ofi_cxi_tx_complete_puts) {
+    if (shmem_transport_ofi_cxi_tx_complete_use_put(len)) {
         SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
         shmem_transport_ofi_cxi_tx_complete_put_locked(ctx, target, source, len, pe, true);
         SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
@@ -971,7 +980,7 @@ static inline
 void shmem_transport_put_nbi(shmem_transport_ctx_t* ctx, void *target, const void *source, size_t len,
                              int pe)
 {
-    if (shmem_transport_ofi_cxi_tx_complete_puts) {
+    if (shmem_transport_ofi_cxi_tx_complete_use_put(len)) {
         SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
         shmem_transport_ofi_cxi_tx_complete_put_locked(ctx, target, source, len, pe, false);
         SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);

@@ -140,6 +140,10 @@ class TxCompleteTransportTest(unittest.TestCase):
     def test_boundaries_flags_offsets_and_source_lifetime(self):
         self.run_case("boundaries")
 
+    def test_hybrid_cutoffs_injection_bounce_and_provider_fragmentation(self):
+        for case in ("hybrid-window", "hybrid-bounce", "hybrid-fragmentation"):
+            self.run_case(case)
+
     def test_mixed_peers_repeated_destinations_and_context_isolation(self):
         self.run_case("mixed")
 
@@ -210,6 +214,50 @@ class TxCompleteTransportTest(unittest.TestCase):
                         self.assertIn("requires an OFI build with the CXI provider",
                                       result.stderr)
 
+    def test_size_cutoffs_defaults_units_aliases_and_validation(self):
+        clean = {key: value for key, value in self.environment.items()
+                 if not key.startswith(("SHMEM_", "SMA_"))}
+        mode = "SHMEM_OFI_CXI_TX_COMPLETE_PUTS"
+        lower = "SHMEM_OFI_CXI_TX_COMPLETE_PUTS_LOWER_CUTOFF"
+        upper = "SHMEM_OFI_CXI_TX_COMPLETE_PUTS_UPPER_CUTOFF"
+        for configuration, binary in self.env_binaries:
+            for name, overrides, expected_lower, expected_upper, status, diagnostic in (
+                ("defaults", {}, 1024, 8192, 0, None),
+                ("scaled", {lower: "2k", upper: "16k"}, 2048, 16384, 0, None),
+                ("zero-lower", {lower: "0", upper: "8k"}, 0, 8192, 0, None),
+                ("aliases", {lower.replace("SHMEM_", "SMA_"): "2k",
+                             upper.replace("SHMEM_", "SMA_"): "16k"},
+                 2048, 16384, 0, None),
+                ("shmem-wins", {lower: "1k", upper: "8k",
+                                lower.replace("SHMEM_", "SMA_"): "2k",
+                                upper.replace("SHMEM_", "SMA_"): "16k"},
+                 1024, 8192, 0, None),
+                ("equal", {lower: "8k", upper: "8k"}, 8192, 8192, 1,
+                 "LOWER_CUTOFF < UPPER_CUTOFF"),
+                ("reversed", {lower: "16k", upper: "8k"}, 16384, 8192, 1,
+                 "LOWER_CUTOFF < UPPER_CUTOFF"),
+                ("negative", {lower: "-1"}, 0, 8192, 2, "Invalid size"),
+                ("invalid", {upper: "junk"}, 1024, 0, 2, "Invalid size"),
+            ):
+                if configuration != "ofi":
+                    continue
+                with self.subTest(configuration=configuration, case=name):
+                    result = subprocess.run(
+                        [str(binary), "1", "1", str(expected_lower), str(expected_upper)],
+                        cwd=ROOT, env=dict(clean, **{mode: "1"}, **overrides),
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                    if diagnostic:
+                        self.assertIn(diagnostic, result.stderr)
+            with self.subTest(configuration=configuration, case="off-ignores-window"):
+                result = subprocess.run(
+                    [str(binary), "0", "1", "16384", "8192"], cwd=ROOT,
+                    env=dict(clean, **{mode: "0", lower: "16k", upper: "8k"}),
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     @unittest.skipUnless(os.environ.get("SOS_TEST_M4_SYNTAX") == "1",
                          "fresh M4/compiler execution requires explicit opt-in")
     def test_generated_signal_bindings_syntax(self):
@@ -268,8 +316,6 @@ class TxCompleteTransportTest(unittest.TestCase):
             ("bad-completion", "Unrecognized completion object"),
             ("foreign-marker", "Unrecognized completion object"),
             ("wrong-marker", "Unrecognized completion object"),
-            ("oversize", "exceeds provider max_msg_size"),
-            ("oversize-small", "exceeds provider max_msg_size"),
         ):
             with self.subTest(case=case):
                 self.run_case(case, status=1, diagnostic=diagnostic)

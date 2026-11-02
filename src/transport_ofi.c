@@ -229,6 +229,8 @@ void shmem_transport_ofi_cxi_tx_complete_put_locked(shmem_transport_ctx_t *ctx,
     if (!len) return;
     if (len > shmem_transport_ofi_max_msg_size)
         RAISE_ERROR_STR("OFI_CXI_TX_COMPLETE_PUTS full-width put exceeds provider max_msg_size");
+    if (!shmem_transport_ofi_cxi_tx_complete_use_put(len))
+        RAISE_ERROR_STR("Experimental CXI put called outside the configured size window");
 
     struct shmem_transport_ofi_cxi_tx_complete_peer *peer;
     if (ctx->cxi_tx_complete_peers_hashed) {
@@ -281,13 +283,20 @@ void shmem_transport_ofi_cxi_tx_complete_put_locked(shmem_transport_ctx_t *ctx,
     };
     uint64_t polled = 0;
     int ret;
+    bool inject = len <= shmem_transport_ofi_max_buffered_send;
+    uint64_t flags = inject ? FI_INJECT : FI_TRANSMIT_COMPLETE;
     SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
     do {
-        ret = fi_writemsg(ctx->ep, &msg, FI_TRANSMIT_COMPLETE);
-        shmem_transport_ofi_cxi_tx_complete_check_post(ret, "payload", len, pe,
-                                                       FI_TRANSMIT_COMPLETE);
+        if (inject)
+            ret = fi_inject_write(ctx->ep, source, len, GET_DEST(pe),
+                                  (uint64_t) address, key);
+        else
+            ret = fi_writemsg(ctx->ep, &msg, flags);
+        shmem_transport_ofi_cxi_tx_complete_check_post(ret,
+                                                       inject ? "injection" : "payload",
+                                                       len, pe, flags);
     } while (try_again(ctx, ret, &polled));
-    if (source_reuse_wait)
+    if (source_reuse_wait && !inject)
         shmem_transport_ofi_cxi_tx_complete_wait_locked(ctx);
 }
 
@@ -2127,7 +2136,11 @@ int shmem_transport_init(void)
     if (shmem_transport_ofi_cxi_tx_complete_puts) {
         shmem_transport_ofi_cxi_tx_complete_validate(shmem_transport_ofi_info.p_info);
         if (shmem_internal_my_pe == 0)
-            RAISE_WARN_STR("Experimental CXI full-width transmit-complete puts enabled; remote visibility is not qualified");
+            RAISE_WARN_MSG("Experimental CXI TX-complete size window enabled: (%zu, %zu] B;"
+                           " native injection <= %zu B preserved; remote visibility is not qualified\n",
+                           shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS_LOWER_CUTOFF,
+                           shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS_UPPER_CUTOFF,
+                           shmem_transport_ofi_max_buffered_send);
     }
 
     ret = allocate_fabric_resources(&shmem_transport_ofi_info);

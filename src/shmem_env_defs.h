@@ -90,6 +90,10 @@ SHMEM_INTERNAL_ENV_DEF(CMA_GET_MAX, size, 16*1024, SHMEM_INTERNAL_ENV_CAT_INTRAN
 
 SHMEM_INTERNAL_ENV_DEF(OFI_CXI_TX_COMPLETE_PUTS, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Experimental CXI full-width transmit-complete puts; requires OFI; remote visibility unqualified")
+SHMEM_INTERNAL_ENV_DEF(OFI_CXI_TX_COMPLETE_PUTS_LOWER_CUTOFF, size, 1024, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Exclusive lower size cutoff for experimental CXI TX-complete puts; native injection takes precedence")
+SHMEM_INTERNAL_ENV_DEF(OFI_CXI_TX_COMPLETE_PUTS_UPPER_CUTOFF, size, 8192, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Inclusive upper size cutoff for experimental CXI TX-complete puts; larger puts use the original path")
 
 #ifdef USE_OFI
 SHMEM_INTERNAL_ENV_DEF(OFI_ATOMIC_CHECKS_WARN, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,

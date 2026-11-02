@@ -178,6 +178,13 @@ int shmem_internal_parse_env(void) {
     if (shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS)
         RAISE_ERROR_STR("SHMEM_OFI_CXI_TX_COMPLETE_PUTS requires an OFI build with the CXI provider");
 #endif
+    if (shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS &&
+        shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS_LOWER_CUTOFF >=
+        shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS_UPPER_CUTOFF)
+        RAISE_ERROR_MSG("OFI_CXI_TX_COMPLETE_PUTS requires LOWER_CUTOFF < UPPER_CUTOFF"
+                        " (got %zu and %zu)\n",
+                        shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS_LOWER_CUTOFF,
+                        shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS_UPPER_CUTOFF);
     return 0;
 }
 

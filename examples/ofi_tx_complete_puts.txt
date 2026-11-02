@@ -8,14 +8,30 @@ that older switch does not enable this mode.
 
 Network bulk puts:
 
-* Every nonempty bulk put posts one full-width fi_writemsg with
-  FI_TRANSMIT_COMPLETE, without FI_INJECT, FI_MORE or size-class chunking.
-* Blocking puts wait for the context's issued-write counter before returning,
-  making their source reusable. This is source completion, not remote delivery.
-* Nonblocking puts do not wait during posting. Their source must remain valid
-  and unchanged until completion through quiet or another completing operation.
-* Sizes exceeding the provider's max_msg_size fail explicitly; the experimental
-  path does not silently fragment them. Zero-length bulk puts post nothing.
+* Native injection always takes precedence for sizes <= the provider's
+  inject_size (or is disabled when the configured injection limit is zero).
+  These use the original fi_inject_write call, with immediate source reuse
+  and no per-put wait. Delivery is tracked for quiet alongside TX-complete puts.
+* Above the injection limit, sizes in the configured window post one full-width
+  fi_writemsg with FI_TRANSMIT_COMPLETE, without FI_INJECT or FI_MORE.
+  Blocking puts wait for source reuse, not remote delivery. Nonblocking puts
+  defer the wait; their source must remain unchanged until completion.
+* Outside that window, blocking puts retain the original conditional bounce
+  buffering or direct-write path; nonblocking puts retain the direct-write path.
+* Puts exceeding max_msg_size use the original provider-limit fragmentation,
+  even when the configured upper cutoff is larger. They no longer abort merely
+  for exceeding one provider message. Zero-length bulk puts post nothing.
+
+Size-window controls (bytes; standard size suffixes and SMA aliases supported):
+
+* SHMEM_OFI_CXI_TX_COMPLETE_PUTS_LOWER_CUTOFF=1024 (exclusive)
+* SHMEM_OFI_CXI_TX_COMPLETE_PUTS_UPPER_CUTOFF=8192 (inclusive)
+* With the mode enabled, lower must be less than upper. A lower cutoff of zero
+  permits all non-injected sizes through the upper cutoff. Cutoffs are not used
+  for routing when the mode is disabled.
+* Default policy: original through 1 KiB, full-width TX-complete above 1 KiB
+  through 8 KiB, original above 8 KiB, with native injection always preserved.
+  This window is a tuning hypothesis, not a qualified optimum.
 
 Delivery and ordering:
 
@@ -26,7 +42,9 @@ Delivery and ordering:
 * Pending peers are sparse per context. One cached peer record needs no hash;
   a second peer promotes the active set to a hash. Overflow/hash storage is
   freed on drain and the cached record on destruction. Different sizes to the
-  same peer coalesce without a size-change drain.
+  same peer coalesce without a size-change drain. Original direct-write fallback
+  drains pending weak writes before posting; bounce-buffer completion can coexist
+  with identified delivery markers.
 * Fence, dependent controls, shared-memory transitions and context destruction
   drain pending delivery. Scalar, signal and atomic controls retain strong
   completion. Blocking put-with-signal payloads remain delivery-complete.
