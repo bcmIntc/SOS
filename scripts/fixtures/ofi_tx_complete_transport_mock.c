@@ -52,6 +52,7 @@ long shmem_internal_heap_length;
 void *shmem_internal_data_base;
 long shmem_internal_data_length;
 struct shmem_internal_params_s shmem_internal_params;
+uint64_t (*shmem_internal_gettid_fn)(void);
 
 static const char *test_case;
 
@@ -67,6 +68,14 @@ void shmem_runtime_abort(int status, const char message[])
 {
     (void) message;
     exit(status);
+}
+
+shmem_free_list_t *shmem_free_list_init(size_t element_size,
+                                       shmem_free_list_item_init_fn_t init_fn,
+                                       size_t max_pool_cnt)
+{
+    CHECK(!"startup fixture must stop before bounce-pool allocation");
+    return NULL;
 }
 
 int shmem_free_list_more(shmem_free_list_t *pool)
@@ -136,6 +145,7 @@ struct mock {
     unsigned event_count, operation_count, accepted, waits, cq_successes;
     unsigned closes, retry_count, retry_progress;
     uint64_t completed, get_completed;
+    uint64_t caps;
     bool delivery_peers[PES], flush_waited;
     void *flush_context, *rogue_context;
     bool rogue;
@@ -279,6 +289,8 @@ static ssize_t write_message(struct fid_ep *ep, const struct fi_msg_rma *msg,
                              uint64_t flags)
 {
     struct mock *mock = from_ep(ep);
+    if ((flags & FI_FENCE) && !(mock->caps & FI_FENCE))
+        return -FI_EINVAL;
     CHECK(msg->iov_count == 1 && msg->rma_iov_count == 1);
     size_t len = msg->msg_iov[0].iov_len;
     CHECK(msg->rma_iov[0].len == len);
@@ -474,8 +486,10 @@ static void init_mock(struct mock *mock)
     mock->ctx.put_cntr = &mock->put;
     mock->ctx.get_cntr = &mock->get;
 #ifndef SOS_MOCK_BASELINE
-    if (shmem_transport_ofi_cxi_tx_complete_puts)
+    if (shmem_transport_ofi_cxi_tx_complete_puts) {
+        mock->caps = FI_FENCE;
         mock->ctx.cxi_tx_complete_flush_frag.mytype = SHMEM_TRANSPORT_OFI_TYPE_TX_COMPLETE_FLUSH;
+    }
 #endif
 #ifdef USE_CTX_LOCK
     SHMEM_MUTEX_INIT(mock->ctx.lock);
@@ -1016,6 +1030,12 @@ static void reject_errors(const char *name)
     else
         bulk(&mock, 256, heap + 32768, 193, 1, true);
     if (!strcmp(name, "error-flush")) mock.error_kind = 'F';
+    if (!strcmp(name, "missing-fence")) mock.caps = 0;
+    if (!strcmp(name, "error-control")) {
+        mock.error_kind = 'P';
+        shmem_transport_ofi_put_control(&mock.ctx, heap + 512, heap + 32768, 8, 1);
+        CHECK(!"control error must abort");
+    }
     if (!strcmp(name, "error-wait")) mock.wait_error = true;
     if (!strcmp(name, "error-counter")) mock.counter_error = true;
     if (!strcmp(name, "error-cq")) mock.cq_error = true;
@@ -1036,7 +1056,7 @@ static void reject_errors(const char *name)
 
 static void validate_provider(const char *name)
 {
-    struct fi_tx_attr tx = { .inject_size = 192 };
+    struct fi_tx_attr tx = { .inject_size = 192, .caps = FI_FENCE };
     struct fi_rx_attr rx = {0};
     struct fi_domain_attr domain = {
         .mr_mode = FI_MR_ENDPOINT, .threading = FI_THREAD_SAFE
@@ -1048,6 +1068,7 @@ static void validate_provider(const char *name)
     };
     shmem_transport_ofi_max_msg_size = 8192;
     if (!strcmp(name, "gate-provider")) fabric.prov_name = "tcp";
+    if (!strcmp(name, "gate-fence")) tx.caps = 0;
     if (!strcmp(name, "gate-context")) selected.mode = FI_CONTEXT;
     if (!strcmp(name, "gate-context2")) selected.mode = FI_CONTEXT2;
     if (!strcmp(name, "gate-tx-context")) tx.mode = FI_CONTEXT;
@@ -1125,13 +1146,44 @@ static void disabled_controls(void)
 }
 
 static uint64_t startup_flags;
+static uint64_t startup_caps, startup_tx_caps, query_caps;
+static bool startup_stop_at_endpoint;
 static enum fi_cq_format startup_cq_format;
 static struct fid_ep startup_ep;
+static struct fid_cntr startup_counter;
+
+int fi_getinfo(uint32_t version, const char *node, const char *service,
+               uint64_t flags, const struct fi_info *hints, struct fi_info **info)
+{
+    query_caps = hints->caps;
+    return -FI_EIO;
+}
+
+static void query_capabilities(void)
+{
+    struct fabric_info info = {0};
+    bool enabled = false;
+#ifndef SOS_MOCK_BASELINE
+    enabled = shmem_transport_ofi_cxi_tx_complete_puts;
+    shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS = enabled;
+#endif
+    CHECK(query_for_fabric(&info) == -FI_EIO);
+#ifdef USE_FI_FENCE
+    CHECK(query_caps & FI_FENCE);
+#else
+    CHECK(!!(query_caps & FI_FENCE) == enabled);
+#endif
+    printf("query_caps:%" PRIu64 "\n", query_caps);
+}
 
 static int startup_endpoint(struct fid_domain *domain, struct fi_info *info,
                              struct fid_ep **ep, void *context)
 {
     startup_flags = info->tx_attr->op_flags;
+    startup_caps = info->caps;
+    startup_tx_caps = info->tx_attr->caps;
+    if (startup_stop_at_endpoint)
+        return -FI_EIO;
     startup_ep.fid.ops = &fid_ops;
     *ep = &startup_ep;
     return 0;
@@ -1146,7 +1198,18 @@ static int startup_cq_open(struct fid_domain *domain, struct fi_cq_attr *attr,
                            struct fid_cq **cq, void *context)
 {
     startup_cq_format = attr->format;
+    if (startup_stop_at_endpoint) {
+        *cq = &progress_cq;
+        return 0;
+    }
     return -FI_EIO;
+}
+
+static int startup_cntr_open(struct fid_domain *domain, struct fi_cntr_attr *attr,
+                             struct fid_cntr **counter, void *context)
+{
+    *counter = &startup_counter;
+    return 0;
 }
 
 static void startup(void)
@@ -1156,7 +1219,8 @@ static void startup(void)
     struct fi_ep_attr ep = {0};
     struct fi_info info = { .tx_attr = &tx, .rx_attr = &rx, .ep_attr = &ep };
     struct fi_ops_domain domain_ops = {
-        .endpoint = startup_endpoint, .cq_open = startup_cq_open
+        .endpoint = startup_endpoint, .cq_open = startup_cq_open,
+        .cntr_open = startup_cntr_open
     };
     struct fid_domain domain = { .ops = &domain_ops };
     struct fid_av av = {0};
@@ -1170,6 +1234,8 @@ static void startup(void)
     if (shmem_transport_ofi_cxi_tx_complete_puts) {
         CHECK(startup_flags == FI_DELIVERY_COMPLETE);
         CHECK(startup_cq_format == FI_CQ_FORMAT_CONTEXT);
+        CHECK(startup_caps & FI_FENCE);
+        CHECK(startup_tx_caps & FI_FENCE);
     } else
 #endif
     {
@@ -1177,6 +1243,17 @@ static void startup(void)
         CHECK(startup_cq_format == FI_CQ_FORMAT_UNSPEC);
     }
     printf("startup:%" PRIu64 ":%d\n", startup_flags, startup_cq_format);
+    startup_stop_at_endpoint = true;
+    struct mock mock = {0};
+    CHECK(shmem_transport_ofi_ctx_init(&mock.ctx, 1) == -FI_EIO);
+#ifndef SOS_MOCK_BASELINE
+    CHECK(!!(startup_caps & FI_FENCE) == shmem_transport_ofi_cxi_tx_complete_puts);
+    CHECK(!!(startup_tx_caps & FI_FENCE) == shmem_transport_ofi_cxi_tx_complete_puts);
+#else
+    CHECK(!(startup_caps & FI_FENCE) && !(startup_tx_caps & FI_FENCE));
+#endif
+    printf("ctx_caps:%" PRIu64 ":%" PRIu64 "\n", startup_caps, startup_tx_caps);
+    destroy_mock_lock(&mock);
 }
 
 #ifndef SOS_MOCK_BASELINE
@@ -1239,8 +1316,10 @@ int main(int argc, char **argv)
     if (!strcmp(test_case, "disabled")) disabled();
     else if (!strcmp(test_case, "disabled-controls")) disabled_controls();
     else if (!strcmp(test_case, "disabled-startup")) startup();
+    else if (!strcmp(test_case, "disabled-query")) query_capabilities();
 #ifndef SOS_MOCK_BASELINE
     else if (!strcmp(test_case, "enabled-startup")) startup();
+    else if (!strcmp(test_case, "enabled-query")) query_capabilities();
     else if (!strcmp(test_case, "disabled-put-helper") ||
              !strcmp(test_case, "disabled-drain-helper") ||
              !strcmp(test_case, "disabled-control-helper")) reject_disabled_helper(test_case);

@@ -37,6 +37,8 @@ Delivery and ordering:
 Admission and limits:
 
 * Requires OFI with the CXI provider and a nonzero maximum message size.
+  FI_FENCE is requested during provider selection and enabled on shared
+  default and separate transmit endpoints for delivery markers.
   FI_CONTEXT/FI_CONTEXT2, FI_MR_LOCAL and HMEM are rejected explicitly.
 * The disabled path preserves baseline endpoint flags and provider calls; it
   does not allocate peer state, initialize extra locks or issue delivery markers.

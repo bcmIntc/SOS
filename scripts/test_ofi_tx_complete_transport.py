@@ -156,7 +156,7 @@ class TxCompleteTransportTest(unittest.TestCase):
 
     def test_disabled_provider_traces_match_performance_base(self):
         for name, binary in self.binaries:
-            for case in ("disabled", "disabled-controls", "disabled-startup"):
+            for case in ("disabled", "disabled-controls", "disabled-startup", "disabled-query"):
                 with self.subTest(configuration=name, case=case):
                     outputs = []
                     for candidate in (self.baseline_binaries[name], binary):
@@ -171,6 +171,10 @@ class TxCompleteTransportTest(unittest.TestCase):
 
     def test_startup_completion_configuration_is_opt_in(self):
         self.run_case("enabled-startup")
+
+    def test_provider_query_requests_fence_only_for_enabled_mode(self):
+        self.run_case("enabled-query")
+        self.run_case("disabled-query")
 
     def test_direct_experimental_helpers_reject_disabled_mode(self):
         for case in ("disabled-put-helper", "disabled-drain-helper", "disabled-control-helper"):
@@ -238,6 +242,7 @@ class TxCompleteTransportTest(unittest.TestCase):
             self.run_case(case)
         for case, diagnostic in (
             ("gate-provider", "requires the CXI provider"),
+            ("gate-fence", "requires FI_FENCE transmit capability"),
             ("gate-context", "FI_CONTEXT or FI_CONTEXT2"),
             ("gate-context2", "FI_CONTEXT or FI_CONTEXT2"),
             ("gate-tx-context", "FI_CONTEXT or FI_CONTEXT2"),
@@ -253,8 +258,10 @@ class TxCompleteTransportTest(unittest.TestCase):
 
     def test_provider_errors_and_unknown_completions_are_rejected(self):
         for case, diagnostic in (
-            ("error-payload", "OFI error"),
-            ("error-flush", "OFI error"),
+            ("error-payload", "TX-complete payload failed: pe=1 len=193 flags="),
+            ("error-flush", "TX-complete delivery flush failed: pe=1 len=0 flags="),
+            ("error-control", "TX-complete control failed: pe=1 len=8 flags="),
+            ("missing-fence", "OFI error -22"),
             ("error-wait", "OFI error"),
             ("error-counter", "counter reports an operation error"),
             ("error-cq", "OFI error"),

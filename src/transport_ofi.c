@@ -125,6 +125,8 @@ static void shmem_transport_ofi_cxi_tx_complete_validate(const struct fi_info *s
 {
     if (strcmp(selected->fabric_attr->prov_name, "cxi"))
         RAISE_ERROR_STR("OFI_CXI_TX_COMPLETE_PUTS requires the CXI provider");
+    if (!(selected->tx_attr->caps & FI_FENCE))
+        RAISE_ERROR_STR("OFI_CXI_TX_COMPLETE_PUTS requires FI_FENCE transmit capability");
     if ((selected->mode | selected->tx_attr->mode | selected->rx_attr->mode) &
         (FI_CONTEXT | FI_CONTEXT2))
         RAISE_ERROR_STR("OFI_CXI_TX_COMPLETE_PUTS does not support FI_CONTEXT or FI_CONTEXT2");
@@ -169,6 +171,17 @@ static void shmem_transport_ofi_cxi_tx_complete_wait_locked(shmem_transport_ctx_
     shmem_transport_ofi_cxi_tx_complete_progress_locked(ctx);
 }
 
+static void shmem_transport_ofi_cxi_tx_complete_check_post(int ret,
+                                                          const char *operation,
+                                                          size_t len, int pe,
+                                                          uint64_t flags)
+{
+    if (ret && ret != -FI_EAGAIN)
+        RAISE_ERROR_MSG("CXI TX-complete %s failed: pe=%d len=%zu flags=%#" PRIx64
+                        ": OFI error %d: %s\n",
+                        operation, pe, len, flags, ret, fi_strerror(-ret));
+}
+
 void shmem_transport_ofi_cxi_tx_complete_drain_locked(shmem_transport_ctx_t *ctx)
 {
     if (!shmem_transport_ofi_cxi_tx_complete_puts)
@@ -184,13 +197,15 @@ void shmem_transport_ofi_cxi_tx_complete_drain_locked(shmem_transport_ctx_t *ctx
         };
         uint64_t polled = 0;
         int ret;
+        const uint64_t flags = FI_FENCE | FI_DELIVERY_COMPLETE | FI_COMPLETION;
         ctx->cxi_tx_complete_flush_completed = false;
         SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
         do {
             /* Fence makes this peer's earlier payloads visible before the
              * delivery-complete marker, not merely source-safe. */
-            ret = fi_writemsg(ctx->ep, &msg,
-                              FI_FENCE | FI_DELIVERY_COMPLETE | FI_COMPLETION);
+            ret = fi_writemsg(ctx->ep, &msg, flags);
+            shmem_transport_ofi_cxi_tx_complete_check_post(ret, "delivery flush",
+                                                           0, peer->pe, flags);
         } while (try_again(ctx, ret, &polled));
         shmem_transport_ofi_cxi_tx_complete_wait_locked(ctx);
         while (!ctx->cxi_tx_complete_flush_completed)
@@ -269,6 +284,8 @@ void shmem_transport_ofi_cxi_tx_complete_put_locked(shmem_transport_ctx_t *ctx,
     SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
     do {
         ret = fi_writemsg(ctx->ep, &msg, FI_TRANSMIT_COMPLETE);
+        shmem_transport_ofi_cxi_tx_complete_check_post(ret, "payload", len, pe,
+                                                       FI_TRANSMIT_COMPLETE);
     } while (try_again(ctx, ret, &polled));
     if (source_reuse_wait)
         shmem_transport_ofi_cxi_tx_complete_wait_locked(ctx);
@@ -304,6 +321,8 @@ void shmem_transport_ofi_put_control(shmem_transport_ctx_t *ctx, void *target,
         SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
         do {
             ret = fi_writemsg(ctx->ep, &msg, FI_DELIVERY_COMPLETE);
+            shmem_transport_ofi_cxi_tx_complete_check_post(ret, "control", chunk, pe,
+                                                           FI_DELIVERY_COMPLETE);
         } while (try_again(ctx, ret, &polled));
         sent += chunk;
     }
@@ -1690,6 +1709,8 @@ int query_for_fabric(struct fabric_info *info)
                                    ordering semantics to fi_atomicmsg
                                    for put with signal implementation */
 #endif
+    if (shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS)
+        hints.caps |= FI_FENCE;
 #ifdef USE_FI_HMEM
     hints.caps |= FI_HMEM;
 #endif
@@ -1903,6 +1924,10 @@ static int shmem_transport_ofi_target_ep_init(void)
     info->p_info->tx_attr->mode = 0;
     info->p_info->rx_attr->mode = 0;
     info->p_info->tx_attr->caps = FI_RMA | FI_ATOMIC;
+    if (shmem_transport_ofi_cxi_tx_complete_puts) {
+        info->p_info->caps |= FI_FENCE;
+        info->p_info->tx_attr->caps |= FI_FENCE;
+    }
     info->p_info->rx_attr->caps = info->p_info->caps;
 
     ret = fi_endpoint(shmem_transport_ofi_domainfd,
@@ -1969,6 +1994,8 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
 
     info->p_info->ep_attr->tx_ctx_cnt = shmem_transport_ofi_stx_max > 0 ? FI_SHARED_CONTEXT : 0;
     info->p_info->caps = FI_RMA | FI_WRITE | FI_READ | FI_ATOMIC | FI_RECV;
+    if (shmem_transport_ofi_cxi_tx_complete_puts)
+        info->p_info->caps |= FI_FENCE;
     info->p_info->tx_attr->op_flags = FI_DELIVERY_COMPLETE;
     info->p_info->mode = 0;
     info->p_info->tx_attr->mode = 0;
