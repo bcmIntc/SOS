@@ -325,12 +325,8 @@ static ssize_t inject_write(struct fid_ep *ep, const void *source, size_t len,
     record(mock, kind, source, len, destination, address, key, 0);
     ++mock->accepted;
     if (len) {
-        uint64_t flags = FI_DELIVERY_COMPLETE | FI_INJECT;
-#ifndef SOS_MOCK_BASELINE
-        if (shmem_transport_ofi_cxi_tx_complete_puts)
-            flags = FI_TRANSMIT_COMPLETE | FI_INJECT;
-#endif
-        queue_data(mock, source, len, destination, address, key, flags);
+        queue_data(mock, source, len, destination, address, key,
+                   FI_DELIVERY_COMPLETE | FI_INJECT);
     }
     return 0;
 }
@@ -597,7 +593,7 @@ static void boundaries(void)
                 bulk(&mock, 256, source, len, 2, nbi);
                 unsigned pieces = !!len;
                 CHECK(mock.accepted == pieces);
-                bool inject = len && len <= 192;
+                bool inject = len && len <= shmem_transport_ofi_max_buffered_send;
                 CHECK(mock.waits == (unsigned) (len && !inject && !nbi));
                 for (unsigned i = 0; i < pieces; ++i) {
                     const struct event *event = &mock.events[i];
@@ -610,11 +606,11 @@ static void boundaries(void)
                 /* TX completion permits source reuse but not target visibility.
                  * NBI sources remain live until quiet. */
                 if (!nbi || inject) memset(source, 0xee, len);
-                if (len) CHECK(remote[2][256] == 0);
+                if (len && !inject) CHECK(remote[2][256] == 0);
                 if (nbi) CHECK(mock.completed == 0);
                 reset_trace(&mock);
                 shmem_transport_put_quiet(&mock.ctx);
-                expect_trace(&mock, !len ? "W" : "FW");
+                expect_trace(&mock, !len || inject ? "W" : "FW");
                 for (unsigned i = 0; i < mock.event_count; ++i) {
                     const struct event *event = &mock.events[i];
                     if (event->kind != 'F') continue;
@@ -624,7 +620,7 @@ static void boundaries(void)
                 }
                 CHECK(memcmp(remote[2] + 256, saved, len) == 0);
                 expect_accounted(&mock);
-                CHECK(mock.cq_successes == (unsigned) (len != 0));
+                CHECK(mock.cq_successes == (unsigned) (len != 0 && !inject));
                 unsigned cq_before = mock.cq_successes;
                 reset_trace(&mock);
                 shmem_transport_put_quiet(&mock.ctx);
@@ -685,7 +681,8 @@ static void hybrid_window(void)
                 if (!nbi || kind == 'S') memset(source, 0xee, len);
                 reset_trace(&mock);
                 shmem_transport_put_quiet(&mock.ctx);
-                expect_trace(&mock, kind == 'L' ? "W" : "FW");
+                expect_trace(&mock, kind == 'P' ? "FW" : "W");
+                if (kind != 'P') CHECK(!mock.ctx.cxi_tx_complete_peer_cache);
                 CHECK(!memcmp(remote[2] + 256, saved, len));
                 expect_accounted(&mock);
                 destroy_mock_lock(&mock);
@@ -727,6 +724,27 @@ static void hybrid_bounce(void)
     expect_accounted(&mock);
     mock.ctx.bounce_buffers = NULL;
     free(buffer);
+    destroy_mock_lock(&mock);
+}
+
+static void hybrid_injection_ordering(void)
+{
+    struct mock mock;
+    init_mock(&mock);
+    shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS_LOWER_CUTOFF = 1024;
+    shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS_UPPER_CUTOFF = 8192;
+    memset(heap + 32768, 0x6b, 4096);
+    bulk(&mock, 4096, heap + 32768, 4096, 1, true);
+    CHECK(pending_peer_count(&mock) == 1);
+    reset_trace(&mock);
+    bulk(&mock, 256, heap + 32768, 16, 2, false);
+    expect_trace(&mock, "FWS");
+    CHECK(!pending_peer_count(&mock));
+    CHECK(!memcmp(remote[1] + 4096, heap + 32768, 4096));
+    reset_trace(&mock);
+    shmem_transport_put_quiet(&mock.ctx);
+    expect_trace(&mock, "W");
+    expect_accounted(&mock);
     destroy_mock_lock(&mock);
 }
 
@@ -916,8 +934,12 @@ static void controls(void)
         if (!strcmp(operations[i], "scalar")) {
             shmem_internal_put_scalar((shmem_ctx_t) &mock.ctx, heap + 256,
                                       heap + 32768, 8, 2);
+#ifdef DISABLE_OFI_INJECT
             expect_trace(&mock, "FWPW");
             CHECK(mock.events[2].flags == FI_DELIVERY_COMPLETE);
+#else
+            expect_trace(&mock, "FWS");
+#endif
         } else if (!strcmp(operations[i], "fallback")) {
             shmem_transport_ofi_put_control(&mock.ctx, heap + 256, heap + 32768, 8, 2);
             expect_trace(&mock, "FWPW");
@@ -1431,6 +1453,10 @@ int main(int argc, char **argv)
     shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS_UPPER_CUTOFF = 32768;
     if (strncmp(test_case, "disabled", 8))
         shmem_transport_ofi_cxi_tx_complete_puts = true;
+    if (!strcmp(test_case, "boundaries") ||
+        !strcmp(test_case, "mixed") ||
+        !strcmp(test_case, "peer-cache"))
+        shmem_transport_ofi_max_buffered_send = 0;
 #endif
     SHMEM_Dtsize[FI_UINT64] = sizeof(uint64_t);
     rma_ops.writemsg = write_message;
@@ -1453,6 +1479,11 @@ int main(int argc, char **argv)
     else if (!strcmp(test_case, "disabled-startup")) startup();
     else if (!strcmp(test_case, "disabled-query")) query_capabilities();
 #ifndef SOS_MOCK_BASELINE
+    else if (!strcmp(test_case, "enabled-original")) {
+        shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS_LOWER_CUTOFF = 32768;
+        shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS_UPPER_CUTOFF = 65536;
+        disabled();
+    }
     else if (!strcmp(test_case, "enabled-startup")) startup();
     else if (!strcmp(test_case, "enabled-query")) query_capabilities();
     else if (!strcmp(test_case, "disabled-put-helper") ||
@@ -1461,6 +1492,7 @@ int main(int argc, char **argv)
     else if (!strcmp(test_case, "boundaries")) boundaries();
     else if (!strcmp(test_case, "hybrid-window")) hybrid_window();
     else if (!strcmp(test_case, "hybrid-bounce")) hybrid_bounce();
+    else if (!strcmp(test_case, "hybrid-injection-ordering")) hybrid_injection_ordering();
     else if (!strcmp(test_case, "hybrid-fragmentation")) hybrid_fragmentation();
     else if (!strcmp(test_case, "mixed")) mixed();
     else if (!strcmp(test_case, "peer-cache")) peer_cache();

@@ -385,10 +385,10 @@ extern bool shmem_transport_ofi_cxi_tx_complete_puts;
 static inline bool shmem_transport_ofi_cxi_tx_complete_use_put(size_t len)
 {
     return shmem_transport_ofi_cxi_tx_complete_puts &&
-           (len <= shmem_transport_ofi_max_buffered_send ||
-            (len > shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS_LOWER_CUTOFF &&
-             len <= shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS_UPPER_CUTOFF &&
-             len <= shmem_transport_ofi_max_msg_size));
+           len > shmem_transport_ofi_max_buffered_send &&
+           len > shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS_LOWER_CUTOFF &&
+           len <= shmem_internal_params.OFI_CXI_TX_COMPLETE_PUTS_UPPER_CUTOFF &&
+           len <= shmem_transport_ofi_max_msg_size;
 }
 
 void shmem_transport_ofi_cxi_tx_complete_put_locked(shmem_transport_ctx_t *ctx,
@@ -686,11 +686,6 @@ static inline
 void shmem_transport_put_scalar(shmem_transport_ctx_t* ctx, void *target, const
                                void *source, size_t len, int pe)
 {
-    if (shmem_transport_ofi_cxi_tx_complete_puts) {
-        shmem_transport_ofi_put_control(ctx, target, source, len, pe);
-        return;
-    }
-
     int ret = 0;
     uint64_t dst = (uint64_t) pe;
     uint64_t polled = 0;
@@ -702,6 +697,8 @@ void shmem_transport_put_scalar(shmem_transport_ctx_t* ctx, void *target, const
     shmem_internal_assert(len <= shmem_transport_ofi_max_buffered_send);
 
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
+    if (shmem_transport_ofi_cxi_tx_complete_puts && ctx->cxi_tx_complete_peers)
+        shmem_transport_ofi_cxi_tx_complete_drain_locked(ctx);
     SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
 
     do {

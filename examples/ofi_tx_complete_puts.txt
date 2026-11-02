@@ -11,7 +11,8 @@ Network bulk puts:
 * Native injection always takes precedence for sizes <= the provider's
   inject_size (or is disabled when the configured injection limit is zero).
   These use the original fi_inject_write call, with immediate source reuse
-  and no per-put wait. Delivery is tracked for quiet alongside TX-complete puts.
+  and no per-put wait. Injected puts do not allocate experimental peer records
+  or add delivery markers. Their original quiet semantics are unchanged.
 * Above the injection limit, sizes in the configured window post one full-width
   fi_writemsg with FI_TRANSMIT_COMPLETE, without FI_INJECT or FI_MORE.
   Blocking puts wait for source reuse, not remote delivery. Nonblocking puts
@@ -36,7 +37,7 @@ Size-window controls (bytes; standard size suffixes and SMA aliases supported):
 Delivery and ordering:
 
 * Quiet posts one zero-byte FI_FENCE | FI_DELIVERY_COMPLETE | FI_COMPLETION
-  write per pending peer on the same endpoint as its payloads, then waits for
+  write per pending TX-complete peer on the same endpoint as its payloads, then waits for
   the counter and identified CQ completion. FI_FENCE orders prior writes to
   that peer before the delivery marker; TX completion alone is not sufficient.
 * Pending peers are sparse per context. One cached peer record needs no hash;
@@ -49,6 +50,11 @@ Delivery and ordering:
   drain pending delivery. Scalar, signal and atomic controls retain strong
   completion. Blocking put-with-signal payloads remain delivery-complete.
   On-node puts retain the shared-memory transport.
+* An injected operation following pending feature puts drains those feature
+  puts first when needed for ordering; it still uses the original injection
+  call and does not create new experimental delivery state. Injection-only
+  traffic uses the original counter-based quiet. This feature does not fix or
+  qualify pre-existing injection/quiet visibility semantics.
 * Context metadata uses the existing lock or a feature-only supplemental mutex.
   SHMEM_THREAD_MULTIPLE requires the provider's FI_THREAD_SAFE contract.
 

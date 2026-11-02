@@ -283,20 +283,13 @@ void shmem_transport_ofi_cxi_tx_complete_put_locked(shmem_transport_ctx_t *ctx,
     };
     uint64_t polled = 0;
     int ret;
-    bool inject = len <= shmem_transport_ofi_max_buffered_send;
-    uint64_t flags = inject ? FI_INJECT : FI_TRANSMIT_COMPLETE;
     SHMEM_TRANSPORT_OFI_CNTR_INC(&ctx->pending_put_cntr);
     do {
-        if (inject)
-            ret = fi_inject_write(ctx->ep, source, len, GET_DEST(pe),
-                                  (uint64_t) address, key);
-        else
-            ret = fi_writemsg(ctx->ep, &msg, flags);
-        shmem_transport_ofi_cxi_tx_complete_check_post(ret,
-                                                       inject ? "injection" : "payload",
-                                                       len, pe, flags);
+        ret = fi_writemsg(ctx->ep, &msg, FI_TRANSMIT_COMPLETE);
+        shmem_transport_ofi_cxi_tx_complete_check_post(ret, "payload", len, pe,
+                                                       FI_TRANSMIT_COMPLETE);
     } while (try_again(ctx, ret, &polled));
-    if (source_reuse_wait && !inject)
+    if (source_reuse_wait)
         shmem_transport_ofi_cxi_tx_complete_wait_locked(ctx);
 }
 

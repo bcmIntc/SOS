@@ -141,7 +141,8 @@ class TxCompleteTransportTest(unittest.TestCase):
         self.run_case("boundaries")
 
     def test_hybrid_cutoffs_injection_bounce_and_provider_fragmentation(self):
-        for case in ("hybrid-window", "hybrid-bounce", "hybrid-fragmentation"):
+        for case in ("hybrid-window", "hybrid-bounce", "hybrid-fragmentation",
+                     "hybrid-injection-ordering"):
             self.run_case(case)
 
     def test_mixed_peers_repeated_destinations_and_context_isolation(self):
@@ -175,6 +176,19 @@ class TxCompleteTransportTest(unittest.TestCase):
 
     def test_startup_completion_configuration_is_opt_in(self):
         self.run_case("enabled-startup")
+
+    def test_enabled_outside_window_matches_original_put_traces(self):
+        for name, binary in self.binaries:
+            outputs = []
+            for candidate, case in ((self.baseline_binaries[name], "disabled"),
+                                    (binary, "enabled-original")):
+                result = subprocess.run(
+                    [str(candidate), case], cwd=ROOT, env=self.environment,
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                outputs.append(result.stdout)
+            self.assertEqual(outputs[0], outputs[1], name)
 
     def test_provider_query_requests_fence_only_for_enabled_mode(self):
         self.run_case("enabled-query")
