@@ -1,0 +1,52 @@
+Experimental full-width CXI transmit-complete puts
+=================================================
+
+Enable with SHMEM_OFI_CXI_TX_COMPLETE_PUTS=1. Default: off.
+SHMEM_OFI_CXI_TX_COMPLETE_PUTS=0 overrides SMA_OFI_CXI_TX_COMPLETE_PUTS=1.
+This is separate from SHMEM_OFI_CXI_CRAY_PUTS on the chunking branch;
+that older switch does not enable this mode.
+
+Network bulk puts:
+
+* Every nonempty bulk put posts one full-width fi_writemsg with
+  FI_TRANSMIT_COMPLETE, without FI_INJECT, FI_MORE or size-class chunking.
+* Blocking puts wait for the context's issued-write counter before returning,
+  making their source reusable. This is source completion, not remote delivery.
+* Nonblocking puts do not wait during posting. Their source must remain valid
+  and unchanged until completion through quiet or another completing operation.
+* Sizes exceeding the provider's max_msg_size fail explicitly; the experimental
+  path does not silently fragment them. Zero-length bulk puts post nothing.
+
+Delivery and ordering:
+
+* Quiet posts one zero-byte FI_FENCE | FI_DELIVERY_COMPLETE | FI_COMPLETION
+  write per pending peer on the same endpoint as its payloads, then waits for
+  the counter and identified CQ completion. FI_FENCE orders prior writes to
+  that peer before the delivery marker; TX completion alone is not sufficient.
+* Pending peers are sparse per context. One cached peer record needs no hash;
+  a second peer promotes the active set to a hash. Overflow/hash storage is
+  freed on drain and the cached record on destruction. Different sizes to the
+  same peer coalesce without a size-change drain.
+* Fence, dependent controls, shared-memory transitions and context destruction
+  drain pending delivery. Scalar, signal and atomic controls retain strong
+  completion. Blocking put-with-signal payloads remain delivery-complete.
+  On-node puts retain the shared-memory transport.
+* Context metadata uses the existing lock or a feature-only supplemental mutex.
+  SHMEM_THREAD_MULTIPLE requires the provider's FI_THREAD_SAFE contract.
+
+Admission and limits:
+
+* Requires OFI with the CXI provider and a nonzero maximum message size.
+  FI_CONTEXT/FI_CONTEXT2, FI_MR_LOCAL and HMEM are rejected explicitly.
+* The disabled path preserves baseline endpoint flags and provider calls; it
+  does not allocate peer state, initialize extra locks or issue delivery markers.
+* FI_INJECT_COMPLETE is not used. This experiment tests transmit completion,
+  not an earlier provider-specific source-completion implementation.
+* Local provider mocks model source completion separately from remote delivery.
+  They do not establish hardware visibility, high-PPN correctness or speedup.
+  Production configure/build/install and compute jobs remain user-owned.
+
+Local checks (no SOS build/install or compute job):
+
+* python3.10 -m unittest scripts/test_ofi_tx_complete_transport.py
+* SOS_TEST_M4_SYNTAX=1 python3.10 -m unittest scripts/test_ofi_tx_complete_transport.py

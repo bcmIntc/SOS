@@ -88,6 +88,9 @@ SHMEM_INTERNAL_ENV_DEF(CMA_GET_MAX, size, 16*1024, SHMEM_INTERNAL_ENV_CAT_INTRAN
                        "Size below which to use CMA for gets")
 #endif /* USE_CMA */
 
+SHMEM_INTERNAL_ENV_DEF(OFI_CXI_TX_COMPLETE_PUTS, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Experimental CXI full-width transmit-complete puts; requires OFI; remote visibility unqualified")
+
 #ifdef USE_OFI
 SHMEM_INTERNAL_ENV_DEF(OFI_ATOMIC_CHECKS_WARN, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Display warnings about unsupported atomic operations")

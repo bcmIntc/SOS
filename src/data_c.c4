@@ -697,7 +697,7 @@ SHMEM_PROF_DEF_CTX_PUT_N_SIGNAL_NBI(`mem')
                             sizeof(uint64_t), 0,                        \
                             (shmem_internal_my_pe == pe));              \
     SHMEM_ERR_CHECK_SIG_OP(sig_op);                                     \
-    shmem_internal_put_nb(ctx, target, source,                          \
+    shmem_internal_put_signal_payload_nb(ctx, target, source,           \
                           sizeof(TYPE) * nelems, pe,                    \
                           &completion);                                 \
     shmem_internal_put_wait(ctx, &completion);                          \
@@ -729,8 +729,8 @@ SHMEM_PROF_DEF_CTX_PUT_N_SIGNAL_NBI(`mem')
                             sizeof(uint64_t), 0,                        \
                             (shmem_internal_my_pe == pe));              \
     SHMEM_ERR_CHECK_SIG_OP(sig_op);                                     \
-    shmem_internal_put_nb(ctx, target, source, (SIZE) * nelems,         \
-                          pe, &completion);                             \
+    shmem_internal_put_signal_payload_nb(ctx, target, source,           \
+                                         (SIZE) * nelems, pe, &completion); \
     shmem_internal_put_wait(ctx, &completion);                          \
     shmem_internal_fence(ctx);                                          \
     if (sig_op == SHMEM_SIGNAL_ADD)                                     \
