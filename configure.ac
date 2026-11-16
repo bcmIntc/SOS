@@ -1062,6 +1062,7 @@ AC_CONFIG_FILES([Makefile
   tests/run-ofi-node-budget.sh
   scripts/rebuild-ofi.sh
   scripts/run-osu-shmem.sh
+  scripts/launch-node-budget.sh
   modules/Makefile
   modules/tests-sos/Makefile
   modules/tests-sos/test/Makefile
