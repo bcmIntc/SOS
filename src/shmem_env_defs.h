@@ -107,6 +107,10 @@ SHMEM_INTERNAL_ENV_DEF(OFI_BOUNCE_LOCAL_MR, bool, false, SHMEM_INTERNAL_ENV_CAT_
                        "Preregister default-context host bounce sources using CXI hybrid descriptors")
 SHMEM_INTERNAL_ENV_DEF(OFI_BOUNCE_COUNTER_RETIRE, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Retire default bounce puts at a full delivery-counter snapshot; requires local MRs, SHMEM_THREAD_SINGLE and OFI_STX_MAX=0")
+SHMEM_INTERNAL_ENV_DEF(OFI_BOUNCE_NODE_BUDGET, size, 0, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Experiment: aggregate default-context bounce slots per node; 0 disables; requires XPMEM, local MRs, single threading and exclusive TX")
+SHMEM_INTERNAL_ENV_DEF(OFI_BOUNCE_NODE_CHUNK, size, 16, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Guaranteed bounce slots per local PE and shared loan quantum (node-budget experiment)")
 SHMEM_INTERNAL_ENV_DEF(OFI_PUT_MORE_BATCH, size, 0, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Experiment: FI_MORE for up to 16 registered bounce puts; 0 disables, 1 posts immediately; requires exclusive single-threaded CXI CQ retirement")
 SHMEM_INTERNAL_ENV_DEF(OFI_PUT_MORE_MIN, size, 0, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
@@ -114,7 +118,7 @@ SHMEM_INTERNAL_ENV_DEF(OFI_PUT_MORE_MIN, size, 0, SHMEM_INTERNAL_ENV_CAT_TRANSPO
 SHMEM_INTERNAL_ENV_DEF(OFI_PUT_MORE_MAX, size, 0, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Maximum bounce-put bytes eligible for FI_MORE (inclusive; 0 is unrestricted)")
 SHMEM_INTERNAL_ENV_DEF(OFI_PUT_BATCH_STATS, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
-                       "Print PE 0 default-context immediate bounce source-ownership statistics at shutdown")
+                       "Print default-context ownership/submission statistics and enabled node-budget diagnostics at shutdown")
 SHMEM_INTERNAL_ENV_DEF(OFI_STX_MAX, long, 1, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Maximum number of STX contexts per PE")
 SHMEM_INTERNAL_ENV_DEF(OFI_STX_AUTO, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,

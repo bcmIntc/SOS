@@ -1,7 +1,7 @@
 # Standalone public-API regressions, independent of the tests-sos submodule.
 if USE_OFI
 # Build the matrix binaries with ordinary make, without installing them.
-noinst_PROGRAMS = ofi_immediate ofi_counter_init ofi_quiet_oracle ofi_more
+noinst_PROGRAMS = ofi_immediate ofi_counter_init ofi_quiet_oracle ofi_more ofi_node_budget
 if USE_PMI_MPI
 # MPI supplies only bootstrap/control; the data plane is standalone libfabric.
 noinst_PROGRAMS += ofi_counter_hardware
@@ -10,12 +10,17 @@ ofi_counter_hardware_CPPFLAGS = -I$(top_srcdir)/src
 ofi_counter_hardware_LDADD =
 $(ofi_counter_hardware_OBJECTS): $(top_srcdir)/src/transport_ofi_counter.h
 endif
-check_PROGRAMS = ofi_quiet_model ofi_counter_wait_model ofi_more_state_model ofi_more_retry_model
+check_PROGRAMS = ofi_quiet_model ofi_counter_wait_model ofi_more_state_model ofi_more_retry_model ofi_node_budget_model
 TESTS = ofi_immediate
 ofi_immediate_SOURCES = ofi_immediate.c
 ofi_counter_init_SOURCES = ofi_counter_init.c
 ofi_quiet_oracle_SOURCES = ofi_quiet_oracle.c
 ofi_more_SOURCES = ofi_more.c
+ofi_node_budget_SOURCES = ofi_node_budget.c
+ofi_node_budget_model_SOURCES = ofi_node_budget_model.c
+ofi_node_budget_model_CPPFLAGS = -I$(top_srcdir)/src
+ofi_node_budget_model_LDADD =
+$(ofi_node_budget_model_OBJECTS): $(top_srcdir)/src/transport_ofi_node_budget.h
 # Explicit local model target; never linked to libsma or launched by TEST_RUNNER.
 ofi_quiet_model_SOURCES = ofi_quiet_oracle.c quiet-model/shmem.c
 ofi_quiet_model_CPPFLAGS = -I$(srcdir)/quiet-model
@@ -38,9 +43,15 @@ $(ofi_more_retry_model_OBJECTS): $(top_srcdir)/src/transport_ofi_more_state.h \
 # config.status generates runners in builddir from the distributed .in files.
 # The configured quiet runner reads its Python driver directly from srcdir.
 nodist_noinst_SCRIPTS = run-ofi-immediate-matrix.sh run-ofi-quiet-matrix.sh \
-                       run-ofi-counter-hardware.sh run-ofi-more.sh
+                       run-ofi-counter-hardware.sh run-ofi-more.sh run-ofi-node-budget.sh
 OFI_TEST_BYTES ?= all
 OFI_TEST_LAUNCHER ?= mpirun -n 2 -ppn 1 -no-vni
+OFI_NODE_LOCAL_PES ?= 4
+OFI_NODE_LAUNCHER ?= mpirun -n 8 -ppn 4 -no-vni
+.PHONY: check-ofi-node-budget
+check-ofi-node-budget: ofi-regressions
+	$(SHELL) "$(abs_builddir)/run-ofi-node-budget.sh" \
+	    "$(OFI_NODE_LOCAL_PES)" $(OFI_NODE_LAUNCHER)
 .PHONY: ofi-regressions check-ofi-quiet check-ofi-immediate check-ofi-counter-hardware
 ofi-regressions: $(noinst_PROGRAMS) $(check_PROGRAMS) $(nodist_noinst_SCRIPTS)
 
@@ -86,6 +97,7 @@ LOG_COMPILER = $(TEST_RUNNER)
 endif
 
 EXTRA_DIST = run-ofi-immediate-matrix.sh.in test_ofi_immediate_matrix.py \
+             run-ofi-node-budget.sh.in \
              run-ofi-more.sh.in \
              run-ofi-quiet-matrix.sh.in test_ofi_quiet_oracle.py quiet-model/shmem.h \
              test_ofi_vpath_workflow.py run-ofi-counter-hardware.sh.in \

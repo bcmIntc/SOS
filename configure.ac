@@ -1059,6 +1059,7 @@ AC_CONFIG_FILES([Makefile
   tests/run-ofi-quiet-matrix.sh
   tests/run-ofi-counter-hardware.sh
   tests/run-ofi-more.sh
+  tests/run-ofi-node-budget.sh
   scripts/rebuild-ofi.sh
   scripts/run-osu-shmem.sh
   modules/Makefile

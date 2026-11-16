@@ -511,6 +511,12 @@ shmem_internal_heap_postinit(void)
     }
     shr_initialized = 1;
 
+#ifdef USE_OFI
+    /* Shared heap mappings must exist before attaching the node-local quota. */
+    ret = shmem_transport_ofi_node_budget_startup();
+    if (ret != 0) goto cleanup_postinit;
+#endif
+
     ret = shmem_internal_collectives_init();
     if (ret != 0) {
         RETURN_ERROR_MSG("Initialization of collectives failed (%d)\n", ret);

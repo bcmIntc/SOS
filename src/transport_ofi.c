@@ -48,6 +48,7 @@
 #include "shmem_internal.h"
 #include "shmem_comm.h"
 #include "transport_ofi.h"
+#include "shmem_remote_pointer.h"
 #ifdef HAVE_RDMA_FI_CXI_EXT_H
 #include <rdma/fi_cxi_ext.h>
 #endif
@@ -63,6 +64,115 @@ struct fabric_info {
     char *domain_name;
     int npes;
 };
+
+/* Identical symmetric allocation on every OFI PE, even when disabled. This
+ * keeps heap offsets identical when nodes use different experiment settings.
+ * A DSO global cannot be assumed to belong to the mapped symmetric data area. */
+typedef struct {
+    uint64_t budget, chunk, maximum;
+    uint64_t ready, available, arrived, released, departed;
+    uint64_t leases, misses, borrowed, returned, peak_capacity;
+} ofi_node_record_t;
+static void *ofi_node_allocation;
+static ofi_node_record_t *ofi_node_record, *ofi_node_leader;
+static ofi_node_record_t **ofi_node_peers;
+static int ofi_node_size, ofi_node_root;
+
+int shmem_transport_ofi_node_budget_startup(void)
+{
+    size_t budget = shmem_internal_params.OFI_BOUNCE_NODE_BUDGET;
+    if (!budget) return 0;
+    size_t chunk = shmem_internal_params.OFI_BOUNCE_NODE_CHUNK;
+    size_t maximum = shmem_transport_ofi_max_bounce_buffers;
+    ofi_node_size = shmem_internal_get_shr_size();
+    ofi_node_root = shmem_internal_get_node_root_pe();
+    if (ofi_node_size <= 0 || ofi_node_root < 0 ||
+        !shmem_transport_ofi_node_valid((size_t)ofi_node_size, chunk, maximum, budget))
+        RAISE_ERROR_STR("OFI_BOUNCE_NODE_BUDGET must be between local_PEs * NODE_CHUNK and local_PEs * MAX_BOUNCE_BUFFERS; chunk must be 1..MAX_BOUNCE_BUFFERS");
+    if (!__atomic_always_lock_free(sizeof(uint64_t), 0))
+        RAISE_ERROR_STR("OFI node budget requires lock-free 64-bit CPU atomics");
+    ofi_node_peers = calloc((size_t)ofi_node_size, sizeof(*ofi_node_peers));
+    if (!ofi_node_peers) RAISE_ERROR_STR("OFI node budget peer allocation failed");
+    int count = 0;
+    for (int pe = 0; pe < shmem_internal_num_pes; pe++) {
+        if (shmem_internal_get_shr_rank(pe) < 0) continue;
+        ofi_node_record_t *record = shmem_internal_ptr(ofi_node_record, pe);
+        if (!record || record->budget != budget || record->chunk != chunk ||
+            record->maximum != maximum)
+            RAISE_ERROR_STR("OFI node budget requires identical budget/chunk/pool settings and XPMEM mappings on every local PE");
+        if (count >= ofi_node_size) RAISE_ERROR_STR("OFI node budget topology mismatch");
+        ofi_node_peers[count++] = record;
+        if (pe == ofi_node_root) ofi_node_leader = record;
+    }
+    if (count != ofi_node_size || !ofi_node_leader)
+        RAISE_ERROR_STR("OFI node budget topology mismatch");
+    uint64_t ready = 0;
+    if (__atomic_compare_exchange_n(&ofi_node_leader->ready, &ready, 1, false,
+                                   __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        ofi_node_leader->available = budget - (size_t)ofi_node_size * chunk;
+        __atomic_store_n(&ofi_node_leader->ready, 2, __ATOMIC_RELEASE);
+    } else {
+        while (__atomic_load_n(&ofi_node_leader->ready, __ATOMIC_ACQUIRE) != 2)
+            shmem_transport_probe();
+    }
+    shmem_transport_ofi_node_attach(&shmem_transport_ctx_default.node_quota,
+                                    &ofi_node_leader->available, chunk, maximum);
+    return 0;
+}
+
+static void ofi_node_budget_fini(void)
+{
+    shmem_transport_ofi_node_quota_t *q = &shmem_transport_ctx_default.node_quota;
+    if (q->available) {
+        shmem_internal_assert(q->capacity == q->guarantee && q->borrowed == q->returned);
+        ofi_node_record->leases = q->leases;
+        ofi_node_record->misses = q->misses;
+        ofi_node_record->borrowed = q->borrowed;
+        ofi_node_record->returned = q->returned;
+        ofi_node_record->peak_capacity = q->peak_capacity;
+        __atomic_fetch_add(&ofi_node_leader->arrived, 1, __ATOMIC_ACQ_REL);
+        if (shmem_internal_my_pe == ofi_node_root) {
+            while (__atomic_load_n(&ofi_node_leader->arrived, __ATOMIC_ACQUIRE) !=
+                   (uint64_t)ofi_node_size) shmem_transport_probe();
+            uint64_t leases = 0, misses = 0, borrowed = 0, returned = 0, peak = 0;
+            for (int i = 0; i < ofi_node_size; i++) {
+                ofi_node_record_t *r = ofi_node_peers[i];
+                leases += r->leases; misses += r->misses;
+                borrowed += r->borrowed; returned += r->returned;
+                if (r->peak_capacity > peak) peak = r->peak_capacity;
+            }
+            uint64_t initial = ofi_node_record->budget -
+                (uint64_t)ofi_node_size * ofi_node_record->chunk;
+            uint64_t available = __atomic_load_n(q->available, __ATOMIC_ACQUIRE);
+            if (available != initial || borrowed != returned)
+                RAISE_ERROR_STR("OFI node budget leaked shared admission slots");
+            if (shmem_internal_params.OFI_PUT_BATCH_STATS)
+                fprintf(stderr, "OFI node budget: root=%d local_pes=%d budget=%" PRIu64
+                        " chunk=%zu pool_max=%zu initial_shared=%" PRIu64
+                        " available=%" PRIu64 " leases=%" PRIu64 " misses=%" PRIu64
+                        " borrowed=%" PRIu64 " returned=%" PRIu64
+                        " max_pe_quota=%" PRIu64 "\n", ofi_node_root, ofi_node_size,
+                        ofi_node_record->budget, q->guarantee, q->maximum, initial,
+                        available, leases, misses, borrowed, returned, peak);
+            __atomic_store_n(&ofi_node_leader->released, 1, __ATOMIC_RELEASE);
+        }
+        while (!__atomic_load_n(&ofi_node_leader->released, __ATOMIC_ACQUIRE))
+            shmem_transport_probe();
+        /* Root may free its mapping only after every peer's last root access.
+         * Non-root records may be freed after the root finished reading them. */
+        __atomic_fetch_add(&ofi_node_leader->departed, 1, __ATOMIC_ACQ_REL);
+        if (shmem_internal_my_pe == ofi_node_root)
+            while (__atomic_load_n(&ofi_node_leader->departed, __ATOMIC_ACQUIRE) !=
+                   (uint64_t)ofi_node_size) shmem_transport_probe();
+        q->available = NULL;
+    }
+    free(ofi_node_peers);
+    ofi_node_peers = NULL;
+    ofi_node_leader = NULL;
+    if (ofi_node_allocation) shmem_internal_free(ofi_node_allocation);
+    ofi_node_allocation = NULL;
+    ofi_node_record = NULL;
+}
 
 struct fid_fabric*              shmem_transport_ofi_fabfd;
 struct fid_domain*              shmem_transport_ofi_domainfd;
@@ -608,6 +718,15 @@ void init_bounce_buffer(shmem_free_list_item_t *item)
 static void
 enable_bounce_local_mr(struct fabric_info *info)
 {
+    if (shmem_internal_params.OFI_BOUNCE_NODE_BUDGET) {
+#ifndef USE_XPMEM
+        RAISE_ERROR_STR("OFI_BOUNCE_NODE_BUDGET requires an XPMEM build");
+#endif
+        if (!shmem_internal_params.OFI_BOUNCE_LOCAL_MR ||
+            shmem_internal_thread_level != SHMEM_THREAD_SINGLE ||
+            shmem_internal_params.OFI_PUT_MORE_BATCH)
+            RAISE_ERROR_STR("OFI_BOUNCE_NODE_BUDGET requires local MRs, SHMEM_THREAD_SINGLE and FI_MORE off");
+    }
     if (shmem_internal_params.OFI_PUT_MORE_BATCH) {
         if (shmem_internal_params.OFI_PUT_MORE_BATCH > 16)
             RAISE_ERROR_STR("OFI_PUT_MORE_BATCH must be between 0 and 16");
@@ -1927,6 +2046,7 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
     ctx->bounce_puts = ctx->bounce_counter_puts = 0;
     ctx->bounce_counter_reclaimed = ctx->bounce_counter_groups = 0;
     memset(&ctx->put_more, 0, sizeof(ctx->put_more));
+    memset(&ctx->node_quota, 0, sizeof(ctx->node_quota));
     ctx->put_more.stats = id == SHMEM_TRANSPORT_CTX_DEFAULT_ID &&
                          shmem_internal_params.OFI_PUT_BATCH_STATS;
 
@@ -2009,6 +2129,10 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
         ctx->bounce_buffers = NULL;
     }
     init_bounce_local_mrs(ctx);
+    if (id == SHMEM_TRANSPORT_CTX_DEFAULT_ID &&
+        shmem_internal_params.OFI_BOUNCE_NODE_BUDGET &&
+        (ctx->stx_idx >= 0 || !ctx->bounce_buffers || !ctx->bounce_local_mrs))
+        RAISE_ERROR_STR("OFI_BOUNCE_NODE_BUDGET requires registered bounce buffers and an exclusive default TX queue (OFI_STX_MAX=0)");
     if (id == SHMEM_TRANSPORT_CTX_DEFAULT_ID &&
         shmem_internal_params.OFI_PUT_MORE_BATCH) {
         if (ctx->stx_idx >= 0 || !ctx->bounce_buffers || !ctx->bounce_local_mrs)
@@ -2136,6 +2260,18 @@ int shmem_transport_init(void)
 #endif
 
     shmem_transport_ctx_default.options = SHMEMX_CTX_BOUNCE_BUFFER;
+
+    /* Written before runtime exchange; size/order and the record's relative
+     * offset are identical on all PEs. Padding isolates neighboring allocations.
+     * Do not align absolute addresses: malloc-backed heap bases may differ
+     * modulo 64, which would break XPMEM's symmetric-offset translation. */
+    ofi_node_allocation = shmem_internal_shmalloc(sizeof(ofi_node_record_t) + 128);
+    if (!ofi_node_allocation) RAISE_ERROR_STR("OFI node budget control allocation failed");
+    ofi_node_record = (ofi_node_record_t *)((char *)ofi_node_allocation + 64);
+    memset(ofi_node_record, 0, sizeof(*ofi_node_record));
+    ofi_node_record->budget = shmem_internal_params.OFI_BOUNCE_NODE_BUDGET;
+    ofi_node_record->chunk = shmem_internal_params.OFI_BOUNCE_NODE_CHUNK;
+    ofi_node_record->maximum = shmem_transport_ofi_max_bounce_buffers;
 
     ret = shmem_transport_ofi_target_ep_init();
     if (ret != 0) return ret;
@@ -2466,6 +2602,7 @@ int shmem_transport_fini(void)
     /* The default context is not inserted into the list of contexts on
      * SHMEM_TEAM_WORLD, so it must be destroyed here */
     shmem_transport_quiet(&shmem_transport_ctx_default);
+    ofi_node_budget_fini();
     shmem_transport_ctx_destroy(&shmem_transport_ctx_default);
 
     for (e = shmem_transport_ofi_stx_kvs; e != NULL; ) {

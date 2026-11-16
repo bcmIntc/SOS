@@ -99,6 +99,7 @@ libsma_la_SOURCES += \
 	transport_ofi.h \
 	transport_ofi_counter.h \
 	transport_ofi_more_state.h \
+	transport_ofi_node_budget.h \
 	transport_ofi_more.h \
 	transport_ofi.c
 # Keep transport layout/helper changes visible even when dependency tracking
@@ -106,7 +107,9 @@ libsma_la_SOURCES += \
 $(libsma_la_OBJECTS): $(top_srcdir)/src/transport_ofi.h \
 	$(top_srcdir)/src/transport_ofi_counter.h
 $(libsma_la_OBJECTS): $(top_srcdir)/src/transport_ofi_more_state.h \
-	$(top_srcdir)/src/transport_ofi_more.h
+	$(top_srcdir)/src/transport_ofi_more.h \
+	$(top_srcdir)/src/transport_ofi_node_budget.h \
+	$(top_srcdir)/src/shmem_env_defs.h
 endif
 
 if USE_UCX

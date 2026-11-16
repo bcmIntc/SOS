@@ -360,6 +360,7 @@ struct shmem_internal_tid
 };
 
 #include "transport_ofi_more_state.h"
+#include "transport_ofi_node_budget.h"
 
 struct shmem_transport_ctx_t {
     int                             id;
@@ -408,6 +409,7 @@ struct shmem_transport_ctx_t {
     uint64_t                        bounce_counter_reclaimed;
     uint64_t                        bounce_counter_groups;
     shmem_transport_ofi_more_state_t put_more;
+    shmem_transport_ofi_node_quota_t node_quota;
     int                             stx_idx;
     struct shmem_internal_tid       tid;
     struct shmem_internal_team_t   *team;
@@ -550,6 +552,7 @@ void shmem_transport_ctx_destroy(shmem_transport_ctx_t *ctx);
 
 int shmem_transport_init(void);
 int shmem_transport_startup(void);
+int shmem_transport_ofi_node_budget_startup(void);
 int shmem_transport_fini(void);
 
 extern size_t SHMEM_Dtsize[FI_DATATYPE_LAST];
@@ -600,6 +603,8 @@ void shmem_transport_ofi_drain_cq(shmem_transport_ctx_t *ctx)
             RAISE_ERROR_MSG("fi_cq_read returned invalid event count (%zd)\n", ret);
         }
     }
+    if (ctx->bounce_buffers)
+        shmem_transport_ofi_node_release(&ctx->node_quota, ctx->bounce_buffers->nalloc);
 }
 
 #define SHMEM_TRANSPORT_OFI_COUNTER_FLUSH(ctx) \
@@ -632,6 +637,7 @@ void shmem_transport_ofi_wait_counter_sources(shmem_transport_ctx_t *ctx)
     }
     if (shmem_internal_params.OFI_PUT_BATCH_STATS)
         ctx->bounce_counter_groups++;
+    shmem_transport_ofi_node_release(&ctx->node_quota, ctx->bounce_buffers->nalloc);
     SHMEM_TRANSPORT_OFI_CTX_BB_UNLOCK(ctx);
 }
 
@@ -646,7 +652,8 @@ shmem_transport_ofi_bounce_buffer_t * create_bounce_buffer(shmem_transport_ctx_t
 
     shmem_internal_assert(shmem_transport_ofi_max_bounce_buffers > 0);
 
-    while (ctx->bounce_buffers->nalloc >= (uint64_t) shmem_transport_ofi_max_bounce_buffers) {
+    while (ctx->bounce_buffers->nalloc >= (uint64_t) shmem_transport_ofi_max_bounce_buffers ||
+           !shmem_transport_ofi_node_admit(&ctx->node_quota, ctx->bounce_buffers->nalloc)) {
         if (ctx->put_more.count) {
             SHMEM_TRANSPORT_OFI_CTX_BB_UNLOCK(ctx);
             shmem_transport_ofi_more_flush(ctx, OFI_MORE_POOL);
@@ -697,6 +704,7 @@ void shmem_transport_put_quiet(shmem_transport_ctx_t* ctx)
         while (ctx->bounce_buffers->nalloc > 0) {
             shmem_transport_ofi_drain_cq(ctx);
         }
+        shmem_transport_ofi_node_release(&ctx->node_quota, 0);
 
         SHMEM_TRANSPORT_OFI_CTX_BB_UNLOCK(ctx);
     }

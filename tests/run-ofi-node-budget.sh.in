@@ -1,0 +1,108 @@
+#!/bin/sh
+# Eight correctness launches plus two configuration-rejection launches.
+# Example: bash build/tests/run-ofi-node-budget.sh 4 mpirun -n 8 -ppn 4 -no-vni
+set -eu
+if [ "$#" -lt 2 ]; then
+    echo "usage: $0 LOCAL_PES launcher arguments... (>=2 nodes, >=2 PEs/node)" >&2
+    exit 2
+fi
+local_pes=$1
+shift
+case "$local_pes" in ''|*[!0-9]*) echo "LOCAL_PES must be an integer" >&2; exit 2;; esac
+if [ "$local_pes" -lt 2 ] || [ "$local_pes" -gt 1048576 ]; then
+    echo "LOCAL_PES must be 2-1048576" >&2; exit 2
+fi
+binary="@abs_top_builddir@/tests/ofi_node_budget"
+init_binary="@abs_top_builddir@/tests/ofi_counter_init"
+log_dir=${SOS_OFI_LOG_DIR:-@abs_top_builddir@/logs/node-budget-$(date +%Y%m%d-%H%M%S)}
+mkdir -p "$log_dir"
+if [ -e "$log_dir/summary.tsv" ]; then echo "use a fresh log directory" >&2; exit 2; fi
+printf 'retirement\tbudget\tbytes\texit_status\tlog\n' >"$log_dir/summary.tsv"
+export SHMEM_INFO=1 SHMEM_DEBUG=0 SHMEM_SYMMETRIC_SIZE=${SHMEM_SYMMETRIC_SIZE:-1G}
+export SHMEM_OFI_PROVIDER=cxi SHMEM_OFI_BOUNCE_LOCAL_MR=1
+export SHMEM_OFI_STX_MAX=0 SHMEM_OFI_STX_AUTO=0 SHMEM_BOUNCE_SHEAP=1
+export SHMEM_BOUNCE_SIZE=8192 SHMEM_MAX_BOUNCE_BUFFERS=128 SHMEM_OFI_CQ_BATCH_SIZE=1
+export SHMEM_OFI_PUT_MORE_BATCH=0 SHMEM_OFI_PUT_BATCH_STATS=1
+export SHMEM_OFI_BOUNCE_NODE_CHUNK=16
+export FI_CXI_DEFAULT_TX_SIZE=${FI_CXI_DEFAULT_TX_SIZE:-1024}
+# Clear obsolete experiments so the matrix has one admission policy.
+unset SHMEM_OFI_PUT_PIGGYBACK SMA_OFI_PUT_PIGGYBACK
+unset SHMEM_OFI_BOUNCE_ARENA SMA_OFI_BOUNCE_ARENA
+for retirement in 0 1; do
+    export SHMEM_OFI_BOUNCE_COUNTER_RETIRE=$retirement
+    for per_pe in 64 16; do
+        budget=$((local_pes * per_pe))
+        export SHMEM_OFI_BOUNCE_NODE_BUDGET=$budget
+        for bytes in 1024 8192; do
+            log="$log_dir/retire-$retirement-budget-$budget-bytes-$bytes.log"
+            status=0
+            timeout --kill-after=10s "${SOS_OFI_TEST_TIMEOUT:-180s}" \
+                "$@" "$binary" "$bytes" "$local_pes" >"$log" 2>&1 || status=$?
+            printf '%s\t%s\t%s\t%s\t%s\n' "$retirement" "$budget" "$bytes" "$status" "$log" \
+                >>"$log_dir/summary.tsv"
+            if [ "$status" != 0 ] ||
+               ! grep -Fq "OFI node budget payload check passed: bytes=$bytes phases=4" "$log"; then
+                echo "FAIL: payload/finalization: $log (exit $status)" >&2; exit 1
+            fi
+            if ! awk -v pes="$local_pes" -v budget="$budget" -v retire="$retirement" '
+                /OFI node budget:/ {
+                    nodes++
+                    for(k in v) delete v[k]
+                    for(i=1;i<=NF;i++) if(split($i,a,"=")==2) v[a[1]]=a[2]
+                    count=split("root local_pes budget chunk pool_max initial_shared available leases misses borrowed returned max_pe_quota",keys," ")
+                    for(i=1;i<=count;i++) if(v[keys[i]]!~/^[0-9]+$/) bad=1
+                    if(seen[v["root"]]++) bad=1
+                    if(v["local_pes"]!=pes || v["budget"]!=budget ||
+                       v["chunk"]!=16 || v["pool_max"]!=128 ||
+                       v["initial_shared"]!=budget-pes*16 ||
+                       v["available"]!=v["initial_shared"] ||
+                       v["borrowed"]!=v["returned"] ||
+                       v["max_pe_quota"]<16 || v["max_pe_quota"]>128) bad=1
+                    if(budget>pes*16 && (v["borrowed"]+0<=0 || v["leases"]+0<=0)) bad=1
+                    if(budget==pes*16 && (v["borrowed"]!=0 || v["misses"]+0<=0)) bad=1
+                }
+                /OFI immediate bounce:/ {
+                    owners++
+                    for(i=1;i<=NF;i++) if(split($i,a,"=")==2) o[a[1]]=a[2]
+                    if(o["local_mr"]!=1 || o["stx_idx"]!=-1 || o["bounce_puts"]+0<=0 ||
+                       o["retirement"]!=(retire ? "counter" : "cq")) bad=1
+                    if(retire && (o["counter_puts"]!=o["bounce_puts"] ||
+                                  o["reclaimed"]!=o["counter_puts"])) bad=1
+                    if(!retire && (o["counter_puts"]!=0 || o["cq_puts"]!=o["bounce_puts"])) bad=1
+                }
+                /OFI node budget payload check passed:/ {
+                    results++
+                    for(i=1;i<=NF;i++) if(split($i,a,"=")==2) result[a[1]]=a[2]
+                    expected_nodes=result["PEs"]/pes
+                    if(result["local_pes"]!=pes || expected_nodes!=int(expected_nodes)) bad=1
+                }
+                END {exit !(nodes==expected_nodes && nodes>=2 && owners==1 && results==1 && !bad)}
+                ' "$log"; then
+                echo "FAIL: admission/ownership evidence: $log" >&2; exit 1
+            fi
+            echo "PASS: $log"
+        done
+    done
+done
+export SHMEM_OFI_BOUNCE_COUNTER_RETIRE=0
+for rejection in more budget; do
+    export SHMEM_OFI_PUT_MORE_BATCH=0 SHMEM_OFI_BOUNCE_NODE_BUDGET=$((local_pes * 64))
+    case "$rejection" in
+        more) export SHMEM_OFI_PUT_MORE_BATCH=2
+              expected="OFI_BOUNCE_NODE_BUDGET requires local MRs, SHMEM_THREAD_SINGLE and FI_MORE off";;
+        budget) export SHMEM_OFI_BOUNCE_NODE_BUDGET=$((local_pes * 16 - 1))
+                expected="OFI_BOUNCE_NODE_BUDGET must be between";;
+    esac
+    log="$log_dir/reject-$rejection.log"
+    status=0
+    timeout --kill-after=10s "${SOS_OFI_TEST_TIMEOUT:-180s}" \
+        "$@" "$init_binary" >"$log" 2>&1 || status=$?
+    printf 'reject-%s\t%s\t0\t%s\t%s\n' "$rejection" "$SHMEM_OFI_BOUNCE_NODE_BUDGET" "$status" "$log" \
+        >>"$log_dir/summary.tsv"
+    if [ "$status" = 0 ] || [ "$status" = 124 ] || [ "$status" = 137 ] ||
+       ! grep -Fq "$expected" "$log"; then
+        echo "FAIL: expected initialization rejection: $log (exit $status)" >&2; exit 1
+    fi
+    echo "PASS: rejection: $log"
+done
+echo "PASS: all 10 node-budget cases; logs: $log_dir"
