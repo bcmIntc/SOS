@@ -119,6 +119,8 @@ SHMEM_INTERNAL_ENV_DEF(OFI_PUT_MORE_MAX, size, 0, SHMEM_INTERNAL_ENV_CAT_TRANSPO
                        "Maximum bounce-put bytes eligible for FI_MORE (inclusive; 0 is unrestricted)")
 SHMEM_INTERNAL_ENV_DEF(OFI_PUT_BATCH_STATS, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Print default-context ownership/submission statistics and enabled node-budget diagnostics at shutdown")
+SHMEM_INTERNAL_ENV_DEF(OFI_BOUNCE_POOL_STATS, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Measure bounce-slot availability waits and occupancy; report every PE/context at shutdown")
 SHMEM_INTERNAL_ENV_DEF(OFI_STX_MAX, long, 1, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Maximum number of STX contexts per PE")
 SHMEM_INTERNAL_ENV_DEF(OFI_STX_AUTO, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,

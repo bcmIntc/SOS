@@ -2045,6 +2045,11 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
     ctx->bounce_counter_retire = false;
     ctx->bounce_puts = ctx->bounce_counter_puts = 0;
     ctx->bounce_counter_reclaimed = ctx->bounce_counter_groups = 0;
+    ctx->bounce_pool_stats = shmem_internal_params.OFI_BOUNCE_POOL_STATS;
+    ctx->bounce_pool_allocations = ctx->bounce_pool_waits = 0;
+    ctx->bounce_pool_limit_waits = ctx->bounce_pool_quota_waits = 0;
+    ctx->bounce_pool_drain_calls = ctx->bounce_pool_high_water = 0;
+    ctx->bounce_pool_wait_seconds = ctx->bounce_pool_max_wait_seconds = 0.0;
     memset(&ctx->put_more, 0, sizeof(ctx->put_more));
     memset(&ctx->node_quota, 0, sizeof(ctx->node_quota));
     ctx->put_more.stats = id == SHMEM_TRANSPORT_CTX_DEFAULT_ID &&
@@ -2459,6 +2464,17 @@ void shmem_transport_ctx_destroy(shmem_transport_ctx_t *ctx)
         return;
     shmem_internal_assert(ctx->put_more.count == 0);
     shmem_internal_assert(ctx->bounce_counter_head == NULL);
+    if (ctx->bounce_pool_stats) {
+        fprintf(stderr, "[%04d] OFI bounce pool: ctx=%d has_pool=%d allocations=%"PRIu64
+                " waits=%"PRIu64" limit_waits=%"PRIu64" quota_waits=%"PRIu64
+                " drain_calls=%"PRIu64" high_water=%"PRIu64" limit=%zu"
+                " wait_total_us=%.3f wait_max_us=%.3f\n",
+                shmem_internal_my_pe, ctx->id, ctx->bounce_buffers != NULL, ctx->bounce_pool_allocations,
+                ctx->bounce_pool_waits, ctx->bounce_pool_limit_waits,
+                ctx->bounce_pool_quota_waits, ctx->bounce_pool_drain_calls,
+                ctx->bounce_pool_high_water, shmem_transport_ofi_max_bounce_buffers,
+                ctx->bounce_pool_wait_seconds * 1e6, ctx->bounce_pool_max_wait_seconds * 1e6);
+    }
     if (ctx->id == SHMEM_TRANSPORT_CTX_DEFAULT_ID &&
         shmem_internal_my_pe == 0 && shmem_internal_params.OFI_PUT_BATCH_STATS) {
         fprintf(stderr, "[0000] OFI immediate bounce: local_mr=%d retirement=%s cq_batch=%zu"

@@ -27,6 +27,9 @@
 #include <unistd.h>
 #include <stddef.h>
 #include <inttypes.h>
+#include <errno.h>
+#include <time.h>
+#include <sys/time.h>
 #include "shmem_free_list.h"
 #include "shmem_internal.h"
 #include "shmem_atomic.h"
@@ -408,6 +411,15 @@ struct shmem_transport_ctx_t {
     uint64_t                        bounce_counter_puts;
     uint64_t                        bounce_counter_reclaimed;
     uint64_t                        bounce_counter_groups;
+    bool                            bounce_pool_stats;
+    uint64_t                        bounce_pool_allocations;
+    uint64_t                        bounce_pool_waits;
+    uint64_t                        bounce_pool_limit_waits;
+    uint64_t                        bounce_pool_quota_waits;
+    uint64_t                        bounce_pool_drain_calls;
+    uint64_t                        bounce_pool_high_water;
+    double                          bounce_pool_wait_seconds;
+    double                          bounce_pool_max_wait_seconds;
     shmem_transport_ofi_more_state_t put_more;
     shmem_transport_ofi_node_quota_t node_quota;
     int                             stx_idx;
@@ -642,11 +654,29 @@ void shmem_transport_ofi_wait_counter_sources(shmem_transport_ctx_t *ctx)
 }
 
 static inline
+double shmem_transport_ofi_bounce_pool_now(void)
+{
+#ifdef HAVE_CLOCK_GETTIME
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        RAISE_ERROR_MSG("Bounce-pool timer failed: %s\n", strerror(errno));
+    return (double) now.tv_sec + (double) now.tv_nsec / 1e9;
+#else
+    struct timeval now;
+    if (gettimeofday(&now, NULL) != 0)
+        RAISE_ERROR_MSG("Bounce-pool timer failed: %s\n", strerror(errno));
+    return (double) now.tv_sec + (double) now.tv_usec / 1e6;
+#endif
+}
+
+static inline
 shmem_transport_ofi_bounce_buffer_t * create_bounce_buffer(shmem_transport_ctx_t *ctx,
                                                            const void *source,
                                                            const size_t len)
 {
     shmem_transport_ofi_bounce_buffer_t *buff;
+    bool waited = false;
+    double wait_start = 0.0;
 
     SHMEM_TRANSPORT_OFI_CTX_BB_LOCK(ctx);
 
@@ -654,6 +684,18 @@ shmem_transport_ofi_bounce_buffer_t * create_bounce_buffer(shmem_transport_ctx_t
 
     while (ctx->bounce_buffers->nalloc >= (uint64_t) shmem_transport_ofi_max_bounce_buffers ||
            !shmem_transport_ofi_node_admit(&ctx->node_quota, ctx->bounce_buffers->nalloc)) {
+        if (ctx->bounce_pool_stats) {
+            if (!waited) {
+                waited = true;
+                ctx->bounce_pool_waits++;
+                if (ctx->bounce_buffers->nalloc >= (uint64_t) shmem_transport_ofi_max_bounce_buffers)
+                    ctx->bounce_pool_limit_waits++;
+                else
+                    ctx->bounce_pool_quota_waits++;
+                wait_start = shmem_transport_ofi_bounce_pool_now();
+            }
+            ctx->bounce_pool_drain_calls++;
+        }
         if (ctx->put_more.count) {
             SHMEM_TRANSPORT_OFI_CTX_BB_UNLOCK(ctx);
             shmem_transport_ofi_more_flush(ctx, OFI_MORE_POOL);
@@ -666,9 +708,22 @@ shmem_transport_ofi_bounce_buffer_t * create_bounce_buffer(shmem_transport_ctx_t
         }
         shmem_transport_ofi_drain_cq(ctx);
     }
+    if (waited) {
+        double elapsed = shmem_transport_ofi_bounce_pool_now() - wait_start;
+        if (elapsed < 0.0)
+            RAISE_ERROR_STR("Bounce-pool timer moved backwards");
+        ctx->bounce_pool_wait_seconds += elapsed;
+        if (elapsed > ctx->bounce_pool_max_wait_seconds)
+            ctx->bounce_pool_max_wait_seconds = elapsed;
+    }
 
     buff = (shmem_transport_ofi_bounce_buffer_t*) shmem_free_list_alloc(ctx->bounce_buffers);
     ctx->pending_bb_cntr++;
+    if (buff != NULL && ctx->bounce_pool_stats) {
+        ctx->bounce_pool_allocations++;
+        if (ctx->bounce_buffers->nalloc > ctx->bounce_pool_high_water)
+            ctx->bounce_pool_high_water = ctx->bounce_buffers->nalloc;
+    }
 
     SHMEM_TRANSPORT_OFI_CTX_BB_UNLOCK(ctx);
 

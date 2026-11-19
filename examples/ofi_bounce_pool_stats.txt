@@ -1,0 +1,32 @@
+Bounce-slot availability probes (OFI only)
+=========================================
+
+Enable with SHMEM_OFI_BOUNCE_POOL_STATS=1. The default is off.
+This does not change completion flags, pool size, or admission rules.
+
+Every PE reports one summary for each destroyed context, including zero-wait
+contexts. has_pool distinguishes unused/disabled pools from active pools.
+Unlike OFI_PUT_BATCH_STATS, reporting is not limited to PE 0.
+
+Fields:
+  allocations       Successful bounce allocations while probing is enabled.
+  waits             Allocations that entered the availability wait loop.
+  limit_waits       Entries initially blocked by the local in-use limit.
+  quota_waits       Entries initially denied by the optional node quota.
+  drain_calls       Explicit CQ drains in this allocation wait loop.
+  high_water        Maximum simultaneously in-use buffers seen after allocation.
+  limit             Configured per-context maximum.
+  wait_total_us     Total wall time in availability waits.
+  wait_max_us       Longest availability wait.
+
+limit_waits + quota_waits equals waits. Classification is at entry; a wait
+can later encounter a different constraint. Time includes the loop's flush,
+progress and counter-retirement work, but excludes allocation and memcpy.
+Only wait entries read the clock; successful fast-path allocations update
+occupancy/counts without timing. Internal helper CQ drains are not included in
+drain_calls. Clock failures or backwards intervals are reported as errors.
+
+An availability wait can be brief because completed buffers merely need CQ
+processing. Counts/high-water alone do not establish a performance bottleneck;
+use wait duration and controlled capacity/completion comparisons. These probes
+do not establish the cause of slow NIC delivery.
