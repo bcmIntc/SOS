@@ -48,11 +48,11 @@ OFI_TEST_BYTES ?= all
 OFI_TEST_LAUNCHER ?= mpirun -n 2 -ppn 1 -no-vni
 OFI_NODE_LOCAL_PES ?= 4
 OFI_NODE_LAUNCHER ?= mpirun -n 8 -ppn 4 -no-vni
-.PHONY: check-ofi-node-budget
+.PHONY: check-ofi-node-budget ofi-regressions check-ofi-quiet check-ofi-immediate \
+        check-ofi-counter-hardware check-ofi-bounce-tx-model
 check-ofi-node-budget: ofi-regressions
 	$(SHELL) "$(abs_builddir)/run-ofi-node-budget.sh" \
 	    "$(OFI_NODE_LOCAL_PES)" $(OFI_NODE_LAUNCHER)
-.PHONY: ofi-regressions check-ofi-quiet check-ofi-immediate check-ofi-counter-hardware
 ofi-regressions: $(noinst_PROGRAMS) $(check_PROGRAMS) $(nodist_noinst_SCRIPTS)
 
 check-ofi-counter-hardware: ofi-regressions
@@ -94,12 +94,13 @@ LDADD += $(top_builddir)/pmi-simple/libpmi_simple.la
 endif
 NPROCS ?= 2
 LOG_COMPILER = $(TEST_RUNNER)
+else
+.PHONY: check-ofi-bounce-tx-model
 endif
 
 # Source-extracted CPU model: no libsma, configure/build of production, launcher
 # or allocation is required. Override PYTHON when python3 predates Python 3.8.
 PYTHON ?= python3
-.PHONY: check-ofi-bounce-tx-model
 check-ofi-bounce-tx-model:
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) "$(top_srcdir)/scripts/test_ofi_bounce_tx_complete.py"
 
