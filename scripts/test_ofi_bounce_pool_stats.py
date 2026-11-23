@@ -151,7 +151,7 @@ class BouncePoolStatsTests(unittest.TestCase):
         source = (ROOT / "src/transport_ofi.c").read_text()
         start = source.index("void shmem_transport_ctx_destroy")
         report = block(source, source.index("if (ctx->bounce_pool_stats)", start))
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory(prefix=".ofi-pool-test-", dir=ROOT) as temporary:
             root = Path(temporary)
             for monotonic in (False, True):
                 with self.subTest(monotonic=monotonic):

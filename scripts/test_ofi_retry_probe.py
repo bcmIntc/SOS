@@ -51,6 +51,7 @@ typedef struct {
     struct counter *put_cntr, *get_cntr;
     void *ep, *cq;
     int node_quota;
+    struct { int context; bool outstanding, complete; } bounce_tx_marker;
 } shmem_transport_ctx_t;
 static size_t shmem_transport_ofi_max_bounce_buffers = 128;
 static uint64_t shmem_transport_ofi_max_poll = 1000;
@@ -60,6 +61,7 @@ static unsigned char data;
 static void *shmem_internal_data_base = &data;
 static struct { size_t OFI_CQ_BATCH_SIZE; } shmem_internal_params = {1};
 #define SHMEM_TRANSPORT_OFI_TYPE_BOUNCE 1
+#define SHMEM_TRANSPORT_OFI_TYPE_BOUNCE_TX 3
 #define SHMEM_TRANSPORT_OFI_CNTR_READ(p) (*(p))
 #define SHMEM_TRANSPORT_OFI_CTX_BB_LOCK(ctx) ((void)0)
 #define SHMEM_TRANSPORT_OFI_CTX_BB_UNLOCK(ctx) ((void)0)
@@ -148,7 +150,8 @@ int main(int argc, char **argv) {
 class RetryProbeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.temporary = tempfile.TemporaryDirectory()
+        cls.temporary = tempfile.TemporaryDirectory(prefix=".ofi-retry-test-", dir=ROOT)
+        cls.addClassCleanup(cls.temporary.cleanup)
         root = Path(cls.temporary.name)
         header = (ROOT / "src/transport_ofi.h").read_text()
         drain = block(header, header.index("void shmem_transport_ofi_drain_cq("))

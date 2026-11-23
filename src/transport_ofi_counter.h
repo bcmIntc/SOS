@@ -1,4 +1,4 @@
-/* OFI delivery-counter helpers. Include after the context, CQ drain, probe,
+/* OFI operation-counter helpers. Include after the context, CQ drain, probe,
  * and error/locking definitions. Callers hold the context lock; they must
  * not hold the bounce free-list lock or have an unaccepted post counted.
  */
@@ -52,7 +52,9 @@ void shmem_transport_ofi_ensure_put_counter_capacity(shmem_transport_ctx_t *ctx)
     if (ctx->put_cntr_pending < ctx->put_cntr_limit)
         return;
 
-    /* All old writes, atomics and terminal writes must finish before reset.
+    /* All old writes, atomics and terminal writes must reach their requested
+     * completion stage before reset. TX-bounce counter reach is NOT remote
+     * delivery: weak peer bits/count survive until fenced marker CQ proof.
      * Do not reset logical/statistical counts, epoch membership or retained
      * source ownership: completed counter-owned buffers can stay on their list.
      * No new fabric operation can be accepted while the context lock is held. */

@@ -18,11 +18,12 @@ import unittest
 
 
 MODEL_BINARY = None
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class QuietOracleTests(unittest.TestCase):
-    def run_pair(self, mode, early_return):
-        with tempfile.TemporaryDirectory(prefix="sos-quiet-model-") as tmp:
+    def run_pair(self, mode, early_return, bytes_=1024, writes=17):
+        with tempfile.TemporaryDirectory(prefix=".sos-quiet-model-", dir=ROOT) as tmp:
             backing = Path(tmp) / "memory"
             with backing.open("wb") as stream:
                 stream.truncate(4096 + 2 * 2097152)
@@ -36,7 +37,8 @@ class QuietOracleTests(unittest.TestCase):
                                SOS_OFI_CONTROL_HOST="127.0.0.1",
                                SOS_OFI_CONTROL_TIMEOUT="5")
                     processes.append(subprocess.Popen(
-                        [MODEL_BINARY, "1024", mode], env=env,
+                        [MODEL_BINARY, str(bytes_), mode, str(writes)], env=env,
+                        cwd=ROOT,
                         universal_newlines=True,
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE))
                 results = []
@@ -56,16 +58,17 @@ class QuietOracleTests(unittest.TestCase):
                         process.kill()
                     process.wait()
 
-    def check_delivery(self, mode):
-        results = self.run_pair(mode, False)
+    def check_delivery(self, mode, bytes_=1024, writes=17):
+        results = self.run_pair(mode, False, bytes_, writes)
         self.assertEqual([r[0] for r in results], [0, 0], results)
         self.assertIn("OFI quiet oracle completed:", results[0][1])
-        self.assertIn("bytes=1024", results[0][1])
+        self.assertIn("bytes=" + str(bytes_), results[0][1])
+        self.assertIn("writes=" + str(writes), results[0][1])
         self.assertIn("mode=" + mode, results[0][1])
         self.assertIn("receiver_shmem_calls=0", results[0][1])
 
-    def check_early_return(self, mode):
-        results = self.run_pair(mode, True)
+    def check_early_return(self, mode, bytes_=1024, writes=17):
+        results = self.run_pair(mode, True, bytes_, writes)
         self.assertEqual([r[0] for r in results], [1, 1], results)
         self.assertIn("mismatch", results[1][2])
         self.assertNotIn("OFI quiet oracle completed:", results[0][1])
@@ -81,6 +84,12 @@ class QuietOracleTests(unittest.TestCase):
 
     def test_nbi_early_quiet_return_is_detected(self):
         self.check_early_return("nbi")
+
+    def test_bounce_window_single_and_multiple_write_observations(self):
+        for writes in (1, 17):
+            with self.subTest(writes=writes):
+                self.check_delivery("blocking", 4096, writes)
+                self.check_early_return("blocking", 4096, writes)
 
 
 if __name__ == "__main__":

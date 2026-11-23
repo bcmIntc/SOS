@@ -26,7 +26,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define WRITES 17
+#define MAX_WRITES 17
 #define EPOCHS 4
 #define HOST_BYTES 256
 #define MAGIC UINT32_C(0x534f5351)
@@ -202,10 +202,10 @@ pattern(int epoch, int slot, size_t byte)
 }
 
 static int
-observe(const volatile unsigned char *target, size_t bytes, int epoch)
+observe(const volatile unsigned char *target, size_t bytes, int epoch, int writes)
 {
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    for (int slot = 0; slot < WRITES; slot++)
+    for (int slot = 0; slot < writes; slot++)
         for (size_t byte = 0; byte < bytes; byte++) {
             unsigned char actual = target[(size_t) slot * bytes + byte];
             if (actual != pattern(epoch, slot, byte)) {
@@ -223,8 +223,9 @@ int
 main(int argc, char **argv)
 {
     size_t bytes = 1024;
+    int writes = MAX_WRITES;
     const char *mode = argc >= 3 ? argv[2] : "blocking";
-    if (argc > 3 || (strcmp(mode, "blocking") && strcmp(mode, "nbi")))
+    if (argc > 4 || (strcmp(mode, "blocking") && strcmp(mode, "nbi")))
         return 1;
     if (argc >= 2) {
         char *end;
@@ -232,6 +233,13 @@ main(int argc, char **argv)
         if (!*argv[1] || *end || n == 0 || n > 8192)
             return 1;
         bytes = (size_t) n;
+    }
+    if (argc == 4) {
+        char *end;
+        long n = strtol(argv[3], &end, 10);
+        if (!*argv[3] || *end || n < 1 || n > MAX_WRITES)
+            return 1;
+        writes = (int) n;
     }
     const char *timeout = getenv("SOS_OFI_CONTROL_TIMEOUT");
     if (timeout) {
@@ -252,12 +260,12 @@ main(int argc, char **argv)
     int me = shmem_my_pe();
     int nbi = !strcmp(mode, "nbi");
     struct peer_info *local = shmem_malloc(sizeof(*local));
-    unsigned char *target = shmem_malloc(EPOCHS * WRITES * bytes);
-    unsigned char *source = malloc(WRITES * bytes);
+    unsigned char *target = shmem_malloc(EPOCHS * writes * bytes);
+    unsigned char *source = malloc(writes * bytes);
     if (!local || !target || !source)
         fail("allocation failed");
     memset(local, 0, sizeof(*local));
-    memset(target, 0, EPOCHS * WRITES * bytes);
+    memset(target, 0, EPOCHS * writes * bytes);
     if (gethostname(local->host, HOST_BYTES - 1))
         fail("gethostname failed");
     const char *control_host = getenv("SOS_OFI_CONTROL_HOST");
@@ -296,12 +304,12 @@ main(int argc, char **argv)
     }
     for (int epoch = 0; epoch < EPOCHS; epoch++) {
         if (me == 0) {
-            for (int i = 0; i < WRITES; i++) {
-                int slot = epoch % 2 ? WRITES - i - 1 : i;
+            for (int i = 0; i < writes; i++) {
+                int slot = epoch % 2 ? writes - i - 1 : i;
                 unsigned char *s = source + (nbi ? (size_t) slot * bytes : 0);
                 for (size_t byte = 0; byte < bytes; byte++)
                     s[byte] = pattern(epoch, slot, byte);
-                unsigned char *t = target + ((size_t) epoch * WRITES + slot) * bytes;
+                unsigned char *t = target + ((size_t) epoch * writes + slot) * bytes;
                 if (nbi)
                     shmem_putmem_nbi(t, s, bytes, 1);
                 else {
@@ -312,7 +320,7 @@ main(int argc, char **argv)
             shmem_quiet();
             uint64_t returned = now_ns();
             if (nbi)
-                memset(source, 0xee, WRITES * bytes);
+                memset(source, 0xee, writes * bytes);
             send_frame(control, epoch, QUIET_RETURNED);
             if (receive_frame(control, epoch) != ACK_GOOD)
                 fail("receiver rejected data after quiet");
@@ -322,7 +330,7 @@ main(int argc, char **argv)
         } else {
             if (receive_frame(control, epoch) != QUIET_RETURNED)
                 fail("missing quiet-return announcement");
-            int good = observe(target + (size_t) epoch * WRITES * bytes, bytes, epoch);
+            int good = observe(target + (size_t) epoch * writes * bytes, bytes, epoch, writes);
             send_frame(control, epoch, good ? ACK_GOOD : ACK_BAD);
             if (!good)
                 fail("target visibility check failed");
@@ -337,7 +345,7 @@ main(int argc, char **argv)
     if (me == 0)
         printf("OFI quiet oracle completed: mode=%s bytes=%zu epochs=%d "
                "writes=%d control=tcp receiver_shmem_calls=0\n",
-               mode, bytes, EPOCHS, WRITES);
+               mode, bytes, EPOCHS, writes);
     shmem_finalize();
     return 0;
 }

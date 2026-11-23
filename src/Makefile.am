@@ -98,6 +98,7 @@ if USE_OFI
 libsma_la_SOURCES += \
 	transport_ofi.h \
 	transport_ofi_counter.h \
+	transport_ofi_bounce_tx.h \
 	transport_ofi_more_state.h \
 	transport_ofi_node_budget.h \
 	transport_ofi_more.h \
@@ -106,6 +107,7 @@ libsma_la_SOURCES += \
 # is disabled. Always depend on the source-tree headers in a VPATH build.
 $(libsma_la_OBJECTS): $(top_srcdir)/src/transport_ofi.h \
 	$(top_srcdir)/src/transport_ofi_counter.h
+$(libsma_la_OBJECTS): $(top_srcdir)/src/transport_ofi_bounce_tx.h
 $(libsma_la_OBJECTS): $(top_srcdir)/src/transport_ofi_more_state.h \
 	$(top_srcdir)/src/transport_ofi_more.h \
 	$(top_srcdir)/src/transport_ofi_node_budget.h \

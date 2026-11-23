@@ -284,6 +284,7 @@ typedef enum fi_op       shm_internal_op_t;
 #define SHM_INTERNAL_PROD            FI_PROD
 
 #define SHMEM_TRANSPORT_OFI_TYPE_BOUNCE 0x01
+#define SHMEM_TRANSPORT_OFI_TYPE_BOUNCE_TX 0x03
 #define SHMEM_TRANSPORT_OFI_TYPE_LONG   0x02
 
 
@@ -364,6 +365,13 @@ struct shmem_internal_tid
 
 #include "transport_ofi_more_state.h"
 #include "transport_ofi_node_budget.h"
+#include "transport_ofi_bounce_tx.h"
+
+typedef struct shmem_transport_ofi_delivery_marker_t {
+    struct fi_context2 context;
+    bool outstanding;
+    bool complete;
+} shmem_transport_ofi_delivery_marker_t;
 
 struct shmem_transport_ctx_t {
     int                             id;
@@ -377,7 +385,8 @@ struct shmem_transport_ctx_t {
     struct fid_cntr*                get_cntr;
     struct fid_cq*                  cq;
     /* Includes every non-fetching fabric operation, including terminal
-     * writes. Protected by the context lock; rebased only after full delivery. */
+     * writes. In TX-bounce mode this includes local-stage completions, NOT
+     * proof of remote delivery. Protected by the context lock. */
     uint64_t                        put_cntr_pending;
     uint64_t                        put_cntr_limit;
     /* Saturates at two logical puts; transport fragments do not count as
@@ -407,6 +416,10 @@ struct shmem_transport_ctx_t {
     shmem_transport_ofi_bounce_mr_t *bounce_local_mrs;
     shmem_transport_ofi_bounce_buffer_t *bounce_counter_head;
     bool                            bounce_counter_retire;
+    bool                            bounce_tx_complete;
+    uint64_t                        bounce_tx_weak_pending;
+    void                           *bounce_tx_marker_desc;
+    shmem_transport_ofi_delivery_marker_t bounce_tx_marker;
     uint64_t                        bounce_puts;
     uint64_t                        bounce_counter_puts;
     uint64_t                        bounce_counter_reclaimed;
@@ -511,8 +524,8 @@ void shmem_transport_ofi_record_put(shmem_transport_ctx_t *ctx, int pe)
     /* Before counting an unaccepted write, finish and rebase if necessary.
      * Retries must never enter this path with that write already counted. */
     shmem_transport_ofi_ensure_put_counter_capacity(ctx);
-    if (!ctx->put_epoch_dirty[pe]) {
-        ctx->put_epoch_dirty[pe] = 1;
+    if (!(ctx->put_epoch_dirty[pe] & SHMEM_OFI_PUT_EPOCH_DIRTY)) {
+        ctx->put_epoch_dirty[pe] |= SHMEM_OFI_PUT_EPOCH_DIRTY;
         ctx->put_epoch_pes[ctx->put_epoch_npes++] = pe;
     }
     ctx->put_cntr_pending++;
@@ -595,6 +608,13 @@ void shmem_transport_ofi_drain_cq(shmem_transport_ctx_t *ctx)
 
         else if (ret > 0 && (size_t) ret <= batch) {
             for (ssize_t i = 0; i < ret; i++) {
+                if (buf[i].op_context == &ctx->bounce_tx_marker.context) {
+                    if (!ctx->bounce_tx_marker.outstanding ||
+                        ctx->bounce_tx_marker.complete)
+                        RAISE_ERROR_STR("Unexpected TX-bounce delivery marker completion");
+                    ctx->bounce_tx_marker.complete = true;
+                    continue;
+                }
                 if (buf[i].op_context == &ctx->put_epoch_context) {
                     ctx->put_epoch_complete = true;
                     continue;
@@ -605,7 +625,9 @@ void shmem_transport_ofi_drain_cq(shmem_transport_ctx_t *ctx)
                 if (frag == NULL)
                     RAISE_ERROR_STR("CQ completion has no operation context");
 
-                if (SHMEM_TRANSPORT_OFI_TYPE_BOUNCE == frag->mytype) {
+                if (SHMEM_TRANSPORT_OFI_TYPE_BOUNCE == frag->mytype ||
+                    SHMEM_TRANSPORT_OFI_TYPE_BOUNCE_TX == frag->mytype) {
+                    frag->mytype = SHMEM_TRANSPORT_OFI_TYPE_BOUNCE;
                     shmem_free_list_free(ctx->bounce_buffers,
                                          (shmem_transport_ofi_bounce_buffer_t *) frag);
                     ctx->completed_bb_cntr++;
@@ -768,7 +790,8 @@ void shmem_transport_put_quiet(shmem_transport_ctx_t* ctx)
 
     shmem_transport_ofi_wait_counter_sources(ctx);
 
-    /* Reclaim bounce buffers using their delivery completions. */
+    /* Reclaim individual sources. TX-bounce events prove source retirement
+     * only; their peer delivery obligations remain below. */
     if (ctx->bounce_buffers) {
         SHMEM_TRANSPORT_OFI_CTX_BB_LOCK(ctx);
 
@@ -782,7 +805,7 @@ void shmem_transport_put_quiet(shmem_transport_ctx_t* ctx)
 
     /* The first put cannot know whether a second will follow.  The counter
      * stays bound; only batched epochs avoid counter reads and waits. */
-    if (ctx->put_epoch_puts < 2) {
+    if (ctx->put_epoch_puts < 2 && !ctx->bounce_tx_weak_pending) {
         if (ctx->put_epoch_npes > 0) {
             shmem_transport_ofi_wait_put_counter(ctx);
         }
@@ -804,18 +827,27 @@ void shmem_transport_put_quiet(shmem_transport_ctx_t* ctx)
             };
             const struct fi_msg_rma msg = {
                 .msg_iov = &iov,
-                .desc = GET_MR_DESC_ADDR(shmem_transport_ofi_get_mr_desc_index(
+                .desc = ctx->bounce_tx_complete ? &ctx->bounce_tx_marker_desc :
+                    GET_MR_DESC_ADDR(shmem_transport_ofi_get_mr_desc_index(
                                             shmem_internal_data_base)),
                 .iov_count = 1,
                 .addr = GET_DEST(pe),
                 .rma_iov = &rma_iov,
                 .rma_iov_count = 1,
-                .context = &ctx->put_epoch_context
+                .context = ctx->bounce_tx_complete ?
+                    &ctx->bounce_tx_marker.context : &ctx->put_epoch_context
             };
 
             shmem_transport_ofi_more_reserve(ctx);
             shmem_transport_ofi_ensure_put_counter_capacity(ctx);
             ctx->put_epoch_complete = false;
+            if (ctx->bounce_tx_complete) {
+                if (!ctx->bounce_tx_marker_desc ||
+                    ctx->bounce_tx_marker.outstanding)
+                    RAISE_ERROR_STR("Invalid TX-bounce delivery marker ownership");
+                ctx->bounce_tx_marker.complete = false;
+                ctx->bounce_tx_marker.outstanding = true;
+            }
             ctx->put_cntr_pending++;
             do {
                 ret = fi_writemsg(ctx->ep, &msg,
@@ -826,21 +858,34 @@ void shmem_transport_put_quiet(shmem_transport_ctx_t* ctx)
             /* Only the terminal operation generates a write CQ event (apart
              * from events needed to reclaim bounce buffers). */
             if (ctx->bounce_buffers) SHMEM_TRANSPORT_OFI_CTX_BB_LOCK(ctx);
-            while (!ctx->put_epoch_complete) {
+            while (!(ctx->bounce_tx_complete ? ctx->bounce_tx_marker.complete :
+                                              ctx->put_epoch_complete)) {
                 shmem_transport_ofi_drain_cq(ctx);
                 shmem_transport_probe();
             }
             if (ctx->bounce_buffers) SHMEM_TRANSPORT_OFI_CTX_BB_UNLOCK(ctx);
+            if (ctx->bounce_tx_complete)
+                ctx->bounce_tx_marker.outstanding = false;
         }
     }
     for (size_t i = 0; i < ctx->put_epoch_npes; i++)
         ctx->put_epoch_dirty[ctx->put_epoch_pes[i]] = 0;
     ctx->put_epoch_npes = 0;
+    ctx->bounce_tx_weak_pending = 0;
     ctx->put_epoch_puts = 0;
     ctx->put_epoch_id++;
     ctx->completed_put_cntr = SHMEM_TRANSPORT_OFI_CNTR_READ(&ctx->pending_put_cntr);
 
     SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
+}
+
+/* SINGLE/default-only mode: call before acquiring a context or pool lock.
+ * Control, fetching and direct routes cannot expose weak predecessors. */
+static inline
+void shmem_transport_ofi_bounce_tx_order(shmem_transport_ctx_t *ctx)
+{
+    if (ctx->bounce_tx_complete && ctx->bounce_tx_weak_pending)
+        shmem_transport_put_quiet(ctx);
 }
 
 static inline
@@ -857,6 +902,7 @@ int shmem_transport_quiet(shmem_transport_ctx_t* ctx)
 static inline
 int shmem_transport_fence(shmem_transport_ctx_t* ctx)
 {
+    shmem_transport_ofi_bounce_tx_order(ctx);
     shmem_transport_ofi_ctx_lock(ctx);
     shmem_transport_ofi_more_flush(ctx, OFI_MORE_FENCE);
     SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
@@ -1022,6 +1068,7 @@ void shmem_transport_ofi_put_scalar_chunk(shmem_transport_ctx_t* ctx, void *targ
 
     shmem_internal_assert(len <= shmem_transport_ofi_max_buffered_send);
 
+    shmem_transport_ofi_bounce_tx_order(ctx);
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
     shmem_transport_ofi_begin_put(ctx, epoch);
     shmem_transport_ofi_record_put(ctx, pe);
@@ -1061,6 +1108,7 @@ void shmem_transport_ofi_put_large_chunk(shmem_transport_ctx_t* ctx, void *targe
     size_t frag_len = len;
 
     /* A fragmented transfer is one logical put for batch selection. */
+    shmem_transport_ofi_bounce_tx_order(ctx);
     SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
     shmem_transport_ofi_begin_put(ctx, epoch);
     while (frag_source < ((uint8_t *) source) + len) {
@@ -1108,12 +1156,25 @@ void shmem_transport_ofi_put_nb_chunk(shmem_transport_ctx_t* ctx, void *target,
 
     } else if (len <= shmem_transport_ofi_bounce_buffer_size && ctx->bounce_buffers) {
 
+        bool tx_complete = shmem_transport_ofi_bounce_tx_eligible(
+            ctx->bounce_tx_complete, len, shmem_transport_ofi_max_buffered_send,
+            shmem_transport_ofi_bounce_buffer_size, shmem_transport_ofi_max_msg_size) &&
+            shmem_internal_get_shr_rank(pe) == -1;
+        /* CMA can route a large local payload through the NIC but subsequent
+         * scalar controls through shared memory. Keep such peers strong. */
+        if (!tx_complete)
+            shmem_transport_ofi_bounce_tx_order(ctx);
         SHMEM_TRANSPORT_OFI_CTX_LOCK(ctx);
         shmem_transport_ofi_begin_put(ctx, epoch);
         shmem_transport_ofi_get_mr(target, pe, &addr, &key);
 
         shmem_transport_ofi_bounce_buffer_t *buff =
             create_bounce_buffer(ctx, source, len);
+        if (tx_complete) {
+            if (!buff->local_desc)
+                RAISE_ERROR_STR("TX-bounce source has no registered descriptor");
+            buff->frag.mytype = SHMEM_TRANSPORT_OFI_TYPE_BOUNCE_TX;
+        }
         /* Pool-pressure retirement above must not wait for this unposted put. */
         bool more_eligible = shmem_transport_ofi_more_prepare(ctx, len);
         shmem_transport_ofi_record_put(ctx, pe);
@@ -1144,8 +1205,10 @@ void shmem_transport_ofi_put_nb_chunk(shmem_transport_ctx_t* ctx, void *target,
         ctx->put_more.bounce_post = true;
         ctx->put_more.bounce_flags = more_eligible ?
             shmem_transport_ofi_more_flags(&ctx->put_more, headroom) : 0;
+        uint64_t completion_flags = tx_complete ? FI_TRANSMIT_COMPLETE :
+                                                  FI_DELIVERY_COMPLETE;
         do {
-            ret = fi_writemsg(ctx->ep, &msg, FI_DELIVERY_COMPLETE |
+            ret = fi_writemsg(ctx->ep, &msg, completion_flags |
                              (ctx->bounce_counter_retire ? 0 : FI_COMPLETION) |
                              ctx->put_more.bounce_flags);
             if (!ret) {
@@ -1159,8 +1222,12 @@ void shmem_transport_ofi_put_nb_chunk(shmem_transport_ctx_t* ctx, void *target,
                 }
             }
         } while (SHMEM_TRANSPORT_OFI_RETRY(ctx, ret, &polled, pe, len,
-                    FI_DELIVERY_COMPLETE | (ctx->bounce_counter_retire ? 0 : FI_COMPLETION) |
+                    completion_flags | (ctx->bounce_counter_retire ? 0 : FI_COMPLETION) |
                     ctx->put_more.bounce_flags));
+        if (tx_complete)
+            shmem_transport_ofi_bounce_tx_mark_peer(ctx->put_epoch_dirty,
+                ctx->put_epoch_pes, &ctx->put_epoch_npes,
+                &ctx->bounce_tx_weak_pending, pe);
         if (ctx->bounce_counter_retire) {
             buff->counter_next = ctx->bounce_counter_head;
             ctx->bounce_counter_head = buff;
@@ -1190,6 +1257,7 @@ static inline
 void shmem_transport_put_signal_nbi(shmem_transport_ctx_t* ctx, void *target, const void *source, size_t len,
                                     uint64_t *sig_addr, uint64_t signal, int sig_op, int pe)
 {
+    shmem_transport_ofi_bounce_tx_order(ctx);
     int ret = 0;
     uint64_t dst = (uint64_t) pe;
     uint64_t polled = 0;
@@ -1363,6 +1431,7 @@ void shmem_transport_put_nbi(shmem_transport_ctx_t* ctx, void *target, const voi
 static inline
 void shmem_transport_get(shmem_transport_ctx_t* ctx, void *target, const void *source, size_t len, int pe)
 {
+    shmem_transport_ofi_bounce_tx_order(ctx);
     int ret = 0;
     uint64_t dst = (uint64_t) pe;
     uint64_t polled = 0;
@@ -1450,6 +1519,7 @@ void shmem_transport_cswap_nbi(shmem_transport_ctx_t* ctx, void *target, const
                                void *source, void *dest, const void *operand,
                                size_t len, int pe, int datatype)
 {
+    shmem_transport_ofi_bounce_tx_order(ctx);
     int ret = 0;
     uint64_t dst = (uint64_t) pe;
     uint64_t polled = 0;
@@ -1501,6 +1571,7 @@ static inline
 void shmem_transport_cswap(shmem_transport_ctx_t* ctx, void *target, const void *source, void *dest,
                            const void *operand, size_t len, int pe, int datatype)
 {
+    shmem_transport_ofi_bounce_tx_order(ctx);
 #ifdef ENABLE_MR_ENDPOINT
     /* CXI provider currently does not support fetch atomics with FI_DELIVERY_COMPLETE
      * That is why non-blocking API is used which uses FI_INJECT. FI_ATOMIC_READ is
@@ -1548,6 +1619,7 @@ static inline
 void shmem_transport_mswap(shmem_transport_ctx_t* ctx, void *target, const void *source, void *dest,
                            const void *mask, size_t len, int pe, int datatype)
 {
+    shmem_transport_ofi_bounce_tx_order(ctx);
     int ret = 0;
     uint64_t dst = (uint64_t) pe;
     uint64_t polled = 0;
@@ -1587,6 +1659,7 @@ static inline
 void shmem_transport_atomic(shmem_transport_ctx_t* ctx, void *target, const void *source, size_t len,
                             int pe, int op, int datatype)
 {
+    shmem_transport_ofi_bounce_tx_order(ctx);
     int ret = 0;
     uint64_t dst = (uint64_t) pe;
     uint64_t polled = 0;
@@ -1616,6 +1689,7 @@ void shmem_transport_atomicv(shmem_transport_ctx_t* ctx, void *target, const voi
                              size_t count, size_t type_size, int pe, int op, int datatype,
                              long *completion)
 {
+    shmem_transport_ofi_bounce_tx_order(ctx);
     size_t full_len = count*type_size;
     int ret = 0;
     uint64_t dst = (uint64_t) pe;
@@ -1717,6 +1791,7 @@ void shmem_transport_fetch_atomic_nbi(shmem_transport_ctx_t* ctx, void *target,
                                       const void *source, void *dest,
                                       size_t len, int pe, int op, int datatype)
 {
+    shmem_transport_ofi_bounce_tx_order(ctx);
     int ret = 0;
     uint64_t dst = (uint64_t) pe;
     uint64_t polled = 0;
@@ -1772,6 +1847,7 @@ void shmem_transport_fetch_atomic(shmem_transport_ctx_t* ctx, void *target,
                                   const void *source, void *dest,
                                   size_t len, int pe, int op, int datatype)
 {
+    shmem_transport_ofi_bounce_tx_order(ctx);
 #ifdef ENABLE_MR_ENDPOINT
     /* CXI provider currently does not support fetch atomics with FI_DELIVERY_COMPLETE
      * That is why non-blocking API is used which uses FI_INJECT. FI_ATOMIC_READ is

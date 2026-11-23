@@ -17,6 +17,7 @@ EXTRA_DIST = sandia-openshmem.spec autogen.sh pmi-simple \
 	scripts/build-ofi-immediate.sh scripts/rebuild-ofi.sh.in \
 	scripts/run-osu-shmem.sh.in scripts/launch-node-budget.sh.in \
 	scripts/test_ofi_retry_probe.py scripts/test_ofi_bounce_pool_stats.py \
+	scripts/test_ofi_bounce_tx_complete.py \
 	tests/ofi_retry_probe.md
 
 if ENABLE_MANPAGES

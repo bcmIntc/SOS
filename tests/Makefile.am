@@ -96,9 +96,17 @@ NPROCS ?= 2
 LOG_COMPILER = $(TEST_RUNNER)
 endif
 
+# Source-extracted CPU model: no libsma, configure/build of production, launcher
+# or allocation is required. Override PYTHON when python3 predates Python 3.8.
+PYTHON ?= python3
+.PHONY: check-ofi-bounce-tx-model
+check-ofi-bounce-tx-model:
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) "$(top_srcdir)/scripts/test_ofi_bounce_tx_complete.py"
+
 EXTRA_DIST = run-ofi-immediate-matrix.sh.in test_ofi_immediate_matrix.py \
              run-ofi-node-budget.sh.in \
              run-ofi-more.sh.in \
              run-ofi-quiet-matrix.sh.in test_ofi_quiet_oracle.py quiet-model/shmem.h \
              test_ofi_vpath_workflow.py run-ofi-counter-hardware.sh.in \
-             test_ofi_counter_hardware_runner.py test_osu_shmem_runner.py
+             test_ofi_counter_hardware_runner.py test_osu_shmem_runner.py \
+             ofi_bounce_tx_model.c ofi_bounce_tx_complete.md

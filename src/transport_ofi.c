@@ -746,7 +746,8 @@ enable_bounce_local_mr(struct fabric_info *info)
         if (shmem_internal_thread_level != SHMEM_THREAD_SINGLE)
             RAISE_ERROR_STR("OFI_BOUNCE_COUNTER_RETIRE requires SHMEM_THREAD_SINGLE");
     }
-    if (!shmem_internal_params.OFI_BOUNCE_LOCAL_MR)
+    if (!shmem_internal_params.OFI_BOUNCE_LOCAL_MR &&
+        !shmem_internal_params.OFI_BOUNCE_TX_COMPLETE)
         return;
     if (!info->p_info->fabric_attr->prov_name ||
         strcmp(info->p_info->fabric_attr->prov_name, "cxi"))
@@ -792,7 +793,8 @@ register_bounce_local_mr(shmem_transport_ctx_t *ctx, void *base, size_t bytes)
 static void
 init_bounce_local_mrs(shmem_transport_ctx_t *ctx)
 {
-    if (!shmem_internal_params.OFI_BOUNCE_LOCAL_MR ||
+    if ((!shmem_internal_params.OFI_BOUNCE_LOCAL_MR &&
+         !shmem_internal_params.OFI_BOUNCE_TX_COMPLETE) ||
         ctx->id != SHMEM_TRANSPORT_CTX_DEFAULT_ID)
         return;
     if (!ctx->bounce_buffers)
@@ -1806,6 +1808,8 @@ int query_for_fabric(struct fabric_info *info)
     ep_attr.tx_ctx_cnt        = 0;
     hints.fabric_attr         = &fabric_attr;
     tx_attr.op_flags          = FI_DELIVERY_COMPLETE;
+    if (shmem_internal_params.OFI_BOUNCE_TX_COMPLETE)
+        tx_attr.op_flags |= FI_COMPLETION;
     tx_attr.inject_size       = shmem_transport_ofi_max_buffered_send; /* require provider to support this as a min */
     hints.tx_attr             = &tx_attr; /* TODO: fill tx_attr */
     hints.rx_attr             = NULL;
@@ -1896,6 +1900,43 @@ int query_for_fabric(struct fabric_info *info)
                        info->fabric_name != NULL ? info->fabric_name : "<auto>",
                        info->domain_name != NULL ? info->domain_name : "<auto>");
         return ret;
+    }
+
+    if (shmem_internal_params.OFI_BOUNCE_TX_COMPLETE) {
+        const uint64_t required = FI_RMA | FI_WRITE | FI_FENCE;
+        struct fi_info *tx_info = NULL;
+        if (!info->p_info->fabric_attr->prov_name ||
+            strcmp(info->p_info->fabric_attr->prov_name, "cxi"))
+            RAISE_ERROR_STR("OFI_BOUNCE_TX_COMPLETE requires the CXI provider");
+        if ((info->p_info->caps & required) != required ||
+            (info->p_info->tx_attr->caps & required) != required ||
+            (info->p_info->tx_attr->op_flags &
+             (FI_DELIVERY_COMPLETE | FI_COMPLETION)) !=
+             (FI_DELIVERY_COMPLETE | FI_COMPLETION))
+            RAISE_ERROR_STR("OFI_BOUNCE_TX_COMPLETE requires negotiated fenced delivery/CQ completion");
+        if ((info->p_info->mode | info->p_info->tx_attr->mode) &
+            (FI_CONTEXT | FI_CONTEXT2 | FI_LOCAL_MR))
+            RAISE_ERROR_STR("OFI_BOUNCE_TX_COMPLETE does not support provider context/local-MR modes");
+        /* Bounce descriptors support local MR registration, but the retained
+         * host direct/get/atomic routes do not supply mandatory local MRs. */
+        if (info->p_info->domain_attr->mr_mode & FI_MR_LOCAL)
+            RAISE_ERROR_STR("OFI_BOUNCE_TX_COMPLETE requires optional local descriptors for unchanged direct routes");
+        /* Completion levels are alternative per-operation flags, not a pair
+         * of endpoint defaults. Verify TX support separately on this exact
+         * selected provider/domain, retaining delivery negotiation above. */
+        fabric_attr.prov_name = info->p_info->fabric_attr->prov_name;
+        fabric_attr.name = info->p_info->fabric_attr->name;
+        domain_attr.name = info->p_info->domain_attr->name;
+        tx_attr.op_flags = FI_TRANSMIT_COMPLETE | FI_COMPLETION;
+        ret = fi_getinfo(FI_VERSION(OFI_MAJOR_VERSION, OFI_MINOR_VERSION),
+                         NULL, NULL, 0, &hints, &tx_info);
+        OFI_CHECK_ERROR_MSG(ret, "OFI_BOUNCE_TX_COMPLETE TX/CQ negotiation failed (%s)\n",
+                            fi_strerror(-ret));
+        if (!tx_info ||
+            (tx_info->tx_attr->op_flags & tx_attr.op_flags) != tx_attr.op_flags ||
+            (tx_info->tx_attr->caps & required) != required)
+            RAISE_ERROR_STR("OFI_BOUNCE_TX_COMPLETE TX/CQ flags not negotiated");
+        fi_freeinfo(tx_info);
     }
 
     if (info->p_info->ep_attr->max_msg_size > 0) {
@@ -2043,6 +2084,10 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
     ctx->bounce_local_mrs = NULL;
     ctx->bounce_counter_head = NULL;
     ctx->bounce_counter_retire = false;
+    ctx->bounce_tx_complete = false;
+    ctx->bounce_tx_weak_pending = 0;
+    ctx->bounce_tx_marker_desc = NULL;
+    memset(&ctx->bounce_tx_marker, 0, sizeof(ctx->bounce_tx_marker));
     ctx->bounce_puts = ctx->bounce_counter_puts = 0;
     ctx->bounce_counter_reclaimed = ctx->bounce_counter_groups = 0;
     ctx->bounce_pool_stats = shmem_internal_params.OFI_BOUNCE_POOL_STATS;
@@ -2137,6 +2182,35 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
     }
     init_bounce_local_mrs(ctx);
     if (id == SHMEM_TRANSPORT_CTX_DEFAULT_ID &&
+        shmem_internal_params.OFI_BOUNCE_TX_COMPLETE) {
+        if (ctx != &shmem_transport_ctx_default ||
+            ctx->options & (SHMEM_CTX_PRIVATE | SHMEM_CTX_SERIALIZED) ||
+            ctx->stx_idx >= 0 || !ctx->bounce_buffers || !ctx->bounce_local_mrs)
+            RAISE_ERROR_STR("OFI_BOUNCE_TX_COMPLETE requires registered bounce buffers and an exclusive ordinary default context");
+        size_t lower = shmem_transport_ofi_max_buffered_send > 1024 ?
+                       shmem_transport_ofi_max_buffered_send : 1024;
+        size_t upper = MIN((size_t)8192, MIN(shmem_transport_ofi_bounce_buffer_size,
+                                           shmem_transport_ofi_max_msg_size));
+        if (lower >= upper)
+            RAISE_ERROR_MSG("OFI_BOUNCE_TX_COMPLETE has an empty effective window (%zu,%zu] B\n",
+                            lower, upper);
+        if (!shmem_internal_data_base || !shmem_internal_data_length)
+            RAISE_ERROR_STR("OFI_BOUNCE_TX_COMPLETE requires a registered symmetric marker address");
+        /* Stable registered host address and descriptor; marker CQ storage is
+         * in the context, never a pool slot. No registration while posting. */
+        ctx->bounce_tx_marker_desc =
+            register_bounce_local_mr(ctx, shmem_internal_data_base, 1);
+        ctx->bounce_tx_complete = true;
+        if (shmem_internal_my_pe == 0)
+            fprintf(stderr, "[0000] OFI TX-complete bounce prototype: enabled=1 "
+                    "window=(%zu,%zu]B inject=%zu bounce=%zu max_msg=%zu "
+                    "provider=cxi host=1 thread=SINGLE context=default peers=nonshared stx=exclusive "
+                    "source_retirement=TX-CQ delivery=fenced-peer-CQ\n",
+                    lower, upper, shmem_transport_ofi_max_buffered_send,
+                    shmem_transport_ofi_bounce_buffer_size,
+                    shmem_transport_ofi_max_msg_size);
+    }
+    if (id == SHMEM_TRANSPORT_CTX_DEFAULT_ID &&
         shmem_internal_params.OFI_BOUNCE_NODE_BUDGET &&
         (ctx->stx_idx >= 0 || !ctx->bounce_buffers || !ctx->bounce_local_mrs))
         RAISE_ERROR_STR("OFI_BOUNCE_NODE_BUDGET requires registered bounce buffers and an exclusive default TX queue (OFI_STX_MAX=0)");
@@ -2170,6 +2244,23 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
 int shmem_transport_init(void)
 {
     int ret = 0;
+    if (shmem_internal_params.OFI_BOUNCE_TX_COMPLETE) {
+#ifdef USE_FI_HMEM
+        RAISE_ERROR_STR("OFI_BOUNCE_TX_COMPLETE requires a host-only build");
+#endif
+        if (shmem_internal_thread_level != SHMEM_THREAD_SINGLE)
+            RAISE_ERROR_STR("OFI_BOUNCE_TX_COMPLETE requires SHMEM_THREAD_SINGLE");
+        if (shmem_internal_params.OFI_STX_MAX != 0 ||
+            shmem_internal_params.OFI_STX_AUTO)
+            RAISE_ERROR_STR("OFI_BOUNCE_TX_COMPLETE requires OFI_STX_MAX=0 and OFI_STX_AUTO off");
+        if (shmem_internal_params.OFI_PUT_MORE_BATCH ||
+            shmem_internal_params.OFI_BOUNCE_COUNTER_RETIRE ||
+            shmem_internal_params.OFI_BOUNCE_NODE_BUDGET)
+            RAISE_ERROR_STR("OFI_BOUNCE_TX_COMPLETE requires FI_MORE (including batch=1), counter source retirement and node budget off");
+        if (!shmem_internal_params.BOUNCE_SIZE ||
+            !shmem_internal_params.MAX_BOUNCE_BUFFERS)
+            RAISE_ERROR_STR("OFI_BOUNCE_TX_COMPLETE requires a nonempty bounce pool");
+    }
     if (shmem_internal_params.OFI_CQ_BATCH_SIZE < 1 ||
         shmem_internal_params.OFI_CQ_BATCH_SIZE > 32)
         RAISE_ERROR_STR("OFI_CQ_BATCH_SIZE must be between 1 and 32");
@@ -2464,6 +2555,10 @@ void shmem_transport_ctx_destroy(shmem_transport_ctx_t *ctx)
 
     if (ctx == NULL)
         return;
+    if (ctx->bounce_tx_complete)
+        shmem_transport_put_quiet(ctx);
+    shmem_internal_assert(!ctx->bounce_tx_weak_pending);
+    shmem_internal_assert(!ctx->bounce_tx_marker.outstanding);
     shmem_internal_assert(ctx->put_more.count == 0);
     shmem_internal_assert(ctx->bounce_counter_head == NULL);
     if (ctx->bounce_pool_stats) {

@@ -105,6 +105,8 @@ SHMEM_INTERNAL_ENV_DEF(OFI_CQ_BATCH_SIZE, size, 1, SHMEM_INTERNAL_ENV_CAT_TRANSP
                        "Maximum OFI CQ entries per read (1-32); does not change event generation")
 SHMEM_INTERNAL_ENV_DEF(OFI_BOUNCE_LOCAL_MR, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Preregister default-context host bounce sources using CXI hybrid descriptors")
+SHMEM_INTERNAL_ENV_DEF(OFI_BOUNCE_TX_COMPLETE, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
+                       "Prototype TX-CQ retirement for registered CXI host bounce puts to nonshared peers (1024,8192]B; requires SHMEM_THREAD_SINGLE, OFI_STX_MAX=0 and FI_MORE/counter retirement/node budget off")
 SHMEM_INTERNAL_ENV_DEF(OFI_BOUNCE_COUNTER_RETIRE, bool, false, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
                        "Retire default bounce puts at a full delivery-counter snapshot; requires local MRs, SHMEM_THREAD_SINGLE and OFI_STX_MAX=0")
 SHMEM_INTERNAL_ENV_DEF(OFI_BOUNCE_NODE_BUDGET, size, 0, SHMEM_INTERNAL_ENV_CAT_TRANSPORT,
