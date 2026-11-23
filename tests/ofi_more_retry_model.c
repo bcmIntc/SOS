@@ -24,6 +24,7 @@ struct fi_msg_rma {
 typedef struct {
     shmem_transport_ofi_more_state_t put_more;
     uint64_t put_cntr_pending, put_cntr_limit, pending_get_cntr;
+    uint64_t retry_probe_cq_events;
     struct counter *put_cntr, *get_cntr;
     void *bounce_buffers, *ep;
 } shmem_transport_ctx_t;
@@ -81,6 +82,13 @@ static uint64_t shmem_transport_ofi_read_put_counter(shmem_transport_ctx_t *ctx)
     uint64_t completed = fi_cntr_read(ctx->put_cntr);
     if (fi_cntr_readerr(ctx->put_cntr)) RAISE_ERROR_STR("put counter error");
     return completed;
+}
+static void shmem_transport_ofi_retry_probe(shmem_transport_ctx_t *ctx,
+    const char *operation, int line, int pe, size_t bytes, uint64_t flags,
+    int ret, uint64_t polled, uint64_t cq_before, bool exhausted)
+{
+    (void)ctx; (void)operation; (void)line; (void)pe; (void)bytes; (void)flags;
+    (void)ret; (void)polled; (void)cq_before; (void)exhausted;
 }
 #include "transport_ofi_more.h"
 

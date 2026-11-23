@@ -420,6 +420,10 @@ struct shmem_transport_ctx_t {
     uint64_t                        bounce_pool_high_water;
     double                          bounce_pool_wait_seconds;
     double                          bounce_pool_max_wait_seconds;
+    bool                            retry_probe;
+    uint64_t                        retry_probe_reports;
+    uint64_t                        retry_probe_cq_reads;
+    uint64_t                        retry_probe_cq_events;
     shmem_transport_ofi_more_state_t put_more;
     shmem_transport_ofi_node_quota_t node_quota;
     int                             stx_idx;
@@ -582,6 +586,10 @@ void shmem_transport_ofi_drain_cq(shmem_transport_ctx_t *ctx)
 
     for (;;) {
         ret = fi_cq_read(ctx->cq, (void *)buf, batch);
+        if (ctx->retry_probe) {
+            ctx->retry_probe_cq_reads++;
+            if (ret > 0) ctx->retry_probe_cq_events += (uint64_t) ret;
+        }
 
         if (ret == -FI_EAGAIN) break; /* No events */
 
@@ -623,6 +631,10 @@ void shmem_transport_ofi_drain_cq(shmem_transport_ctx_t *ctx)
     shmem_transport_ofi_more_flush(ctx, OFI_MORE_REBASE)
 #include "transport_ofi_counter.h"
 #undef SHMEM_TRANSPORT_OFI_COUNTER_FLUSH
+
+static inline void shmem_transport_ofi_retry_probe(shmem_transport_ctx_t *ctx,
+    const char *operation, int line, int pe, size_t bytes, uint64_t flags,
+    int ret, uint64_t polled, uint64_t cq_before, bool exhausted);
 
 #include "transport_ofi_more.h"
 
@@ -742,7 +754,11 @@ shmem_transport_ofi_bounce_buffer_t * create_bounce_buffer(shmem_transport_ctx_t
 }
 
 static inline int try_again(shmem_transport_ctx_t *ctx, const int ret,
-                            uint64_t *polled);
+                            uint64_t *polled, const char *operation, int line,
+                            int pe, size_t bytes, uint64_t flags);
+
+#define SHMEM_TRANSPORT_OFI_RETRY(ctx, ret, polled, pe, bytes, flags) \
+    try_again(ctx, ret, polled, __func__, __LINE__, pe, bytes, flags)
 
 static inline
 void shmem_transport_put_quiet(shmem_transport_ctx_t* ctx)
@@ -804,7 +820,8 @@ void shmem_transport_put_quiet(shmem_transport_ctx_t* ctx)
             do {
                 ret = fi_writemsg(ctx->ep, &msg,
                                   FI_FENCE | FI_DELIVERY_COMPLETE | FI_COMPLETION);
-            } while (try_again(ctx, ret, &polled));
+            } while (SHMEM_TRANSPORT_OFI_RETRY(ctx, ret, &polled, pe, 0,
+                        FI_FENCE | FI_DELIVERY_COMPLETE | FI_COMPLETION));
 
             /* Only the terminal operation generates a write CQ event (apart
              * from events needed to reclaim bounce buffers). */
@@ -859,10 +876,47 @@ int shmem_transport_fence(shmem_transport_ctx_t* ctx)
  * to reclaim resources and indicate that the operation should be retried.  If
  * retry limit (ofi_max_poll) is exceeded, abort. */
 static inline
-int try_again(shmem_transport_ctx_t *ctx, const int ret, uint64_t *polled) {
+void shmem_transport_ofi_retry_probe(shmem_transport_ctx_t *ctx,
+                                     const char *operation, int line,
+                                     int pe, size_t bytes, uint64_t flags,
+                                     int ret, uint64_t polled,
+                                     uint64_t cq_before, bool exhausted)
+{
+    if (!ctx->retry_probe) return;
+    if (!exhausted && ((polled != 1 && polled != 16) || ctx->retry_probe_reports >= 8))
+        return;
+    ctx->retry_probe_reports++;
+    fprintf(stderr, "[%04d] OFI retry probe: ctx=%d operation=%s line=%d pe=%d "
+            "bytes=%zu flags=0x%" PRIx64 " fi_more=%d ret=%d attempt=%" PRIu64
+            " exhausted=%d put_issued=%" PRIu64 " put_done=%" PRIu64
+            " put_errors=%" PRIu64 " get_issued=%" PRIu64 " get_done=%" PRIu64
+            " get_errors=%" PRIu64 " cq_reads=%" PRIu64 " cq_events=%" PRIu64
+            " cq_events_before=%" PRIu64 " bb_pending=%" PRIu64
+            " bb_done=%" PRIu64 " pool_used=%" PRIu64 " pool_limit=%zu"
+            " more_limit=%zu more_count=%zu more_flags=0x%" PRIx64
+            " more_dest=%" PRIu64 " tx_posts=%" PRIu64 " budget=%zu epoch_puts=%u epoch_peers=%zu"
+            " epoch_complete=%d single_ep=%d stx_idx=%d\n",
+            shmem_internal_my_pe, ctx->id, operation, line, pe, bytes,
+            flags, !!(flags & FI_MORE), ret, polled, exhausted,
+            ctx->put_cntr_pending, fi_cntr_read(ctx->put_cntr), fi_cntr_readerr(ctx->put_cntr),
+            SHMEM_TRANSPORT_OFI_CNTR_READ(&ctx->pending_get_cntr),
+            fi_cntr_read(ctx->get_cntr), fi_cntr_readerr(ctx->get_cntr),
+            ctx->retry_probe_cq_reads, ctx->retry_probe_cq_events, cq_before,
+            ctx->pending_bb_cntr, ctx->completed_bb_cntr,
+            ctx->bounce_buffers ? ctx->bounce_buffers->nalloc : 0,
+            shmem_transport_ofi_max_bounce_buffers, ctx->put_more.limit,
+            ctx->put_more.count, ctx->put_more.bounce_flags, ctx->put_more.dest, ctx->put_more.tx_posts,
+            ctx->put_more.budget, ctx->put_epoch_puts, ctx->put_epoch_npes,
+            ctx->put_epoch_complete, shmem_transport_ofi_single_ep, ctx->stx_idx);
+}
+
+static inline
+int try_again(shmem_transport_ctx_t *ctx, const int ret, uint64_t *polled,
+              const char *operation, int line, int pe, size_t bytes, uint64_t flags) {
 
     if (ret) {
         if (ret == -FI_EAGAIN) {
+            uint64_t cq_before = ctx->retry_probe_cq_events;
             /* Issued counts already include the unaccepted member. Do not
              * enter admission/rebase waits from this retry path. */
             shmem_transport_ofi_more_flush(ctx, OFI_MORE_RETRY);
@@ -884,6 +938,10 @@ int try_again(shmem_transport_ctx_t *ctx, const int ret, uint64_t *polled) {
             shmem_transport_probe();
 
             (*polled)++;
+            shmem_transport_ofi_retry_probe(ctx, operation, line, pe, bytes, flags,
+                ret, *polled, cq_before,
+                (ctx->put_more.limit && *polled >= 64) ||
+                *polled > shmem_transport_ofi_max_poll);
 
             if (ctx->put_more.limit && *polled >= 64)
                 RAISE_ERROR_STR("FI_MORE operation retry exceeded 64 attempts");
@@ -896,6 +954,8 @@ int try_again(shmem_transport_ctx_t *ctx, const int ret, uint64_t *polled) {
             }
         }
         else {
+            shmem_transport_ofi_retry_probe(ctx, operation, line, pe, bytes, flags,
+                ret, *polled, ctx->retry_probe_cq_events, true);
             OFI_CTX_CHECK_ERROR(ctx, (ssize_t) ret);
         }
     }
@@ -971,7 +1031,8 @@ void shmem_transport_ofi_put_scalar_chunk(shmem_transport_ctx_t* ctx, void *targ
         ret = shmem_transport_ofi_post_write(ctx, source, len, GET_DEST(dst),
                                              (uint64_t) addr, key, FI_INJECT);
 
-    } while (try_again(ctx, ret, &polled));
+    } while (SHMEM_TRANSPORT_OFI_RETRY(ctx, ret, &polled, pe, len,
+                FI_INJECT | FI_DELIVERY_COMPLETE));
     SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
 }
 
@@ -1012,7 +1073,8 @@ void shmem_transport_ofi_put_large_chunk(shmem_transport_ctx_t* ctx, void *targe
         do {
             ret = shmem_transport_ofi_post_write(ctx, frag_source, frag_len,
                                                  GET_DEST(dst), frag_target, key, 0);
-        } while (try_again(ctx, ret, &polled));
+        } while (SHMEM_TRANSPORT_OFI_RETRY(ctx, ret, &polled, pe, frag_len,
+                    FI_DELIVERY_COMPLETE));
 
         frag_source += frag_len;
         frag_target += frag_len;
@@ -1096,7 +1158,9 @@ void shmem_transport_ofi_put_nb_chunk(shmem_transport_ctx_t* ctx, void *target,
                     ctx->put_more.key = key;
                 }
             }
-        } while (try_again(ctx, ret, &polled));
+        } while (SHMEM_TRANSPORT_OFI_RETRY(ctx, ret, &polled, pe, len,
+                    FI_DELIVERY_COMPLETE | (ctx->bounce_counter_retire ? 0 : FI_COMPLETION) |
+                    ctx->put_more.bounce_flags));
         if (ctx->bounce_counter_retire) {
             buff->counter_next = ctx->bounce_counter_head;
             ctx->bounce_counter_head = buff;
@@ -1163,7 +1227,8 @@ void shmem_transport_put_signal_nbi(shmem_transport_ctx_t* ctx, void *target, co
 
         do {
             ret = fi_writemsg(ctx->ep, &msg, FI_INJECT | FI_DELIVERY_COMPLETE);
-        } while (try_again(ctx, ret, &polled));
+        } while (SHMEM_TRANSPORT_OFI_RETRY(ctx, ret, &polled, pe, len,
+                    FI_INJECT | FI_DELIVERY_COMPLETE));
 
         SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
     } else {
@@ -1212,7 +1277,8 @@ void shmem_transport_put_signal_nbi(shmem_transport_ctx_t* ctx, void *target, co
 
             do {
                 ret = fi_writemsg(ctx->ep, &msg, FI_DELIVERY_COMPLETE);
-            } while (try_again(ctx, ret, &polled));
+            } while (SHMEM_TRANSPORT_OFI_RETRY(ctx, ret, &polled, pe, frag_len,
+                        FI_DELIVERY_COMPLETE));
 
             frag_source += frag_len;
             frag_target += frag_len;
@@ -1262,7 +1328,7 @@ void shmem_transport_put_signal_nbi(shmem_transport_ctx_t* ctx, void *target, co
 
     do {
         ret = fi_atomicmsg(ctx->ep, &msg_signal, flags_signal);
-    } while (try_again(ctx, ret, &polled));
+    } while (SHMEM_TRANSPORT_OFI_RETRY(ctx, ret, &polled, pe, sizeof(signal), flags_signal));
 
     SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
 }
@@ -1319,7 +1385,7 @@ void shmem_transport_get(shmem_transport_ctx_t* ctx, void *target, const void *s
                           (uint64_t) addr,
                           key,
                           NULL);
-        } while (try_again(ctx, ret, &polled));
+        } while (SHMEM_TRANSPORT_OFI_RETRY(ctx, ret, &polled, pe, len, 0));
     }
     else {
         uint8_t *frag_target = (uint8_t *) target;
@@ -1340,7 +1406,7 @@ void shmem_transport_get(shmem_transport_ctx_t* ctx, void *target, const void *s
                               GET_MR_DESC(shmem_transport_ofi_get_mr_desc_index(target)),
                               GET_DEST(dst), frag_source,
                               key, NULL);
-            } while (try_again(ctx, ret, &polled));
+            } while (SHMEM_TRANSPORT_OFI_RETRY(ctx, ret, &polled, pe, frag_len, 0));
 
             frag_source += frag_len;
             frag_target += frag_len;
@@ -1426,7 +1492,7 @@ void shmem_transport_cswap_nbi(shmem_transport_ctx_t* ctx, void *target, const
                                    1,
                                    FI_INJECT);  /* FI_DELIVERY_COMPLETE is not required as 
                                                    it is implied for fetch atomicmsgs */
-    } while (try_again(ctx, ret, &polled));
+    } while (SHMEM_TRANSPORT_OFI_RETRY(ctx, ret, &polled, pe, len, FI_INJECT));
     SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
 }
 
@@ -1472,7 +1538,7 @@ void shmem_transport_cswap(shmem_transport_ctx_t* ctx, void *target, const void 
                                 SHMEM_TRANSPORT_DTYPE(datatype),
                                 FI_CSWAP,
                                 NULL);
-    } while (try_again(ctx, ret, &polled));
+    } while (SHMEM_TRANSPORT_OFI_RETRY(ctx, ret, &polled, pe, len, 0));
     SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
 #endif
 }
@@ -1512,7 +1578,7 @@ void shmem_transport_mswap(shmem_transport_ctx_t* ctx, void *target, const void 
                                 SHMEM_TRANSPORT_DTYPE(datatype),
                                 FI_MSWAP,
                                 NULL);
-    } while (try_again(ctx, ret, &polled));
+    } while (SHMEM_TRANSPORT_OFI_RETRY(ctx, ret, &polled, pe, len, 0));
     SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
 }
 
@@ -1539,7 +1605,8 @@ void shmem_transport_atomic(shmem_transport_ctx_t* ctx, void *target, const void
                                               (uint64_t) addr, key,
                                               SHMEM_TRANSPORT_DTYPE(datatype), op,
                                               FI_INJECT);
-    } while (try_again(ctx, ret, &polled));
+    } while (SHMEM_TRANSPORT_OFI_RETRY(ctx, ret, &polled, pe, len,
+                FI_INJECT | FI_DELIVERY_COMPLETE));
     SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
 }
 
@@ -1585,7 +1652,8 @@ void shmem_transport_atomicv(shmem_transport_ctx_t* ctx, void *target, const voi
             ret = shmem_transport_ofi_post_atomic(ctx, source, len, GET_DEST(dst),
                                                   (uint64_t) addr, key, dt, op,
                                                   FI_INJECT);
-        } while (try_again(ctx, ret, &polled));
+        } while (SHMEM_TRANSPORT_OFI_RETRY(ctx, ret, &polled, pe, full_len,
+                    FI_INJECT | FI_DELIVERY_COMPLETE));
 
     } else if (full_len <=
                MIN(shmem_transport_ofi_bounce_buffer_size, max_atomic_size) &&
@@ -1614,7 +1682,8 @@ void shmem_transport_atomicv(shmem_transport_ctx_t* ctx, void *target, const voi
                                              };
         do {
             ret = fi_atomicmsg(ctx->ep, &msg, FI_COMPLETION | FI_DELIVERY_COMPLETE);
-        } while (try_again(ctx, ret, &polled));
+        } while (SHMEM_TRANSPORT_OFI_RETRY(ctx, ret, &polled, pe, full_len,
+                    FI_COMPLETION | FI_DELIVERY_COMPLETE));
 
     } else {
         size_t sent = 0;
@@ -1630,7 +1699,8 @@ void shmem_transport_atomicv(shmem_transport_ctx_t* ctx, void *target, const voi
                     (const char *) source + sent * SHMEM_Dtsize[dt],
                     chunksize, GET_DEST(dst),
                     (uint64_t) addr + sent * SHMEM_Dtsize[dt], key, dt, op, 0);
-            } while (try_again(ctx, ret, &polled));
+            } while (SHMEM_TRANSPORT_OFI_RETRY(ctx, ret, &polled, pe,
+                        chunksize * SHMEM_Dtsize[dt], FI_DELIVERY_COMPLETE));
 
             sent += chunksize;
         }
@@ -1692,7 +1762,7 @@ void shmem_transport_fetch_atomic_nbi(shmem_transport_ctx_t* ctx, void *target,
                                  1,
                                  amo_flags); /* FI_DELIVERY_COMPLETE is not required as it's
                                                 implied for fetch atomicmsgs */
-    } while (try_again(ctx, ret, &polled));
+    } while (SHMEM_TRANSPORT_OFI_RETRY(ctx, ret, &polled, pe, len, amo_flags));
     SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
 }
 
@@ -1737,7 +1807,7 @@ void shmem_transport_fetch_atomic(shmem_transport_ctx_t* ctx, void *target,
                               SHMEM_TRANSPORT_DTYPE(datatype),
                               op,
                               NULL);
-    } while (try_again(ctx, ret, &polled));
+    } while (SHMEM_TRANSPORT_OFI_RETRY(ctx, ret, &polled, pe, len, 0));
     SHMEM_TRANSPORT_OFI_CTX_UNLOCK(ctx);
 #endif
 }

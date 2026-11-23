@@ -25,17 +25,24 @@ shmem_transport_ofi_more_flush(shmem_transport_ctx_t *ctx, int reason)
     };
     ctx->put_cntr_pending++;
     for (unsigned int attempt = 0; attempt < 64; attempt++) {
+        uint64_t cq_before = ctx->retry_probe_cq_events;
         int ret = fi_writemsg(ctx->ep, &msg, FI_DELIVERY_COMPLETE);
         if (!ret) {
             shmem_transport_ofi_more_accept(&ctx->put_more, false, 0, reason);
             return;
         }
-        if (ret != -FI_EAGAIN) OFI_CTX_CHECK_ERROR(ctx, ret);
+        if (ret != -FI_EAGAIN) {
+            shmem_transport_ofi_retry_probe(ctx, __func__, __LINE__, -1, 0,
+                FI_DELIVERY_COMPLETE, ret, attempt + 1, cq_before, true);
+            OFI_CTX_CHECK_ERROR(ctx, ret);
+        }
         if (ctx->put_more.stats) ctx->put_more.retries++;
         if (ctx->bounce_buffers) SHMEM_TRANSPORT_OFI_CTX_BB_LOCK(ctx);
         shmem_transport_ofi_drain_cq(ctx);
         if (ctx->bounce_buffers) SHMEM_TRANSPORT_OFI_CTX_BB_UNLOCK(ctx);
         shmem_transport_probe();
+        shmem_transport_ofi_retry_probe(ctx, __func__, __LINE__, -1, 0,
+            FI_DELIVERY_COMPLETE, ret, attempt + 1, cq_before, attempt == 63);
     }
     /* TX/resource reservations are conservative, not a provider guarantee.
      * Fail with retained ownership rather than wait forever on unsubmitted TX. */

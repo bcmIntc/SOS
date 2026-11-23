@@ -2050,6 +2050,8 @@ static int shmem_transport_ofi_ctx_init(shmem_transport_ctx_t *ctx, int id)
     ctx->bounce_pool_limit_waits = ctx->bounce_pool_quota_waits = 0;
     ctx->bounce_pool_drain_calls = ctx->bounce_pool_high_water = 0;
     ctx->bounce_pool_wait_seconds = ctx->bounce_pool_max_wait_seconds = 0.0;
+    ctx->retry_probe = shmem_internal_params.OFI_RETRY_PROBE;
+    ctx->retry_probe_reports = ctx->retry_probe_cq_reads = ctx->retry_probe_cq_events = 0;
     memset(&ctx->put_more, 0, sizeof(ctx->put_more));
     memset(&ctx->node_quota, 0, sizeof(ctx->node_quota));
     ctx->put_more.stats = id == SHMEM_TRANSPORT_CTX_DEFAULT_ID &&
